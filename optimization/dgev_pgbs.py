@@ -119,6 +119,9 @@ class SamplerConfig:
     random_seed: Optional[int] = 123
     progress: bool = True
 
+    # Progress summary cadence (iterations). 0 => auto (~2% of n_iter).
+    progress_every: int = 0
+
 # =============================================================================
 # Particle Gibbs with Backward Simulation (structural DGEV)
 # =============================================================================
@@ -205,7 +208,6 @@ class DGEVParticleGibbs:
                 if g_first.size != self.period - 1:
                     raise ValueError("seasonal_vector_init must have length = period-1!")
             else:
-                # Use prior mean if available; else a smooth default
                 if self.priors.m_season is not None:
                     g_first = np.asarray(self.priors.m_season, float)
                     if g_first.size != self.period - 1:
@@ -296,8 +298,9 @@ class DGEVParticleGibbs:
         self.true_beta_t: Optional[np.ndarray] = None
         self.true_gamma_t: Optional[np.ndarray] = None
 
-        # last PF evidence (log p(y | theta) with states marginalized)
+        # last PF evidence and PF diagnostics
         self.last_log_evidence: float = float("nan")
+        self.last_pf_diag: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Truth registration (for plotting/diagnostics)
@@ -320,7 +323,7 @@ class DGEVParticleGibbs:
         self.true_gamma_t = None if gamma is None else np.asarray(gamma, float)
 
     # ------------------------------------------------------------------ #
-    # State-space pieces
+    # Helpers: normalization / ESS / EMA
     # ------------------------------------------------------------------ #
     @staticmethod
     def _safe_normalize(p: np.ndarray) -> np.ndarray:
@@ -329,13 +332,27 @@ class DGEVParticleGibbs:
         p[p < 0.0] = 0.0
         s = float(np.sum(p))
         if not np.isfinite(s) or s <= 0.0:
+            print(f"Warning: weights could not be normalized, using uniform weights instead.")
             return np.full_like(p, 1.0 / p.size)
         p /= s
         s2 = float(np.sum(p))
         if not np.isclose(s2, 1.0, atol=1e-12):
+            print(f"Warning: weights normalization off by {s2-1.0:.3e}, renormalizing.")
             p /= s2
         return p
 
+    @staticmethod
+    def _ess(w: np.ndarray) -> float:
+        s2 = float(np.sum(w * w))
+        return (1.0 / s2) if s2 > 0.0 else 0.0
+
+    @staticmethod
+    def _ema(old: Optional[float], new: float, alpha: float = 0.1) -> float:
+        return (alpha * new + (1.0 - alpha) * (0.0 if old is None else old))
+
+    # ------------------------------------------------------------------ #
+    # State-space pieces
+    # ------------------------------------------------------------------ #
     def _state_mean(self, x_prev: np.ndarray, t: int) -> np.ndarray:
         """
         E[x_t | x_{t-1}] for dynamic components.
@@ -613,20 +630,23 @@ class DGEVParticleGibbs:
     # ------------------------------------------------------------------ #
     # Conditional bootstrap PF + backward simulation
     # ------------------------------------------------------------------ #
-    def _conditional_pf(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    def _conditional_pf(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, dict]:
         """
         Conditional bootstrap particle filter that returns:
         - parts: particles over time,
         - w: normalized weights,
         - a: ancestor indices,
         - logZ: marginal log-likelihood log p(y | theta) (states integrated out),
-                estimated as sum_t log( (1/N) * sum_m w_t^m ).
+        - pf_diag: dict with ESS and max-weight diagnostics (mean/min/max across time).
         """
         N, T, D = self.cfg.n_particles, self.T, self.dim
         parts = np.zeros((T + 1, N, D), float)
         w = np.zeros((T + 1, N), float)
         a = np.zeros((T + 1, N), int)
         logZ = 0.0  # accumulate PF evidence
+
+        ess_list: List[float] = []
+        maxw_list: List[float] = []
 
         # t=0 : replicate prior state
         if D > 0:
@@ -654,6 +674,8 @@ class DGEVParticleGibbs:
 
         # normalized weights for resampling
         w[1, :] = self._safe_normalize(np.exp(lw - lw_max))
+        ess_list.append(self._ess(w[1, :]))
+        maxw_list.append(float(np.max(w[1, :])))
 
         if self.cfg.progress:
             print("  Running conditional bootstrap PF...")
@@ -697,8 +719,22 @@ class DGEVParticleGibbs:
 
             # normalized weights for resampling
             w[t, :] = self._safe_normalize(np.exp(lw - lw_max))
+            ess_t = self._ess(w[t, :])
+            maxw_t = float(np.max(w[t, :]))
+            ess_list.append(ess_t)
+            maxw_list.append(maxw_t)
 
-        return parts, w, a, float(logZ)
+            # tqdm postfix so you see degeneracy live
+            if self.cfg.progress and hasattr(it, "set_postfix"):
+                it.set_postfix(ESS=f"{ess_t:6.1f}", MaxW=f"{maxw_t:7.4f}")
+
+        pf_diag = {
+            "ess_mean": float(np.mean(ess_list)),
+            "ess_min": float(np.min(ess_list)),
+            "maxw_mean": float(np.mean(maxw_list)),
+            "maxw_max": float(np.max(maxw_list)),
+        }
+        return parts, w, a, float(logZ), pf_diag
 
     def _backward_simulation(self, parts: np.ndarray, w: np.ndarray) -> np.ndarray:
         N, T, D = self.cfg.n_particles, self.T, self.dim
@@ -725,9 +761,10 @@ class DGEVParticleGibbs:
         return x_new
 
     def update_states_pgbs(self) -> None:
-        parts, w, _, logZ = self._conditional_pf()
+        parts, w, _, logZ, pf_diag = self._conditional_pf()
         self.x = self._backward_simulation(parts, w)
         self.last_log_evidence = float(logZ)
+        self.last_pf_diag = pf_diag
 
     # ------------------------------------------------------------------ #
     # MCMC driver
@@ -762,6 +799,11 @@ class DGEVParticleGibbs:
         if self.seasonal_mode == "deterministic":
             self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
 
+        # rolling summaries
+        ema_logZ: Optional[float] = None
+        ema_Q = np.zeros(self.dim, float) if self.dim > 0 else None
+        print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50)
+
         for it in range(cfg.n_iter):
             if cfg.progress:
                 print(f"Iteration {it + 1}/{cfg.n_iter}")
@@ -774,6 +816,9 @@ class DGEVParticleGibbs:
                 mu_vec_now = self._mu_vec_current()
                 current_log_ev = float(gev_loglike_sum(self.y, mu_vec_now, self.sigma, self.xi))
 
+            # update EMA of evidence
+            ema_logZ = self._ema(ema_logZ, current_log_ev, alpha=0.1)
+
             if cfg.progress:
                 print(f"  log p(y | theta) [PF states-marginalized] = {current_log_ev:.6f}")
 
@@ -781,6 +826,8 @@ class DGEVParticleGibbs:
             if self.dim > 0:
                 if cfg.progress: print("  Updating Q...")
                 self.update_Q()
+                if ema_Q is not None:
+                    ema_Q = 0.9 * ema_Q + 0.1 * self.Q
 
             # 3) deterministic structural params
             if self.level_mode == "deterministic":
@@ -798,7 +845,42 @@ class DGEVParticleGibbs:
             self.update_logsigma()
             self.update_xi()
 
-            # 5) store
+            # 5) periodic compact progress line
+            if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
+                acc_logs = f"{self.accept['logsigma']}/{self.proposals['logsigma']}"
+                acc_xi   = f"{self.accept['xi']}/{self.proposals['xi']}"
+
+                q_info = ""
+                if self.dim > 0:
+                    with np.errstate(divide='ignore'):
+                        logQ = np.log10(np.clip(self.Q, 1e-20, None))
+                        ema_logQ = np.log10(np.clip(ema_Q, 1e-20, None))
+                    q_info = f" | Q[log10]: cur={np.round(logQ,2)} ema={np.round(ema_logQ,2)}"
+
+                pf_info = ""
+                if self.last_pf_diag:
+                    d = self.last_pf_diag
+                    pf_info = f" | PF: ESS(mean/min)={d['ess_mean']:.1f}/{d['ess_min']:.1f} MaxW(max)={d['maxw_max']:.4f}"
+
+                print(
+                    f"[it {it+1}/{cfg.n_iter}] "
+                    f"logZ={current_log_ev:.3f} ema={ema_logZ:.3f} "
+                    f"σ={np.exp(self.logsigma):.3f} ξ={self.xi:.3f} "
+                    f"acc(logσ)={acc_logs} acc(ξ)={acc_xi}"
+                    f"{q_info}{pf_info}"
+                )
+
+                # Early warnings
+                if self.dim > 0 and np.any(self.Q < 1e-10):
+                    print(f"  [warn] Q near-zero at idx {np.where(self.Q < 1e-10)[0].tolist()} "
+                          f"(min Q={float(np.min(self.Q)):.3e}). "
+                          f"Consider larger prior b_q or a_q→1+ to avoid collapse.")
+
+                if self.last_pf_diag and self.last_pf_diag["ess_min"] < 0.2 * self.cfg.n_particles:
+                    print("  [warn] PF degeneracy (ESS_min < 0.2*N). "
+                          "Consider more particles, tempered/regularized proposals, or larger trans_eps/Q.")
+
+            # 6) store
             if it in save_iters and keep_idx < n_kept:
                 mu_vec = self._mu_vec_current()
                 self.keep["mu"][keep_idx, :] = mu_vec
@@ -895,7 +977,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DGEV PG-BS Sampler")
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
-    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="none")
     parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
     # Basics
     parser.add_argument("--period", type=int, default=4)
@@ -903,18 +985,18 @@ if __name__ == "__main__":
     # Initial values (shared as priors or fixed)
     parser.add_argument("--level-init", type=float, default=5.0)
     parser.add_argument("--slope-init", type=float, default=0.02)
-    # Simulation truths (obs + state noise) — typical Q ≈ 1e-5
+
     parser.add_argument("--true-sigma", type=float, default=2.0)
     parser.add_argument("--true-xi", type=float, default=0.1)
     parser.add_argument("--q-alpha", type=float, default=1e-5)
     parser.add_argument("--q-beta",  type=float, default=1e-5)
     parser.add_argument("--q-gamma", type=float, default=1e-5)
-    # Priors (NOTE: prior-m-sigma is for log-sigma); IG prior centered near 1e-5
+
     parser.add_argument("--prior-m-sigma", type=float, default=2.0)
     parser.add_argument("--prior-s-sigma", type=float, default=1.0)
     parser.add_argument("--prior-m-xi", type=float, default=1.0)
     parser.add_argument("--prior-s-xi", type=float, default=0.2)
-    parser.add_argument("--prior-aq", type=float, default=1.5)   # mean b/(a-1) = 5e-6 / 0.5 = 1e-5
+    parser.add_argument("--prior-aq", type=float, default=2)   # mean b/(a-1) = 5e-6 / 0.5 = 1e-5
     parser.add_argument("--prior-bq", type=float, default=5e-6)  # heavy tail -> prefers small Q but allows larger
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
@@ -931,8 +1013,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-iter", type=int, default=2000)
     parser.add_argument("--burn", type=int, default=100)
     parser.add_argument("--thin", type=int, default=1)
-    parser.add_argument("--step-logsigma", type=float, default=0.06)
-    parser.add_argument("--step-xi", type=float, default=0.06)
+    parser.add_argument("--step-logsigma", type=float, default=0.08)
+    parser.add_argument("--step-xi", type=float, default=0.08)
     parser.add_argument("--step-level", type=float, default=0.02)
     parser.add_argument("--step-slope", type=float, default=0.05)
     parser.add_argument("--step-season", type=float, default=0.02)
@@ -940,6 +1022,7 @@ if __name__ == "__main__":
     parser.add_argument("--trans-eps", type=float, default=1e-8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--progress", default=True)
+    parser.add_argument("--progress-every", type=int, default=0, help="print compact summary every k iters (0=auto)")
     # Output & plotting
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
@@ -1022,7 +1105,8 @@ if __name__ == "__main__":
         step_level=args.step_level, step_slope=args.step_slope,
         step_season=args.step_season,
         n_particles=args.particles, trans_eps=args.trans_eps,
-        random_seed=args.seed, progress=args.progress,
+        random_seed=args.seed, progress=bool(args.progress),
+        progress_every=int(args.progress_every),
     )
 
     # Initial seasonal vector for deterministic sampler (p-1 entries)
