@@ -1,0 +1,65 @@
+{
+  "T": 561,
+  "dim": 5,
+  "include_level": true,
+  "include_trend": true,
+  "include_seasonality": true,
+  "period": 4,
+  "idx_alpha": 0,
+  "idx_beta": 1,
+  "idx_gamma_start": 2,
+  "idx_gamma_end": 4,
+  "cfg": {
+    "n_iter": 10,
+    "burn": 1,
+    "thin": 1,
+    "step_logsigma": 0.08,
+    "step_xi": 0.08,
+    "n_particles": 100,
+    "trans_eps": 1e-08,
+    "random_seed": 7,
+    "progress": true
+  },
+  "priors": {
+    "m_sigma": 0.6931471805599453,
+    "s_sigma": 1.0,
+    "m_xi": -0.2,
+    "s_xi": 0.2,
+    "a_q": 2.0,
+    "b_q": 0.05
+  },
+  "true_sigma": 2.0,
+  "true_xi": -0.2,
+  "true_Q": [
+    0.05,
+    0.01,
+    0.05,
+    0.0,
+    0.0
+  ],
+  "accept": {
+    "logsigma": 7,
+    "xi": 2
+  },
+  "proposals": {
+    "logsigma": 10,
+    "xi": 10
+  },
+  "truth_paths": {
+    "mu": [
+      561
+    ],
+    "alpha": [
+      561
+    ],
+    "beta": [
+      561
+    ],
+    "gamma": [
+      561
+    ]
+  },
+  "seasonal_mode": "dynamic",
+  "elapsed_seconds": 73.68062090873718,
+  "data_hash": 253630998380
+}

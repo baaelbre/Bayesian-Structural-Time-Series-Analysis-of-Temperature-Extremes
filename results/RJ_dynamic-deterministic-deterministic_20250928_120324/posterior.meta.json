@@ -1,0 +1,74 @@
+{
+  "T": 500,
+  "dim": 0,
+  "period": 12,
+  "modes_current": {
+    "level_mode": "deterministic",
+    "trend_mode": "deterministic",
+    "season_mode": "none"
+  },
+  "layout": [],
+  "idx_alpha": null,
+  "idx_beta": null,
+  "idx_gamma_start": null,
+  "idx_gamma_end": null,
+  "cfg": {
+    "n_iter": 100,
+    "burn": 10,
+    "thin": 1,
+    "step_logsigma": 0.06,
+    "step_xi": 0.06,
+    "step_level": 0.02,
+    "step_slope": 0.05,
+    "step_season": 0.02,
+    "n_particles": 100,
+    "trans_eps": 1e-08,
+    "random_seed": 7,
+    "progress": true,
+    "do_rj": true,
+    "rj_try_prob": 1.0
+  },
+  "priors": {
+    "m_sigma": 2.0,
+    "s_sigma": 1.0,
+    "m_xi": 1.0,
+    "s_xi": 0.2,
+    "a_q": 2.0,
+    "b_q": 0.1,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0
+  },
+  "true_sigma": null,
+  "true_xi": null,
+  "true_Q": null,
+  "accept": {
+    "logsigma": 59,
+    "xi": 53,
+    "level": 78,
+    "slope": 10,
+    "season": 13
+  },
+  "proposals": {
+    "logsigma": 100,
+    "xi": 100,
+    "level": 100,
+    "slope": 100,
+    "season": 13
+  },
+  "rj_accepts": {
+    "level": 1,
+    "trend": 0,
+    "season": 8
+  },
+  "rj_proposals": {
+    "level": 100,
+    "trend": 100,
+    "season": 100
+  },
+  "modes": "RJ_dynamic-deterministic-deterministic",
+  "elapsed_seconds": 110.57125663757324
+}

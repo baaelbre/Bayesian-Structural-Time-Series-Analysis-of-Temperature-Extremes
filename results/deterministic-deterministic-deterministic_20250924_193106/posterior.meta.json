@@ -1,0 +1,57 @@
+{
+  "T": 250,
+  "dim": 0,
+  "period": 4,
+  "modes": "deterministic-deterministic-deterministic",
+  "layout": [],
+  "idx_alpha": null,
+  "idx_beta": null,
+  "idx_gamma_start": null,
+  "idx_gamma_end": null,
+  "cfg": {
+    "n_iter": 100,
+    "burn": 10,
+    "thin": 1,
+    "step_logsigma": 0.08,
+    "step_xi": 0.08,
+    "step_level": 0.05,
+    "step_slope": 0.02,
+    "step_season": 0.05,
+    "n_particles": 500,
+    "trans_eps": 1e-08,
+    "random_seed": 7,
+    "progress": true
+  },
+  "priors": {
+    "m_sigma": 2.0,
+    "s_sigma": 1.0,
+    "m_xi": 1.0,
+    "s_xi": 0.2,
+    "a_q": 2.0,
+    "b_q": 0.05,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0
+  },
+  "true_sigma": 2.0,
+  "true_xi": 0.1,
+  "true_Q": null,
+  "accept": {
+    "logsigma": 64,
+    "xi": 51,
+    "level": 76,
+    "slope": 14,
+    "season": 83
+  },
+  "proposals": {
+    "logsigma": 100,
+    "xi": 100,
+    "level": 100,
+    "slope": 100,
+    "season": 100
+  },
+  "elapsed_seconds": 1.1359562873840332
+}
