@@ -997,8 +997,8 @@ if __name__ == "__main__":
     parser.add_argument("--prior-s-sigma", type=float, default=1.0)
     parser.add_argument("--prior-m-xi", type=float, default=1.0)
     parser.add_argument("--prior-s-xi", type=float, default=0.2)
-    parser.add_argument("--prior-aq", type=float, default=2)   # mean b/(a-1) = 5e-6 / 0.5 = 1e-5
-    parser.add_argument("--prior-bq", type=float, default=5e-6)  # heavy tail -> prefers small Q but allows larger
+    parser.add_argument("--prior-aq", type=float, default=2)   # mean b/(a-1)
+    parser.add_argument("--prior-bq", type=float, default=5e-6)
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
     parser.add_argument("--prior-m-slope", type=float, default=0.0)
