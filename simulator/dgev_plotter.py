@@ -551,7 +551,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--root",
         type=str,
-        default="results",
+        default="results/simulations/DGEV",
         help="Root folder to search when --run is not given (e.g., 'results', 'uccle/TX', or 'uccle/TN').",
     )
     parser.add_argument("--level", type=float, default=0.90, help="Credible interval level for bands.")

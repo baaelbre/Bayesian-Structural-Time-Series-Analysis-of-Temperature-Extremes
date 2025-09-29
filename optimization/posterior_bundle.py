@@ -54,7 +54,7 @@ def load_posterior(path: str) -> PosteriorBundle:
 
 # ---- Convenience helpers ----------------------------------------------
 
-def list_runs(root: str = "results") -> list:
+def list_runs(root: str = "results/simulations/DGEV") -> list:
     """
     Return full paths of *run folders that contain 'posterior.npz'*, sorted by modification time (newest last).
 
@@ -82,7 +82,7 @@ def list_runs(root: str = "results") -> list:
     run_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(d, "posterior.npz")))
     return run_dirs
 
-def find_latest_run(root: str = "results") -> str | None:
+def find_latest_run(root: str = "results/simulations/DGEV") -> str | None:
     """
     Find the most recent run *directory that contains 'posterior.npz'*.
 
@@ -96,7 +96,7 @@ def find_latest_run(root: str = "results") -> str | None:
 # ---- Example usage -----------------------------------------------------
 if __name__ == "__main__":
     # Example A: latest under the classic 'results/' tree
-    latest = find_latest_run("results")
+    latest = find_latest_run("results/simulations/DGEV")
     if latest:
         bundle = load_posterior(latest)
         print("[classic] Loaded:", bundle.npz_path)

@@ -273,8 +273,8 @@ class DLMPlotter:
             ax.plot(a_ctr, lw=1.6, label=r"$\alpha_t$ median")
             ax.fill_between(np.arange(self.T), a_lo, a_hi, alpha=0.25, label=self.band_label)
             if (self.true_alpha is not None) and len(self.true_alpha) == self.T:
-                ax.plot(self.true_alpha, lw=1.2, ls="--", label="true $\alpha_t$")
-            ax.set_title("Level component $\alpha_t$")
+                ax.plot(self.true_alpha, lw=1.2, ls="--", label=r"true $\alpha_t$")
+            ax.set_title(r"Level component $\alpha_t$")
             ax.legend()
             r += 1
 
@@ -481,46 +481,62 @@ class DLMPlotter:
 # ----------------------------- #
 # CLI: Load a posterior and plot
 # ----------------------------- #
+# ----------------------------- #
+# CLI: Load a posterior and plot (via optimization/posterior_io)
+# ----------------------------- #
 if __name__ == "__main__":
     import argparse
+    import os
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+    from optimization.posterior_bundle import load_posterior, find_latest_run
 
     parser = argparse.ArgumentParser(description="Plot DLM Gibbs (conjugate Gaussian) posterior diagnostics.")
-    parser.add_argument("--run", type=str, required=True,
-                        help="Path to a 'posterior.npz' file or to a directory containing 'posterior.npz' and 'meta.json'.")
+    parser.add_argument(
+        "--run",
+        type=str,
+        default=None,
+        help="Path to a run directory (containing posterior.npz & posterior.meta.json) "
+             "or directly to posterior.npz. If omitted, we'll search under --root."
+    )
+    parser.add_argument(
+        "--root",
+        type=str,
+        default="results/simulations/DLM",
+        help="Search root (choose one of: 'results/simulations/DLM', 'uccle/TXm', 'uccle/TNm')."
+    )
     parser.add_argument("--level", type=float, default=0.90, help="Credible interval level for bands.")
     parser.add_argument("--show", action="store_true", help="Show figures interactively.")
     parser.add_argument("--skip-states", action="store_true", help="Skip stacked states panel.")
     parser.add_argument("--skip-separate", action="store_true", help="Skip separate component figures.")
     args = parser.parse_args()
 
-    # Resolve paths
-    run_path = args.run
-    if os.path.isdir(run_path):
-        npz_path = os.path.join(run_path, "posterior.npz")
-        meta_path = os.path.join(run_path, "meta.json")
-        save_dir = os.path.join(run_path, "figures")
+    # Resolve the target run using your IO helpers
+    if args.run:
+        target = args.run
+        print(f"[info] Using explicit run: {target}")
     else:
-        npz_path = run_path
-        base = os.path.dirname(os.path.abspath(npz_path))
-        meta_path = os.path.join(base, "meta.json")
-        save_dir = os.path.join(base, "figures")
+        print(f"[info] Searching latest run under: {args.root}")
+        target = find_latest_run(root=args.root)
+        if not target:
+            raise FileNotFoundError(
+                f"No 'posterior.npz' found under '{args.root}'. "
+                f"Pass --run explicitly or pick a valid --root (results_dlm | uccle/TXm | uccle/TNm)."
+            )
 
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"posterior.npz not found at: {npz_path}")
-    if not os.path.exists(meta_path):
-        # fallback meta
-        meta = {}
-    else:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
+    # Load posterior bundle (draws + meta + paths)
+    bundle = load_posterior(target)
+    draws, meta = bundle.draws, bundle.meta
 
-    # Load draws
-    with np.load(npz_path, allow_pickle=True) as Z:
-        draws = {k: Z[k] for k in Z.files}
-
+    # Where to save figures (same folder as the posterior)
+    run_dir = os.path.dirname(bundle.npz_path)
+    save_dir = os.path.join(run_dir, "figures")
     _ensure_dir(save_dir)
-    print(f"[info] saving figures to: {save_dir}")
 
+    print(f"[info] Using run dir: {run_dir}")
+    print(f"[info] Saving figures to: {save_dir}")
+
+    # Make plots
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
     plotter.plot_diagnostics(save_dir=save_dir, fname_prefix="diagnostics", show=bool(args.show))
     if not args.skip_states:
@@ -529,3 +545,4 @@ if __name__ == "__main__":
         plotter.plot_components_separately(save_dir=save_dir, fname_prefix="components", show=bool(args.show))
     plotter.plot_quick_hist_panel(save_dir=save_dir, fname_prefix="quick_hist", show=bool(args.show))
     print("[done] Plots generated.")
+

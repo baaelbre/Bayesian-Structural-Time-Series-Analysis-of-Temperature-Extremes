@@ -928,7 +928,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prior-s-season", type=float, default=5.0)
     # Sampler config
-    parser.add_argument("--n-iter", type=int, default=1000)
+    parser.add_argument("--n-iter", type=int, default=2000)
     parser.add_argument("--burn", type=int, default=100)
     parser.add_argument("--thin", type=int, default=1)
     parser.add_argument("--step-logsigma", type=float, default=0.06)
@@ -936,7 +936,7 @@ if __name__ == "__main__":
     parser.add_argument("--step-level", type=float, default=0.02)
     parser.add_argument("--step-slope", type=float, default=0.05)
     parser.add_argument("--step-season", type=float, default=0.02)
-    parser.add_argument("--particles", type=int, default=100)
+    parser.add_argument("--particles", type=int, default=250)
     parser.add_argument("--trans-eps", type=float, default=1e-8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--progress", default=True)
@@ -1051,7 +1051,7 @@ if __name__ == "__main__":
     sampler.set_truth_paths(mu=mu_T, alpha=alpha_T, beta=beta_T, gamma=gamma_T)
 
     tag = f"{sim_level_mode}-{sim_trend_mode}-{sim_season_mode}"
-    out_dir = args.out_dir or os.path.join("results", f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    out_dir = args.out_dir or os.path.join("results", "simulations", "DGEV", f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     fig_dir = os.path.join(out_dir, "figures")
     _ensure_dir(out_dir); _ensure_dir(fig_dir)
 
