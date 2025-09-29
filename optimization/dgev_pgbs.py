@@ -16,7 +16,7 @@ from datetime import datetime
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
-def default_season_pminus1(period: int) -> np.ndarray:
+def build_seasonal(period: int) -> np.ndarray:
     """
     Build a smooth default for the first (p-1) seasonal entries (last is implied
     by the sum-to-zero constraint). We center a cosine over p points and
@@ -65,6 +65,7 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
     z = (y - mu_vec) / sigma
     u = 1.0 + xi * z
     if np.any(u <= 0.0):
+        print("Warning: gev_loglike_sum encountered u <= 0.0, returning -inf.")
         return -np.inf
     if abs(xi) < 1e-8:
         return float(np.sum(-np.log(sigma) - np.exp(-z) - z))
@@ -213,7 +214,7 @@ class DGEVParticleGibbs:
                     if g_first.size != self.period - 1:
                         raise ValueError("priors.m_season must have length = period-1!")
                 else:
-                    g_first = default_season_pminus1(self.period)
+                    g_first = build_seasonal(self.period)
             g_last = -np.sum(g_first)
             self.season_vec = np.concatenate([g_first, [g_last]]).astype(float)
         else:
@@ -1041,7 +1042,7 @@ if __name__ == "__main__":
     v0_season_first = np.full(args.period - 1, 0.5, float)
     if sim_season_mode == "deterministic":
         # Simulator accepts p-1 for deterministic season as well (last implied)
-        m0_season_first = default_season_pminus1(args.period)
+        m0_season_first = build_seasonal(args.period)
     elif sim_season_mode == "none":
         m0_season_first = None
         v0_season_first = None
@@ -1112,7 +1113,7 @@ if __name__ == "__main__":
     # Initial seasonal vector for deterministic sampler (p-1 entries)
     seasonal_init_pminus1 = (
         np.asarray(m_season_prior, float) if (sim_season_mode == "deterministic" and m_season_prior is not None)
-        else (default_season_pminus1(args.period) if sim_season_mode == "deterministic" else None)
+        else (build_seasonal(args.period) if sim_season_mode == "deterministic" else None)
     )
 
     sampler = DGEVParticleGibbs(
