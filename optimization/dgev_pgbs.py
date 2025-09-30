@@ -82,8 +82,12 @@ class Priors:
 
     # Process noises for dynamic coords: Q ~ IG(a_q, b_q) (shape, scale)
     # E[Q]=b_q/(a_q-1) for a_q>1 ; Var[Q]=b_q^2/((a_q-1)^2 (a_q-2)) for a_q>2
-    a_q: float = 1.5
-    b_q: float = 5e-6
+    a_q_alpha: float = 1.1
+    b_q_alpha: float = 1e-4     # E[Q_alpha] ≈ 1e-3
+    a_q_beta:  float = 1.1
+    b_q_beta:  float = 1e-12    # E[Q_beta]  ≈ 1e-11
+    a_q_gamma: float = 1.5
+    b_q_gamma: float = 5e-6
 
     # Deterministic components’ Gaussian priors
     m_level: float = 0.0
@@ -223,11 +227,12 @@ class DGEVParticleGibbs:
         # ---- Innovation variances Q (for dynamics)
         self.Q = np.zeros(self.dim, float)
         if self.idx_alpha is not None:
-            self.Q[self.idx_alpha] = 1e-5
+            self.Q[self.idx_alpha] = self.priors.b_q_alpha / (self.priors.a_q_alpha - 1.0)
         if self.idx_beta is not None:
-            self.Q[self.idx_beta] = 1e-5
+            self.Q[self.idx_beta]  = self.priors.b_q_beta  / (self.priors.a_q_beta  - 1.0)
         if self.seasonal_mode == "dynamic":
-            self.Q[self.idx_gamma_end] = 1e-5
+            self.Q[self.idx_gamma_end] = self.priors.b_q_gamma / (self.priors.a_q_gamma - 1.0)
+
 
         # ---- Initial latent path x_{0:T}
         self.x = np.zeros((self.T + 1, self.dim), float)
@@ -410,9 +415,9 @@ class DGEVParticleGibbs:
         return np.array([self.mu_from_state(self.x[t], t - 1) for t in range(1, self.T + 1)], float)
 
     def update_Q(self) -> None:
-        a0, b0 = self.priors.a_q, self.priors.b_q
 
         if self.idx_alpha is not None:
+            a0, b0 = self.priors.a_q_alpha, self.priors.b_q_alpha
             resid = []
             for t in range(1, self.T + 1):
                 drift = 0.0
@@ -428,6 +433,7 @@ class DGEVParticleGibbs:
             self.Q[self.idx_alpha] = 1.0 / np.random.gamma(a, 1.0 / b)
 
         if self.idx_beta is not None:
+            a0, b0 = self.priors.a_q_beta, self.priors.b_q_beta
             resid = self.x[1:, self.idx_beta] - self.x[:-1, self.idx_beta]
             rss = float(np.sum(np.square(resid)))
             a = a0 + 0.5 * self.T
@@ -435,6 +441,7 @@ class DGEVParticleGibbs:
             self.Q[self.idx_beta] = 1.0 / np.random.gamma(a, 1.0 / b)
 
         if self.seasonal_mode == "dynamic":
+            a0, b0 = self.priors.a_q_gamma, self.priors.b_q_gamma
             g0, gL = self.idx_gamma_start, self.idx_gamma_end
             resid = []
             for t in range(1, self.T + 1):
@@ -1035,15 +1042,19 @@ if __name__ == "__main__":
     parser.add_argument("--true-sigma", type=float, default=2.0)
     parser.add_argument("--true-xi", type=float, default=0.1)
     parser.add_argument("--q-alpha", type=float, default=1e-3)
-    parser.add_argument("--q-beta",  type=float, default=1e-11)
+    parser.add_argument("--q-beta",  type=float, default=1e-9)
     parser.add_argument("--q-gamma", type=float, default=1e-7)
 
     parser.add_argument("--prior-m-sigma", type=float, default=1.0)
     parser.add_argument("--prior-s-sigma", type=float, default=1.0)
     parser.add_argument("--prior-m-xi", type=float, default=0.0)
     parser.add_argument("--prior-s-xi", type=float, default=0.2)
-    parser.add_argument("--prior-aq", type=float, default=2.0)
-    parser.add_argument("--prior-bq", type=float, default=5e-6)
+    parser.add_argument("--prior-aq-alpha", type=float, default=1.1)
+    parser.add_argument("--prior-aq-beta", type=float, default=1.1)
+    parser.add_argument("--prior-aq-gamma", type=float, default=1.1)
+    parser.add_argument("--prior-bq-alpha", type=float, default=5e-5)
+    parser.add_argument("--prior-bq-beta", type=float, default=5e-5)
+    parser.add_argument("--prior-bq-gamma", type=float, default=5e-5)
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
     parser.add_argument("--prior-m-slope", type=float, default=0.0)
@@ -1135,16 +1146,18 @@ if __name__ == "__main__":
     priors = Priors(
         m_sigma=float(args.prior_m_sigma), s_sigma=float(args.prior_s_sigma),
         m_xi=float(args.prior_m_xi), s_xi=float(args.prior_s_xi),
-        a_q=float(args.prior_aq), b_q=float(args.prior_bq),
+        a_q_alpha=float(args.prior_aq_alpha), b_q_alpha=float(args.prior_bq_alpha),
+        a_q_beta=float(args.prior_aq_beta), b_q_beta=float(args.prior_bq_beta),
+        a_q_gamma=float(args.prior_aq_gamma), b_q_gamma=float(args.prior_bq_gamma),
         m_level=float(args.prior_m_level), s_level=float(args.prior_s_level),
         m_slope=float(args.prior_m_slope), s_slope=float(args.prior_s_slope),
         m_season=m_season_prior, s_season=float(args.prior_s_season),
     )
 
-    prior_mean_Q = priors.b_q / (priors.a_q - 1.0) if priors.a_q > 1.0 else float("inf")
-    prior_var_Q  = (priors.b_q**2 / ((priors.a_q - 1.0)**2 * (priors.a_q - 2.0))
-                    if priors.a_q > 2.0 else float("inf"))
-    print(f"[info] Prior on Q has mean={prior_mean_Q:.6g} and variance={prior_var_Q:.6g}.")
+    prior_mean_Q_alpha = priors.b_q_alpha / (priors.a_q_alpha - 1.0) if priors.a_q_alpha > 1.0 else float("inf")
+    prior_var_Q_alpha  = (priors.b_q_alpha**2 / ((priors.a_q_alpha - 1.0)**2 * (priors.a_q_alpha - 2.0))
+                    if priors.a_q_alpha > 2.0 else float("inf"))
+    print(f"[info] Prior on Q_alpha has mean={prior_mean_Q_alpha:.6g} and variance={prior_var_Q_alpha:.6g}.")
 
     cfg = SamplerConfig(
         n_iter=args.n_iter, burn=args.burn, thin=args.thin,

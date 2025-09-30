@@ -10,7 +10,7 @@ import pandas as pd
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from optimization.dgev_pgbs import DGEVParticleGibbs, Priors, SamplerConfig
-from simulator.dgev_plotter import DGEVPlotter
+from simulator.dgev_plotter import DGEVPlotter  # optional
 
 
 # =========================
@@ -20,54 +20,52 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def load_uccle(
-    start_year=1892,
-    end_year=2022,
-    data_dir="data",
-    max_file="Uccle_Temp_Max_monthly_anom2.csv",
-    min_file="Uccle_Temp_Min_monthly_anom2.csv",
-    max_avg_file="Uccle_Temp_Max_Avg_monthly_anom2.csv",
-    min_avg_file="Uccle_Temp_Min_Avg_monthly_anom2.csv",
+def load_monthlies(
+    start_year: int = 1892,
+    end_year: int = 2022,
+    data_dir: str = "data",
+    txx_file: str = "TXx.csv",
+    txn_file: str = "TXn.csv",
+    tnx_file: str = "TNx.csv",
+    tnn_file: str = "TNn.csv",
 ) -> dict:
     """
-    Reads four monthly anomaly CSVs with a datetime-like index (first col) and a single value column.
-    Returns a dict with aligned monthly Series clipped to [start_year, end_year].
+    Reads four monthly CSVs with a datetime-like index (first column) and a single value column:
+      TXx (monthly max of TX), TXn (monthly min of TX),
+      TNx (monthly max of TN), TNn (monthly min of TN).
 
-    Expected CSV format:
-      - First column: date or YYYY-MM
-      - Second column: value (anomaly)
+    Each CSV is expected to have:
+      - Index column: parseable dates (e.g., 'YYYY-MM-01'), representing month starts.
+      - One numeric column named like the file stem (TXx, TXn, TNx, TNn).
 
-    Output keys:
-      'max', 'min', 'max_avg', 'min_avg'
+    Returns aligned Series on monthly start ("MS"), clipped to [start_year, end_year].
+    Output keys: 'TXx', 'TXn', 'TNx', 'TNn'
     """
 
-    def read_one(path):
+    def read_one(path: str) -> pd.Series:
         df = pd.read_csv(path, index_col=0)
+        # Parse index to datetime and coerce to month-start freq
         df.index = pd.to_datetime(df.index)
-        # If the file contains multiple columns, keep the first numeric column
+        # Pick the first numeric column (or the only one)
         if df.shape[1] > 1:
-            # Prefer a column named 'value' otherwise first numeric
-            if "value" in df.columns:
-                s = df["value"]
-            else:
-                num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-                if not num_cols:
-                    raise ValueError(f"No numeric column found in {path}.")
-                s = df[num_cols[0]]
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not num_cols:
+                raise ValueError(f"No numeric column found in {path}.")
+            s = df[num_cols[0]]
         else:
             s = df.iloc[:, 0]
-        # Force monthly frequency if possible
         s = s.sort_index()
         s = s.loc[(s.index.year >= start_year) & (s.index.year <= end_year)]
         return s.asfreq("MS")
 
-    d = {}
-    d["max"] = read_one(os.path.join(data_dir, max_file))
-    d["min"] = read_one(os.path.join(data_dir, min_file))
-    d["max_avg"] = read_one(os.path.join(data_dir, max_avg_file))
-    d["min_avg"] = read_one(os.path.join(data_dir, min_avg_file))
+    d = {
+        "TXx": read_one(os.path.join(data_dir, txx_file)),
+        "TXn": read_one(os.path.join(data_dir, txn_file)),
+        "TNx": read_one(os.path.join(data_dir, tnx_file)),
+        "TNn": read_one(os.path.join(data_dir, tnn_file)),
+    }
 
-    # align all
+    # Align to common monthly index
     common_idx = None
     for s in d.values():
         common_idx = s.index if common_idx is None else common_idx.intersection(s.index)
@@ -96,21 +94,21 @@ def build_seasonal(period: int) -> np.ndarray:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="DGEV PG-BS on Uccle monthly anomalies")
+    parser = argparse.ArgumentParser(description="DGEV PG-BS on Uccle monthly TX/TN extremes")
 
     # Data & selection
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--max-file", type=str, default="Uccle_Temp_Max_monthly_anom2.csv")
-    parser.add_argument("--min-file", type=str, default="Uccle_Temp_Min_monthly_anom2.csv")
-    parser.add_argument("--max-avg-file", type=str, default="Uccle_Temp_Max_Avg_monthly_anom2.csv")
-    parser.add_argument("--min-avg-file", type=str, default="Uccle_Temp_Min_Avg_monthly_anom2.csv")
+    parser.add_argument("--txx-file", type=str, default="TXx.csv")
+    parser.add_argument("--txn-file", type=str, default="TXn.csv")
+    parser.add_argument("--tnx-file", type=str, default="TNx.csv")
+    parser.add_argument("--tnn-file", type=str, default="TNn.csv")
     parser.add_argument("--start-year", type=int, default=1892)
     parser.add_argument("--end-year", type=int, default=2022)
     parser.add_argument(
         "--series",
-        choices=["max", "min", "max_avg", "min_avg"],
-        default="max",
-        help="Which Uccle series to fit.",
+        choices=["TXx", "TXn", "TNx", "TNn"],
+        default="TXx",
+        help="Which monthly series to fit.",
     )
 
     # Structural model modes
@@ -124,12 +122,12 @@ if __name__ == "__main__":
     parser.add_argument("--slope-init", type=float, default=0.0)
 
     # Priors
-    parser.add_argument("--prior-m-sigma", type=float, default=0.0, help="Mean of prior on log(sigma)")
+    parser.add_argument("--prior-m-sigma", type=float, default=1.0, help="Mean of prior on log(sigma)")
     parser.add_argument("--prior-s-sigma", type=float, default=1.0, help="SD of prior on log(sigma)")
     parser.add_argument("--prior-m-xi", type=float, default=0.0)
-    parser.add_argument("--prior-s-xi", type=float, default=0.3)
-    parser.add_argument("--prior-aq", type=float, default=1.5, help="IG shape for Q")
-    parser.add_argument("--prior-bq", type=float, default=5e-6, help="IG scale for Q")
+    parser.add_argument("--prior-s-xi", type=float, default=0.1)
+    parser.add_argument("--prior-aq", type=float, default=1.9, help="IG shape for Q")
+    parser.add_argument("--prior-bq", type=float, default=1e-3, help="IG scale for Q")
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
     parser.add_argument("--prior-m-slope", type=float, default=0.0)
@@ -150,13 +148,14 @@ if __name__ == "__main__":
     parser.add_argument("--step-logsigma", type=float, default=0.1)
     parser.add_argument("--step-xi", type=float, default=0.1)
     parser.add_argument("--step-level", type=float, default=0.05)
-    parser.add_argument("--step-slope", type=float, default=0.01)
+    parser.add_argument("--step-slope", type=float, default=0.001)
     parser.add_argument("--step-season", type=float, default=0.05)
 
-    parser.add_argument("--particles", type=int, default=300)
+    parser.add_argument("--particles", type=int, default=100)
     parser.add_argument("--trans-eps", type=float, default=1e-8)
 
-    parser.add_argument("--progress", action="store_true", help="Print per-iteration progress info.")
+    # Progress controls
+    parser.add_argument("--progress", default=True, help="Print per-iteration progress info.")
     parser.add_argument(
         "--progress-every",
         type=int,
@@ -183,15 +182,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     np.random.seed(args.seed)
 
-    # Load Uccle data
-    series = load_uccle(
+    # Load selected monthly series
+    series = load_monthlies(
         start_year=args.start_year,
         end_year=args.end_year,
         data_dir=args.data_dir,
-        max_file=args.max_file,
-        min_file=args.min_file,
-        max_avg_file=args.max_avg_file,
-        min_avg_file=args.min_avg_file,
+        txx_file=args.txx_file,
+        txn_file=args.txn_file,
+        tnx_file=args.tnx_file,
+        tnn_file=args.tnn_file,
     )
     y = series[args.series].dropna().to_numpy(dtype=float)
     T = y.size
@@ -199,7 +198,7 @@ if __name__ == "__main__":
     if T < 5:
         raise ValueError(f"Not enough observations after filtering by years; got T={T}.")
 
-    # Seasonal prior means (first p-1 entries) if deterministic season chosen
+    # Parse seasonal prior means (first p-1 entries) if deterministic season chosen
     def parse_csv_floats(s):
         if s is None:
             return None
@@ -234,7 +233,7 @@ if __name__ == "__main__":
         n_iter=args.n_iter,
         burn=args.burn,
         thin=args.thin,
-        step_logsigma=args.step_logsigma,
+        step_logsigma=args.step_logsigma if hasattr(args, "step_logsigma") else args.step_logsigma,
         step_xi=args.step_xi,
         step_level=args.step_level,
         step_slope=args.step_slope,
@@ -338,4 +337,3 @@ if __name__ == "__main__":
             )
         except Exception as e:
             print(f"[warn] Plotting failed: {e}")
-
