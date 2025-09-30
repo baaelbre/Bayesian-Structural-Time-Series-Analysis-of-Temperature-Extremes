@@ -9,14 +9,12 @@ import numpy as np
 from tqdm import tqdm
 from datetime import datetime
 
-
 # =============================================================================
 # Utilities
 # =============================================================================
 
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
-
 
 def build_seasonal(period: int) -> np.ndarray:
     """
@@ -25,7 +23,6 @@ def build_seasonal(period: int) -> np.ndarray:
     g = np.cos(2 * np.pi * np.arange(period) / period)
     g -= np.mean(g)
     return g[: period - 1].astype(float)
-
 
 def parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
     """
@@ -38,7 +35,6 @@ def parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
     if not s:
         return None
     return [float(tok) for tok in s.split(",")]
-
 
 # =============================================================================
 # GEV helpers
@@ -58,7 +54,6 @@ def gev_logpdf(y: float, mu: float, sigma: float, xi: float) -> float:
         return -np.log(sigma) - np.exp(-z) - z
     return -np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)
 
-
 def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) -> float:
     """
     Sum_t log f(y_t | mu_t, sigma, xi).
@@ -72,7 +67,6 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
     if abs(xi) < 1e-8:
         return float(np.sum(-np.log(sigma) - np.exp(-z) - z))
     return float(np.sum(-np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
-
 
 # =============================================================================
 # Priors & Config
@@ -101,14 +95,13 @@ class Priors:
     m_season: Optional[Sequence[float]] = None
     s_season: float = 5.0
 
-
 @dataclass
 class SamplerConfig:
     n_iter: int = 5000
     burn: int = 1000
     thin: int = 5
 
-    # RW–MH step sizes
+    # RW–MH step sizes (initial values)
     step_logsigma: float = 0.05
     step_xi: float = 0.05
     step_level: float = 0.05
@@ -122,6 +115,15 @@ class SamplerConfig:
     progress: bool = True
     progress_every: int = 0  # 0 => auto (~2% of n_iter)
 
+    # ---- Adaptive RW–MH options (Robbins–Monro; windowed) ----
+    adapt_steps: bool = False         # enable adaptation
+    adapt_every: int = 25             # adapt every k iterations
+    adapt_until: str = "burn"         # "burn" or "all"
+    adapt_target_1d: float = 0.44     # recommended 1D RWMH target
+    adapt_eta0: float = 0.05          # initial learning-rate
+    adapt_eta_decay: float = 0.75     # eta_k = eta0 / (1+k)^decay
+    step_min: float = 1e-5
+    step_max: float = 1.0
 
 # =============================================================================
 # Particle Gibbs with Backward Simulation (structural DGEV)
@@ -256,6 +258,11 @@ class DGEVParticleGibbs:
         self.accept = {"logsigma": 0, "xi": 0, "level": 0, "slope": 0, "season": 0}
         self.proposals = {"logsigma": 0, "xi": 0, "level": 0, "slope": 0, "season": 0}
 
+        # ---- adaptation bookkeeping (windowed deltas)
+        self._mh_prev_acc = dict(self.accept)
+        self._mh_prev_prop = dict(self.proposals)
+        self._adapt_round = 0
+
         # ---- Truth overlays (optional)
         self.true_sigma: Optional[float] = None
         self.true_xi: Optional[float] = None
@@ -311,6 +318,24 @@ class DGEVParticleGibbs:
     def _mh_accept(self, logacc: float) -> bool:
         """Numerically safe MH accept: compare to min(0, logacc)."""
         return (np.log(np.random.rand()) < min(0.0, logacc))
+
+    # ------------------------ Step getters/setters (NEW) --------------------- #
+    def _get_step(self, key: str) -> float:
+        if   key == "logsigma": return self.cfg.step_logsigma
+        elif key == "xi":       return self.cfg.step_xi
+        elif key == "level":    return self.cfg.step_level
+        elif key == "slope":    return self.cfg.step_slope
+        elif key == "season":   return self.cfg.step_season
+        else: raise KeyError(key)
+
+    def _set_step(self, key: str, val: float) -> None:
+        v = float(np.clip(val, self.cfg.step_min, self.cfg.step_max))
+        if   key == "logsigma": self.cfg.step_logsigma = v
+        elif key == "xi":       self.cfg.step_xi = v
+        elif key == "level":    self.cfg.step_level = v
+        elif key == "slope":    self.cfg.step_slope = v
+        elif key == "season":   self.cfg.step_season = v
+        else: raise KeyError(key)
 
     # ----------------------------- State model ------------------------------ #
     def _state_mean(self, x_prev: np.ndarray, t: int) -> np.ndarray:
@@ -500,11 +525,10 @@ class DGEVParticleGibbs:
         cst = -0.5 * np.log(2.0 * np.pi * var)
         ll = 0.0
         for t in range(1, self.T + 1):
-            # mean = alpha_{t-1} + drift ; drift = beta_{t-1} (if dynamic) OR slope (if deterministic)
             if self.idx_beta is not None:
                 drift = self.x[t - 1, self.idx_beta]
             else:
-                drift = slope  # trend is deterministic
+                drift = slope
             mean = self.x[t - 1, self.idx_alpha] + drift
             diff = self.x[t, self.idx_alpha] - mean
             ll += cst - 0.5 * diff * diff * inv_var
@@ -539,7 +563,6 @@ class DGEVParticleGibbs:
                 self.proposals["slope"] += 1
                 return
         else:
-            # Level dynamic: observation path does not change with slope directly
             ll_obs_old = 0.0
             ll_obs_new = 0.0
 
@@ -598,6 +621,57 @@ class DGEVParticleGibbs:
         if self._mh_accept(logacc):
             self.season_vec = prop
             self.accept["season"] += 1
+
+    # ------------------- Adaptive step-size ------------------ #
+    def _adapt_steps(self, it: int) -> None:
+        cfg = self.cfg
+        if not cfg.adapt_steps:
+            return
+
+        in_window = (cfg.adapt_until == "all") or (it < cfg.burn)
+        if (it + 1) % max(1, cfg.adapt_every) != 0 or (not in_window):
+            return
+
+        # decreasing learning-rate
+        k = self._adapt_round
+        eta = cfg.adapt_eta0 / ((1.0 + k) ** cfg.adapt_eta_decay)
+
+        # eligible scalar keys
+        keys: List[str] = ["logsigma", "xi"]
+        if self.level_mode == "deterministic":
+            keys.append("level")
+        if self.trend_mode == "deterministic":
+            keys.append("slope")
+        if self.seasonal_mode == "deterministic":
+            keys.append("season")
+
+        target = cfg.adapt_target_1d
+        changed = []
+
+        for key in keys:
+            acc_now = self.accept[key]
+            prop_now = self.proposals[key]
+            acc_win = acc_now - self._mh_prev_acc[key]
+            prop_win = prop_now - self._mh_prev_prop[key]
+            if prop_win <= 0:
+                continue
+
+            rate = acc_win / max(1, prop_win)
+            s = self._get_step(key)
+            s_new = s * np.exp(eta * (rate - target))   # log-scale update
+
+            self._set_step(key, s_new)
+            changed.append((key, s, self._get_step(key), rate))
+
+            # refresh window counters
+            self._mh_prev_acc[key] = acc_now
+            self._mh_prev_prop[key] = prop_now
+
+        if changed and self.cfg.progress:
+            msg = " | ".join([f"{k}: {old:.4g}→{new:.4g} (acc_win={r:.2f})"
+                              for (k, old, new, r) in changed])
+            print(f"  [adapt] η={eta:.4f} target={target:.2f} :: {msg}")
+        self._adapt_round += 1
 
     # ---------------- PF (conditional bootstrap) + backward simulation ------- #
     def _conditional_pf(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, dict]:
@@ -725,7 +799,7 @@ class DGEVParticleGibbs:
         """Readable Q subset: only actual process noises."""
         rows = []
         def add(label, idx):
-            if idx is None: 
+            if idx is None:
                 return
             q = float(self.Q[idx])
             logq = np.log10(max(q, 1e-20))
@@ -816,6 +890,9 @@ class DGEVParticleGibbs:
             self.update_logsigma()
             self.update_xi()
 
+            # --- adapt proposal scales if enabled ---
+            self._adapt_steps(it)
+
             # 5) compact progress line
             if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
                 acc_logs = self._fmt_acc('logsigma')
@@ -852,7 +929,7 @@ class DGEVParticleGibbs:
                         f"(min Q={float(np.min(self.Q)):.3e}). Consider larger b_q or a_q→1+."
                     )
                 if self.last_pf_diag and self.last_pf_diag["ess_min"] < 0.2 * self.cfg.n_particles:
-                    print("  [warn] PF degeneracy (ESS_min < 0.2*N). Consider more particles/regularization.")
+                    print("  [warn] PF degeneracy (ESS_min < 0.2*N). Consider more particles/regularization.)")
 
             # 6) store
             if it in save_iters and keep_idx < n_kept:
@@ -934,7 +1011,6 @@ class DGEVParticleGibbs:
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
 
-
 # ------------------------- CLI / Example run & plots ------------------------ #
 if __name__ == "__main__":
     import sys, argparse
@@ -975,6 +1051,7 @@ if __name__ == "__main__":
     parser.add_argument("--prior-m-season", type=str, default=None,
                         help="Comma-separated first (p-1) means for deterministic seasonal prior (e.g. '0,0,0').")
     parser.add_argument("--prior-s-season", type=float, default=5.0)
+    
     # Sampler config
     parser.add_argument("--n-iter", type=int, default=2000)
     parser.add_argument("--burn", type=int, default=100)
@@ -990,6 +1067,17 @@ if __name__ == "__main__":
     parser.add_argument("--progress", default=True)
     parser.add_argument("--progress-every", type=int, default=10,
                         help="print compact summary every k iterations (0=auto)")
+
+    # Adaptive RW–MH CLI
+    parser.add_argument("--adapt-steps", action="store_true")
+    parser.add_argument("--adapt-every", type=int, default=25)
+    parser.add_argument("--adapt-until", choices=["burn","all"], default="burn")
+    parser.add_argument("--adapt-eta0", type=float, default=0.05)
+    parser.add_argument("--adapt-decay", type=float, default=0.75)
+    parser.add_argument("--adapt-target-1d", type=float, default=0.44)
+    parser.add_argument("--step-min", type=float, default=1e-5)
+    parser.add_argument("--step-max", type=float, default=1.0)
+
     # Output & plotting
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
@@ -1065,6 +1153,14 @@ if __name__ == "__main__":
         n_particles=args.particles, trans_eps=args.trans_eps,
         random_seed=args.seed, progress=bool(args.progress),
         progress_every=int(args.progress_every),
+        adapt_steps=bool(args.adapt_steps),
+        adapt_every=int(args.adapt_every),
+        adapt_until=str(args.adapt_until),
+        adapt_eta0=float(args.adapt_eta0),
+        adapt_eta_decay=float(args.adapt_decay),
+        adapt_target_1d=float(args.adapt_target_1d),
+        step_min=float(args.step_min),
+        step_max=float(args.step_max),
     )
 
     seasonal_init_pminus1 = (
