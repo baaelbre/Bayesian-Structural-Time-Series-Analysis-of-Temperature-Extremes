@@ -1,28 +1,30 @@
 {
-  "T": 100,
-  "dim": 1,
+  "T": 200,
+  "dim": 2,
   "period": 4,
-  "modes": "dynamic-deterministic-none",
+  "modes": "dynamic-dynamic-none",
   "layout": [
-    "alpha"
+    "alpha",
+    "beta"
   ],
   "idx_alpha": 0,
-  "idx_beta": null,
+  "idx_beta": 1,
   "idx_gamma_start": null,
   "idx_gamma_end": null,
   "cfg": {
     "n_iter": 2000,
     "burn": 100,
     "thin": 1,
-    "step_logsigma": 0.06,
-    "step_xi": 0.06,
+    "step_logsigma": 1,
+    "step_xi": 1,
     "step_level": 0.02,
     "step_slope": 0.05,
     "step_season": 0.02,
-    "n_particles": 250,
+    "n_particles": 500,
     "trans_eps": 1e-08,
     "random_seed": 7,
-    "progress": true
+    "progress": true,
+    "progress_every": 0
   },
   "priors": {
     "m_sigma": 2.0,
@@ -41,21 +43,22 @@
   "true_sigma": 2.0,
   "true_xi": 0.1,
   "true_Q": [
-    1e-05
+    1e-05,
+    1e-07
   ],
   "accept": {
-    "logsigma": 1382,
-    "xi": 1564,
+    "logsigma": 137,
+    "xi": 143,
     "level": 0,
-    "slope": 1999,
+    "slope": 0,
     "season": 0
   },
   "proposals": {
     "logsigma": 2000,
     "xi": 2000,
     "level": 0,
-    "slope": 2000,
+    "slope": 0,
     "season": 0
   },
-  "elapsed_seconds": 2233.2746074199677
+  "elapsed_seconds": 39302.12378239632
 }

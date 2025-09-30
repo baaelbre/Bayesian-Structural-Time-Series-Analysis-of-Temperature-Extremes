@@ -545,7 +545,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run",
         type=str,
-        default=None,
+        default="results/simulations/DGEV/dynamic-deterministic-none_20250929_220232",
         help="Path to a run directory (containing posterior.npz) or to a posterior.npz file. If provided, search is skipped.",
     )
     parser.add_argument(
