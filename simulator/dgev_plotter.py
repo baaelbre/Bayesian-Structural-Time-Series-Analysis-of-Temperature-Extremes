@@ -1,6 +1,6 @@
 # %% simulator/dgev_plotter.py
 import os
-from typing import Optional
+from typing import Optional, Tuple, List
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -159,13 +159,39 @@ class DGEVPlotter:
         else:
             plt.close(fig)
 
+    # ---------- Q helpers ----------
+    def _has_Q(self) -> bool:
+        return ("Q" in self.s.keep) and (self.s.keep["Q"].ndim == 2) and (self.s.keep["Q"].shape[0] > 0)
+
+    def _q_series(self, idx: Optional[int]) -> Optional[np.ndarray]:
+        if not self._has_Q() or idx is None:
+            return None
+        Q = self.s.keep["Q"]
+        if idx < 0 or idx >= Q.shape[1]:
+            return None
+        return np.asarray(Q[:, idx], float)
+
+    # ---------- acceptance helpers ----------
+    def _accept_pct(self, key: str) -> Optional[float]:
+        acc = getattr(self.s, "accept", {}) or {}
+        props = getattr(self.s, "proposals", {}) or {}
+        a = acc.get(key, None)
+        p = props.get(key, None)
+        if a is None or p is None or p == 0:
+            return None
+        return 100.0 * float(a) / float(p)
+
+    def _fmt_accept(self, key: str) -> str:
+        pct = self._accept_pct(key)
+        return ("{:.1f}%".format(pct) if pct is not None else "n/a")
+
     # ---------- figures ----------
     def plot_diagnostics(self, save_dir: Optional[str] = None, fname_prefix: str = "diagnostics", show: bool = True):
         kept = self.s.keep
         fig, axs = plt.subplots(3, 3, figsize=(13, 10))
         axs = axs.ravel()
 
-        # traces
+        # traces: sigma, xi
         axs[0].plot(kept["sigma"], lw=1)
         axs[0].set_title(r"trace: $\sigma$")
         if getattr(self.s, "true_sigma", None) is not None:
@@ -178,11 +204,11 @@ class DGEVPlotter:
             axs[1].axhline(self.s.true_xi, ls="--", lw=1.2, label=r"true $\xi$")
             axs[1].legend()
 
-        # innovation variance traces for dynamic states only
-        if getattr(self.s, "include_level", False) and "Q" in kept and self.s.idx_alpha is not None:
+        # innovation variance traces (dynamic only)
+        if getattr(self.s, "include_level", False) and self._has_Q() and self.s.idx_alpha is not None:
             axs[2].plot(kept["Q"][:, self.s.idx_alpha], lw=1)
             axs[2].set_title(r"trace: $Q_\alpha$")
-            if getattr(self.s, "true_Q", None) is not None:
+            if getattr(self.s, "true_Q", None) is not None and self.s.true_Q is not None:
                 axs[2].axhline(self.s.true_Q[self.s.idx_alpha], ls="--", lw=1.2, label=r"true $Q_\alpha$")
                 axs[2].legend()
         else:
@@ -201,37 +227,38 @@ class DGEVPlotter:
             axs[4].axvline(self.s.true_xi, ls="--", lw=1.5, label=r"true $\xi$")
             axs[4].legend()
 
-        if getattr(self.s, "include_trend", False) and "Q" in kept and self.s.idx_beta is not None:
+        if getattr(self.s, "include_trend", False) and self._has_Q() and self.s.idx_beta is not None:
             axs[5].hist(kept["Q"][:, self.s.idx_beta], bins=30, density=True)
             axs[5].set_title(r"posterior: $Q_\beta$")
-            if getattr(self.s, "true_Q", None) is not None:
+            if getattr(self.s, "true_Q", None) is not None and self.s.true_Q is not None:
                 axs[5].axvline(self.s.true_Q[self.s.idx_beta], ls="--", lw=1.5, label=r"true $Q_\beta$")
                 axs[5].legend()
         else:
             axs[5].axis("off")
 
-        if getattr(self.s, "include_seasonality", False) and "Q" in kept and self.s.idx_gamma_end is not None:
+        if getattr(self.s, "include_seasonality", False) and self._has_Q() and self.s.idx_gamma_end is not None:
             axs[6].hist(kept["Q"][:, self.s.idx_gamma_end], bins=30, density=True)
             axs[6].set_title(r"posterior: $Q_\gamma$")
-            if getattr(self.s, "true_Q", None) is not None:
+            if getattr(self.s, "true_Q", None) is not None and self.s.true_Q is not None:
                 axs[6].axvline(self.s.true_Q[self.s.idx_gamma_end], ls="--", lw=1.5, label=r"true $Q_\gamma$")
                 axs[6].legend()
         else:
             axs[6].axis("off")
 
-        # acceptance summary
-        def rate(a, p):
-            return 0.0 if (p is None or p == 0) else a / p
-
-        acc = getattr(self.s, "accept", {"logsigma": 0, "xi": 0})
-        props = getattr(self.s, "proposals", {"logsigma": 1, "xi": 1})
-        txt = (
-            f"accept(logsigma) = {rate(acc.get('logsigma', 0), props.get('logsigma', 0)):.2f}\n"
-            f"accept(xi) = {rate(acc.get('xi', 0), props.get('xi', 0)):.2f}\n"
-            f"(states via PG-BSi: acceptance = 1)"
-        )
+        # acceptance summary (no Q acceptance; add deterministic params if present)
         axs[7].axis("off")
-        axs[7].text(0.05, 0.6, txt, fontsize=12)
+        lines = [
+            f"accept(logsigma) = {self._fmt_accept('logsigma')}",
+            f"accept(xi) = {self._fmt_accept('xi')}",
+        ]
+        if "level_value" in kept:
+            lines.append(f"accept(level) = {self._fmt_accept('level')}")
+        if "slope_value" in kept or "beta_value" in kept:
+            lines.append(f"accept(slope) = {self._fmt_accept('slope')}")
+        if "season_vector" in kept:
+            lines.append(f"accept(season) = {self._fmt_accept('season')}")
+        lines.append("(states via PG-BSi: acceptance = 1)")
+        axs[7].text(0.05, 0.95, "\n".join(lines), fontsize=12, va="top")
 
         # posterior μ vs y
         mu_med = np.median(kept["mu"], axis=0)
@@ -240,7 +267,7 @@ class DGEVPlotter:
         axs[8].plot(self.s.y, label=r"$y_t$", lw=1, alpha=0.6)
         axs[8].plot(mu_med, label=r"$\mu_t$ median", lw=1.5)
         axs[8].fill_between(np.arange(self.s.T), mu_lo, mu_hi, alpha=0.2, label=self.band_label)
-        if getattr(self.s, "true_mu_t", None) is not None and len(self.s.true_mu_t) == self.s.T:
+        if getattr(self.s, "true_mu_t", None) is not None and isinstance(self.s.true_mu_t, np.ndarray) and len(self.s.true_mu_t) == self.s.T:
             axs[8].plot(self.s.true_mu_t, lw=1.5, ls="--", label=r"true $\mu_t$")
         axs[8].set_title(r"Filtered $\mu_t$ vs observations $y_t$")
         axs[8].legend()
@@ -272,7 +299,7 @@ class DGEVPlotter:
         ess_s = self._ess(s, max_lag=5 * max_lag)
         gz_s = self._geweke_z(s)
         axs[0, 2].hist(s, bins=30, density=True)
-        axs[0, 2].set_title(r"$\sigma$ hist" + f"(ESS≈{ess_s:.0f}, Geweke z≈{gz_s:.2f})")
+        axs[0, 2].set_title(r"$\sigma$ hist" + f" (ESS≈{ess_s:.0f}, Geweke z≈{gz_s:.2f})")
         if getattr(self.s, "true_sigma", None) is not None:
             axs[0, 2].axvline(self.s.true_sigma, ls="--", lw=1.2, label=r"true $\sigma$")
             axs[0, 2].legend()
@@ -296,6 +323,156 @@ class DGEVPlotter:
             _ensure_dir(save_dir)
             out_path = os.path.join(save_dir, f"{fname_prefix}.png")
             fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            print(f"[save] Figure -> {out_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    # -------- Process-noise diagnostics (posterior, running mean, ACF) -------
+    def plot_process_noise_diagnostics(
+        self, max_lag: int = 40, save_dir: Optional[str] = None, fname_prefix: str = "q_diagnostics", show: bool = True
+    ):
+        """
+        For each available process noise (Q_alpha, Q_beta, Q_gamma), plot:
+        - posterior (hist)
+        - running mean
+        - ACF
+        (No acceptance rates printed here.)
+        """
+        entries: List[Tuple[str, Optional[int], str]] = []
+        if getattr(self.s, "include_level", False) and self.s.idx_alpha is not None:
+            entries.append(("Q_alpha", self.s.idx_alpha, r"$Q_\alpha$"))
+        if getattr(self.s, "include_trend", False) and self.s.idx_beta is not None:
+            entries.append(("Q_beta", self.s.idx_beta, r"$Q_\beta$"))
+        if getattr(self.s, "include_seasonality", False) and self.s.idx_gamma_end is not None:
+            entries.append(("Q_gamma", self.s.idx_gamma_end, r"$Q_\gamma$"))
+
+        if not entries or not self._has_Q():
+            print("[info] No dynamic process noises present; skipping Q diagnostics.")
+            return
+
+        R = len(entries)
+        fig, axs = plt.subplots(R, 3, figsize=(14, 3.2 * R), squeeze=False)
+
+        for i, (key, idx, label) in enumerate(entries):
+            q = self._q_series(idx)
+            if q is None or q.size == 0:
+                continue
+
+            # Posterior (hist)
+            axs[i, 0].hist(q, bins=40, density=True)
+            axs[i, 0].set_title(fr"posterior: {label}")
+            if getattr(self.s, "true_Q", None) is not None and self.s.true_Q is not None:
+                try:
+                    axs[i, 0].axvline(self.s.true_Q[idx], ls="--", lw=1.2, label=fr"true {label}")
+                    axs[i, 0].legend()
+                except Exception:
+                    pass
+
+            # Running mean
+            run = np.cumsum(q) / np.arange(1, q.size + 1)
+            axs[i, 1].plot(run)
+            axs[i, 1].set_title(fr"{label} running mean")
+
+            # ACF
+            ac = self._acf(q, max_lag=max_lag)
+            axs[i, 2].stem(range(len(ac)), ac)
+            axs[i, 2].set_title(fr"{label} ACF")
+
+        plt.tight_layout()
+        if save_dir is not None:
+            _ensure_dir(save_dir)
+            out_path = os.path.join(save_dir, f"{fname_prefix}.png")
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            print(f"[save] Figure -> {out_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    # ---- Deterministic parameter diagnostics (trace, run mean, ACF, hist) ---
+    def plot_deterministic_param_diagnostics(
+        self,
+        max_lag: int = 40,
+        season_k: int = 6,
+        save_dir: Optional[str] = None,
+        fname_prefix: str = "deterministic_diagnostics",
+        show: bool = True,
+    ):
+        """
+        Plots diagnostics for deterministic parameters when present:
+          - level_value (trace, running mean, ACF, hist)
+          - slope_value (trace, running mean, ACF, hist)
+          - season_vector (first `season_k` components; last is implied)
+        Also annotates/prints acceptance percentages for level/slope/season.
+        """
+        have_level = "level_value" in self.s.keep
+        have_slope = ("slope_value" in self.s.keep) or ("beta_value" in self.s.keep)
+        have_season = "season_vector" in self.s.keep
+
+        # Nothing to do?
+        if not (have_level or have_slope or have_season):
+            print("[info] No deterministic parameters found; skipping deterministic diagnostics.")
+            return
+
+        # Build list of 1D series to diagnose
+        entries: List[Tuple[str, np.ndarray, str]] = []  # (key, series, label)
+
+        if have_level:
+            entries.append(("level", np.asarray(self.s.keep["level_value"], float), r"level"))
+        if have_slope:
+            vec = self.s.keep["slope_value"] if "slope_value" in self.s.keep else self.s.keep["beta_value"]
+            entries.append(("slope", np.asarray(vec, float), r"slope"))
+
+        # Season: per-coordinate up to season_k (p-1 informative coords)
+        if have_season:
+            V = np.asarray(self.s.keep["season_vector"], float)  # (n_keep, p)
+            p = V.shape[1]
+            kmax = min(season_k, p - 1 if p >= 2 else 0)
+            for k in range(kmax):
+                entries.append((f"season[{k+1}]", V[:, k], rf"season $g_{k+1}$"))
+
+        R = len(entries)
+        fig, axs = plt.subplots(R, 4, figsize=(16, 3.0 * R), squeeze=False)
+
+        for i, (key, series, label) in enumerate(entries):
+            # Trace
+            axs[i, 0].plot(series, lw=1.0)
+            axs[i, 0].set_title(f"{label} trace")
+
+            # Running mean
+            run = np.cumsum(series) / np.arange(1, series.size + 1)
+            axs[i, 1].plot(run, lw=1.0)
+            axs[i, 1].set_title(f"{label} running mean")
+
+            # ACF
+            ac = self._acf(series, max_lag=max_lag)
+            axs[i, 2].stem(range(len(ac)), ac)
+            axs[i, 2].set_title(f"{label} ACF")
+
+            # Posterior (hist)
+            axs[i, 3].hist(series, bins=40, density=True)
+            axs[i, 3].set_title(f"{label} posterior")
+
+            # Acceptance annotation for the group key (only for overall season, not each coeff)
+            if key in {"level", "slope"}:
+                pct = self._fmt_accept(key)
+                axs[i, 2].text(0.02, 0.92, f"accept({key}) = {pct}", transform=axs[i, 2].transAxes, fontsize=10, va="top")
+                print(f"[accept] {key}: {pct}")
+            elif key.startswith("season["):
+                # annotate using the *overall* season acceptance once on the first seasonal row
+                if i == (2 if have_level and have_slope else 1 if (have_level or have_slope) else 0):
+                    pct = self._fmt_accept("season")
+                    axs[i, 2].text(0.02, 0.92, f"accept(season) = {pct}", transform=axs[i, 2].transAxes, fontsize=10, va="top")
+                    print(f"[accept] season: {pct}")
+
+        plt.tight_layout()
+        if save_dir is not None:
+            _ensure_dir(save_dir)
+            out_path = os.path.join(save_dir, f"{fname_prefix}.png")
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            print(f"[save] Figure -> {out_path}")
         if show:
             plt.show()
         else:
@@ -327,7 +504,7 @@ class DGEVPlotter:
         ax.plot(self.s.y, label=r"$y_t$", lw=1, alpha=0.7)
         ax.plot(mu_med, label=r"$\mu_t$ median", lw=1.6)
         ax.fill_between(np.arange(self.s.T), mu_lo, mu_hi, alpha=0.25, label=rf"$\mu_t$ {self.band_label}")
-        if getattr(self.s, "true_mu_t", None) is not None and len(self.s.true_mu_t) == self.s.T:
+        if getattr(self.s, "true_mu_t", None) is not None and isinstance(self.s.true_mu_t, np.ndarray) and len(self.s.true_mu_t) == self.s.T:
             ax.plot(self.s.true_mu_t, lw=1.4, ls="--", label=r"true $\mu_t$")
         ax.set_title("Data and posterior $\mu_t$")
         ax.legend(loc="best")
@@ -342,7 +519,7 @@ class DGEVPlotter:
             ax = axes[row]
             ax.plot(a_med, lw=1.6, label=r"$\alpha_t$ median")
             ax.fill_between(np.arange(self.s.T), a_lo, a_hi, alpha=0.25, label=self.band_label)
-            if getattr(self.s, "true_alpha_t", None) is not None and len(self.s.true_alpha_t) == self.s.T:
+            if getattr(self.s, "true_alpha_t", None) is not None and isinstance(self.s.true_alpha_t, np.ndarray) and len(self.s.true_alpha_t) == self.s.T:
                 ax.plot(self.s.true_alpha_t, lw=1.4, ls="--", label=r"true $\alpha_t$")
             ax.set_title(r"Level component $\alpha_t$")
             ax.legend(loc="best")
@@ -358,7 +535,7 @@ class DGEVPlotter:
                 ax = axes[row]
                 ax.plot(b_med, lw=1.6, label=r"$\beta_t$ median")
                 ax.fill_between(np.arange(self.s.T), b_lo, b_hi, alpha=0.25, label=self.band_label)
-                if getattr(self.s, "true_beta_t", None) is not None and len(self.s.true_beta_t) == self.s.T:
+                if getattr(self.s, "true_beta_t", None) is not None and isinstance(self.s.true_beta_t, np.ndarray) and len(self.s.true_beta_t) == self.s.T:
                     ax.plot(self.s.true_beta_t, lw=1.4, ls="--", label=r"true $\beta_t$")
                 ax.set_title(r"Trend component $\beta_t$")
                 ax.legend(loc="best")
@@ -386,7 +563,7 @@ class DGEVPlotter:
                 ax = axes[row]
                 ax.plot(g_med, lw=1.6, label=r"$\gamma_t$ median")
                 ax.fill_between(np.arange(self.s.T), g_lo, g_hi, alpha=0.25, label=self.band_label)
-                if getattr(self.s, "true_gamma_t", None) is not None and len(self.s.true_gamma_t) == self.s.T:
+                if getattr(self.s, "true_gamma_t", None) is not None and isinstance(self.s.true_gamma_t, np.ndarray) and len(self.s.true_gamma_t) == self.s.T:
                     ax.plot(self.s.true_gamma_t, lw=1.4, ls="--", label=r"true $\gamma_t$")
                 ax.set_title(r"Seasonal component $\gamma_t$")
                 ax.legend(loc="best")
@@ -545,8 +722,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run",
         type=str,
-        default="results/simulations/DGEV/dynamic-deterministic-none_20250929_220232",
-        help="Path to a run directory (containing posterior.npz) or to a posterior.npz file. If provided, search is skipped.",
+        default=None,
+        help="Path to a run directory (containing posterior.npz) or to a posterior.npz file. If given, search is skipped.",
     )
     parser.add_argument(
         "--root",
@@ -561,16 +738,21 @@ if __name__ == "__main__":
     parser.add_argument("--skip-states", default=False, help="Skip the stacked states/observations panel.")
     parser.add_argument("--skip-separate", default=False, help="Skip separate component figures.")
     parser.add_argument("--map-bins", type=int, default=60, help="Bins for fast per-time MAP estimation.")
+    parser.add_argument("--max-lag", type=int, default=40, help="Max lag for ACF plots.")
+    parser.add_argument("--season-k", type=int, default=6, help="How many season coefficients to show in diagnostics.")
+    parser.add_argument("--run-default", type=str,
+                        default=None,
+                        help="Optional default run path to use if search fails.")
 
     args = parser.parse_args()
 
-    # ---- Resolve target run (simple) ----
-    if args.run is not None:
-        target = args.run
-        print(f"[info] Using explicit run: {target}")
-    else:
+    # ---- Resolve target run ----
+    target = args.run
+    if not target:
         print(f"[info] Searching latest run under: {args.root}")
         target = find_latest_run(root=args.root)
+        if not target and args.run_default:
+            target = args.run_default
 
     if not target:
         print("[error] No runs found. Provide --run or ensure results exist in the given --root.")
@@ -625,9 +807,9 @@ if __name__ == "__main__":
     s.true_beta_t = draws.get("true_beta_t", None)
     s.true_gamma_t = draws.get("true_gamma_t", None)
 
-    # MCMC bookkeeping (for acceptance text panel)
-    s.accept = meta.get("accept")
-    s.iterations = meta.get("proposals")
+    # MCMC bookkeeping
+    s.accept = meta.get("accept", {})
+    s.proposals = meta.get("proposals", {})
 
     # Save directory (figures saved back into the run directory)
     base_dir = os.path.dirname(bundle.npz_path)
@@ -638,7 +820,12 @@ if __name__ == "__main__":
     # Make plots
     plotter = DGEVPlotter(s, level=float(args.level))
     plotter.plot_diagnostics(save_dir=save_dir, fname_prefix="diagnostics", show=bool(args.show))
-    plotter.plot_mcmc_diagnostics_extra(40, save_dir=save_dir, fname_prefix="mcmc_extra", show=bool(args.show))
+    plotter.plot_mcmc_diagnostics_extra(args.max_lag, save_dir=save_dir, fname_prefix="mcmc_extra", show=bool(args.show))
+    plotter.plot_process_noise_diagnostics(args.max_lag, save_dir=save_dir, fname_prefix="q_diagnostics", show=bool(args.show))
+    plotter.plot_deterministic_param_diagnostics(
+        max_lag=args.max_lag, season_k=args.season_k, save_dir=save_dir, fname_prefix="deterministic_diagnostics", show=bool(args.show)
+    )
+
     if ("mu" in draws) and (not bool(args.skip_states)):
         plotter.plot_states_and_observations(save_dir=save_dir, fname_prefix="states", show=bool(args.show))
     else:
