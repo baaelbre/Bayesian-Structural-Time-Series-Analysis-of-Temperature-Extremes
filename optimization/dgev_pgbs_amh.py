@@ -1023,7 +1023,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DGEV PG-BS Sampler")
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
-    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
     # Basics
     parser.add_argument("--period", type=int, default=4)
@@ -1034,15 +1034,15 @@ if __name__ == "__main__":
 
     parser.add_argument("--true-sigma", type=float, default=2.0)
     parser.add_argument("--true-xi", type=float, default=0.1)
-    parser.add_argument("--q-alpha", type=float, default=1e-5)
-    parser.add_argument("--q-beta",  type=float, default=1e-5)
-    parser.add_argument("--q-gamma", type=float, default=1e-5)
+    parser.add_argument("--q-alpha", type=float, default=1e-3)
+    parser.add_argument("--q-beta",  type=float, default=1e-11)
+    parser.add_argument("--q-gamma", type=float, default=1e-7)
 
     parser.add_argument("--prior-m-sigma", type=float, default=1.0)
     parser.add_argument("--prior-s-sigma", type=float, default=1.0)
     parser.add_argument("--prior-m-xi", type=float, default=0.0)
     parser.add_argument("--prior-s-xi", type=float, default=0.2)
-    parser.add_argument("--prior-aq", type=float, default=1.5)
+    parser.add_argument("--prior-aq", type=float, default=2.0)
     parser.add_argument("--prior-bq", type=float, default=5e-6)
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
