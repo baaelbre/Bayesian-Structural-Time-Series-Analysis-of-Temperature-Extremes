@@ -1,0 +1,73 @@
+{
+  "T": 1560,
+  "dim": 0,
+  "period": 12,
+  "modes": {
+    "level_mode": "deterministic",
+    "trend_mode": "none",
+    "seasonal_mode": "deterministic"
+  },
+  "layout": [],
+  "idx_alpha": null,
+  "idx_beta": null,
+  "idx_gamma_start": null,
+  "idx_gamma_end": null,
+  "cfg": {
+    "n_iter": 10000,
+    "burn": 2000,
+    "thin": 1,
+    "step_logsigma": 0.04,
+    "step_xi": 0.02,
+    "step_level": 0.14,
+    "step_slope": 0.0002,
+    "step_season": 0.1,
+    "n_particles": 250,
+    "trans_eps": 1e-08,
+    "random_seed": 13,
+    "progress": true,
+    "progress_every": 0,
+    "adapt_steps": false,
+    "adapt_every": 25,
+    "adapt_until": "all",
+    "adapt_target_1d": 0.44,
+    "adapt_eta0": 0.05,
+    "adapt_eta_decay": 0.75,
+    "step_min": 1e-05,
+    "step_max": 1.0
+  },
+  "priors": {
+    "m_sigma": 1.9827394241578105,
+    "s_sigma": 3.0,
+    "m_xi": -0.1,
+    "s_xi": 0.25,
+    "a_q": 2.0,
+    "b_q": 0.05,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0
+  },
+  "true_sigma": null,
+  "true_xi": null,
+  "true_Q": null,
+  "accept": {
+    "logsigma": 3748,
+    "xi": 3390,
+    "level": 4975,
+    "slope": 0,
+    "season": 3875
+  },
+  "proposals": {
+    "logsigma": 10000,
+    "xi": 10000,
+    "level": 10000,
+    "slope": 0,
+    "season": 10000
+  },
+  "label": "Uccle TX maxima",
+  "series_key": "TX",
+  "mode_tag": "deterministic-none-deterministic",
+  "elapsed_seconds": 269.6090338230133
+}

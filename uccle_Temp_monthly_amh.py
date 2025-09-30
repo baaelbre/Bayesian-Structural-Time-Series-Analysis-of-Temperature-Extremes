@@ -252,7 +252,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Uccle DGEV runs with adaptive MH options.")
 
     # Data
-    p.add_argument("--series", choices=["TX", "TN"], default="TX")
+    p.add_argument("--series", choices=["TX", "TN"], default="TN")
     p.add_argument("--start-year", type=int, default=1892)
     p.add_argument("--end-year", type=int, default=2022)
     p.add_argument("--data-dir", type=str, default="data")
@@ -260,11 +260,11 @@ if __name__ == "__main__":
 
     # Modes
     p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="deterministic")
-    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="none")
     p.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
 
     # Sampler config
-    p.add_argument("--n-iter", type=int, default=7000)
+    p.add_argument("--n-iter", type=int, default=10000)
     p.add_argument("--burn", type=int, default=2000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--particles", type=int, default=250)
@@ -276,7 +276,13 @@ if __name__ == "__main__":
     p.add_argument("--step-xi", type=float, default=0.02)
     p.add_argument("--step-level", type=float, default=0.14)
     p.add_argument("--step-slope", type=float, default=0.0002)
-    p.add_argument("--step-season", type=float, default=0.11)
+    p.add_argument("--step-season", type=float, default=0.10)
+    # Optimal stepsizes for Uccle TX 1892-2022, n=131:
+    #   Det-Det-Det: logsigma=0.04, xi=0.02, level=0.14, slope=0.0002, season=0.11
+    #   Dyn-Det-Det: logsigma=0.04, xi=0.02, level=0.14, slope=0.0002, season=0.11
+    #   Dyn-Dyn-Det: logsigma=0.04, xi=0.02, level=0.14, slope=0.0002, season=0.11
+    #   Dyn-Dyn-Dyn: logsigma=0.04, xi=0.02, level=0.14, slope=0.0002, season=0.11
+    #   (similar for TN minima-neg)
 
     # Adaptive options
     p.add_argument("--adapt-steps", action="store_true")
