@@ -1,0 +1,93 @@
+{
+  "T": 100,
+  "dim": 2,
+  "period": 4,
+  "modes": "dynamic-dynamic-none",
+  "layout": [
+    "alpha",
+    "beta"
+  ],
+  "idx_alpha": 0,
+  "idx_beta": 1,
+  "idx_gamma_start": null,
+  "idx_gamma_end": null,
+  "cfg": {
+    "n_iter": 2000,
+    "burn": 100,
+    "thin": 1,
+    "step_logsigma": 0.2,
+    "step_xi": 0.2,
+    "step_level": 0.02,
+    "step_slope": 0.0005,
+    "step_season": 0.02,
+    "step_tau_alpha": 0.15,
+    "step_tau_beta": 0.15,
+    "step_tau_gamma": 0.15,
+    "n_particles": 250,
+    "trans_eps": 1e-08,
+    "random_seed": 7,
+    "progress": true,
+    "progress_every": 10,
+    "adapt_steps": false,
+    "adapt_every": 25,
+    "adapt_until": "burn",
+    "adapt_target_1d": 0.44,
+    "adapt_eta0": 0.05,
+    "adapt_eta_decay": 0.75,
+    "step_min": 1e-05,
+    "step_max": 1.0
+  },
+  "priors": {
+    "m_sigma": 1.0,
+    "s_sigma": 1.0,
+    "m_xi": 0.0,
+    "s_xi": 0.2,
+    "u_alpha": 0.01,
+    "alpha_alpha": 0.1,
+    "lambda_alpha": null,
+    "u_beta": 0.0001,
+    "alpha_beta": 0.1,
+    "lambda_beta": null,
+    "u_gamma": 0.001,
+    "alpha_gamma": 0.1,
+    "lambda_gamma": null,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0
+  },
+  "true_sigma": 2.0,
+  "true_xi": 0.1,
+  "true_Q": [
+    0.001,
+    1e-09
+  ],
+  "accept": {
+    "logsigma": 838,
+    "xi": 801,
+    "level": 0,
+    "slope": 0,
+    "season": 0,
+    "tau_alpha": 978,
+    "tau_beta": 933,
+    "tau_gamma": 0
+  },
+  "proposals": {
+    "logsigma": 2000,
+    "xi": 2000,
+    "level": 0,
+    "slope": 0,
+    "season": 0,
+    "tau_alpha": 2000,
+    "tau_beta": 2000,
+    "tau_gamma": 0
+  },
+  "pc_lambdas": {
+    "alpha": 230.25850929940455,
+    "beta": 23025.850929940454,
+    "gamma": 2302.585092994045
+  },
+  "elapsed_seconds": 5486.472322463989
+}

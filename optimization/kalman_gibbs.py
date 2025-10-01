@@ -1,13 +1,14 @@
-# %% DLM_Gibbs.py
 from __future__ import annotations
 
-import os, math, time, json
+import os, math, json, time
 from dataclasses import dataclass, asdict
-from datetime import datetime
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Tuple, Dict, List, Sequence
 
 import numpy as np
+from numpy.linalg import inv, cholesky
+from scipy.stats import invgamma
 from tqdm import tqdm
+from datetime import datetime
 
 # =============================================================================
 # Utilities
@@ -16,71 +17,229 @@ from tqdm import tqdm
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
+
+def build_seasonal(period: int) -> np.ndarray:
+    """
+    Default smooth seasonal for first (p-1) entries (last is implied by sum-to-zero).
+    """
+    g = np.cos(2 * np.pi * np.arange(period) / period)
+    g -= np.mean(g)
+    return g[: period - 1].astype(float)
+
+
 # =============================================================================
-# Priors & configuration
+# Priors & Config (Gaussian DLM)
 # =============================================================================
 
 @dataclass
-class DLM_Priors:
-    """
-    Conjugate priors for a linear-Gaussian DLM.
-
-    Variances use Inverse-Gamma IG(a,b):  p(v) ∝ v^{-(a+1)} exp(-b/v)
-    Static parameters use Gaussian priors N(m_theta, s_theta^2) independently.
-    """
-    # Observation variance R = sigma_y^2
-    a_sigma: float = 2.5
+class Priors:
+    # Observation variance: sigma^2 ~ IG(a_sigma, b_sigma)
+    a_sigma: float = 1.0
     b_sigma: float = 1.0
 
-    # Process variances (per dynamic block)
-    a_Q_alpha: float = 2.5
-    b_Q_alpha: float = 0.1
-    a_Q_beta:  float = 2.5
-    b_Q_beta:  float = 0.1
-    a_Q_gamma: float = 2.5
-    b_Q_gamma: float = 0.1
+    # Process noises for dynamic coords: Q_k ~ IG(a_q, b_q) (shape, scale)
+    # E[Q]=b/(a-1) for a>1 ; Var[Q]=b^2/((a-1)^2 (a-2)) for a>2
+    a_q_alpha: float = 1.1
+    b_q_alpha: float = 1e-3
+    a_q_beta:  float = 1.1
+    b_q_beta:  float = 1e-6
+    a_q_gamma: float = 1.5
+    b_q_gamma: float = 5e-4
 
-    # Static parameters (Gaussian) — only used if deterministic pieces exist
-    m_theta: float = 0.0
-    s_theta: float = 10.0
+    # Deterministic components’ Gaussian priors
+    m_level: float = 0.0
+    s2_level: float = 100.0
+    m_slope: float = 0.0
+    s2_slope: float = 100.0
+
+    # Deterministic season prior (first p-1 means; last implied)
+    m_season: Optional[Sequence[float]] = None
+    s2_season: float = 25.0
 
 
 @dataclass
-class DLM_Config:
+class SamplerConfig:
     n_iter: int = 4000
     burn: int = 1000
     thin: int = 2
+
     random_seed: Optional[int] = 123
     progress: bool = True
-    progress_every: int = 0   # 0 => auto (~2% of n_iter)
+    progress_every: int = 0  # 0 => auto (~2% of n_iter)
+
 
 # =============================================================================
-# DLM with conjugate Gibbs + FFBS (Kalman + RTS)
+# Core Kalman FFBS helpers
 # =============================================================================
 
-class DLM_Gibbs:
-    """
-    Linear-Gaussian DLM with deterministic/dynamic switches:
+class _LinearGaussianSystem:
+    """Builds state-space (F, R) and time-varying design Z_t and offset u_t.
 
-      level_mode   ∈ {"dynamic", "deterministic"}         (no 'none' for level)
-      trend_mode   ∈ {"dynamic", "deterministic", "none"}
-      seasonal_mode∈ {"dynamic", "deterministic", "none"}
-
-    Observation:
-      y_t = mu_t + eps_t,     eps_t ~ N(0, R)
-      mu_t = (level contribution) + (seasonal contribution) + (deterministic regressors)
-
-    Dynamics (when active):
-      alpha_{t+1} = alpha_t + [beta_{t} if dynamic] + w_alpha
-      beta_{t+1}  = beta_t + w_beta
-      seasonal (p-1 dims): shift left; newest coord = -sum(prev p-1) + w_gamma
-
-    Conjugate Gibbs (no MH):
-      - deterministic obs params (intercept, β_det in obs, seasonal dummies) ~ Gaussian
-      - R | (y, x, det params)                                               ~ IG
-      - Q_{•} | x                                                            ~ IG per dynamic coordinate
+    State order mirrors the dynamic layout used throughout:
+        [alpha] [beta] [g1, ..., g_{p-1}]
+    Only included if corresponding mode is dynamic.
     """
 
+    def __init__(self,
+                 T: int,
+                 period: int,
+                 level_mode: str,
+                 trend_mode: str,
+                 seasonal_mode: str,
+                 slope_value: float,
+                 season_vec: Optional[np.ndarray]):
+        self.T = int(T)
+        self.period = int(period)
+        self.level_mode = level_mode
+        self.trend_mode = trend_mode
+        self.seasonal_mode = seasonal_mode
+        self.slope_value = float(slope_value)
+        self.season_vec = None if season_vec is None else np.asarray(season_vec, float)
+
+        # layout
+        layout: List[str] = []
+        if level_mode == "dynamic":
+            layout.append("alpha")
+        if trend_mode == "dynamic":
+            layout.append("beta")
+        if seasonal_mode == "dynamic":
+            layout.extend([f"gamma_{k}" for k in range(1, period)])
+        self.layout = layout
+        self.D = len(layout)
+
+        self.idx_alpha = layout.index("alpha") if "alpha" in layout else None
+        self.idx_beta = layout.index("beta") if "beta" in layout else None
+        if seasonal_mode == "dynamic":
+            self.idx_g0 = layout.index("gamma_1") if "gamma_1" in layout else None
+            self.idx_gL = self.idx_g0 + (period - 2) if self.idx_g0 is not None else None
+        else:
+            self.idx_g0 = None
+            self.idx_gL = None
+
+        # Build constant transition F and process-noise selector G (implicitly identity per coord).
+        self.F = np.eye(self.D)
+        if self.idx_alpha is not None and self.idx_beta is not None:
+            # local level + local trend:
+            self.F[self.idx_alpha, self.idx_beta] = 1.0  # alpha_t = alpha_{t-1} + beta_{t-1} + noise
+        elif self.idx_alpha is not None and trend_mode == "deterministic":
+            # alpha_t = alpha_{t-1} + slope + noise -> handled via d_t on alpha coord
+            pass
+
+        if seasonal_mode == "dynamic":
+            g0, gL = self.idx_g0, self.idx_gL
+            # shift: g1<-g2, ..., g_{p-2}<-g_{p-1}; last becomes -sum(prev)
+            if g0 is not None:
+                # zero seasonal block then fill shift
+                self.F[g0:gL, g0+1:gL+1] = np.eye((period - 2))
+                # last row: all -1 over previous seasonal coords
+                self.F[gL, g0:gL+1] = -1.0
+
+        # time-varying deterministic drift d_t for slope into alpha when slope is deterministic
+        self.d_t = np.zeros((self.T, self.D))
+        if self.idx_alpha is not None and trend_mode == "deterministic":
+            self.d_t[:, self.idx_alpha] = self.slope_value
+
+        # Build time-varying observation design Z_t and offsets u_t (deterministic pieces)
+        self.Z_t = np.zeros((self.T, self.D))
+        self.u_t = np.zeros(self.T)
+        for t in range(self.T):
+            # dynamic alpha always contributes with coefficient 1
+            if self.idx_alpha is not None:
+                self.Z_t[t, self.idx_alpha] = 1.0
+            # dynamic seasonal contributes with coeff 1 on last seasonal coord
+            if self.idx_gL is not None:
+                self.Z_t[t, self.idx_gL] = 1.0
+            # special case: level deterministic & trend dynamic -> observation has t * beta_t
+            if (level_mode == "deterministic") and (self.idx_beta is not None):
+                self.Z_t[t, self.idx_beta] += float(t)
+            # deterministic seasonal offset
+            if seasonal_mode == "deterministic" and self.season_vec is not None:
+                self.u_t[t] += float(self.season_vec[t % period])
+            # deterministic level+trend offset
+            if level_mode == "deterministic":
+                if trend_mode == "deterministic":
+                    self.u_t[t] += 0.0  # accounted below when sampling level/slope; keep 0 here
+                else:
+                    self.u_t[t] += 0.0  # level enters via regression step as offset too
+
+
+# ---- Kalman filter + backward sampling ---- #
+
+def _kalman_ffbs(y: np.ndarray,
+                 sys: _LinearGaussianSystem,
+                 Q: np.ndarray,
+                 sigma2: float,
+                 m0: np.ndarray,
+                 P0: np.ndarray) -> np.ndarray:
+    """
+    Forward-filter backward-sample a full trajectory x_{1:T}.
+    Returns array of shape (T, D).
+    """
+    y = np.asarray(y, float)
+    T, D = sys.T, sys.D
+    if D == 0:
+        return np.zeros((T, 0), float)
+
+    F = sys.F
+    Z_t = sys.Z_t
+    d_t = sys.d_t
+    u_t = sys.u_t
+
+    Qmat = np.diag(Q)  # process noise covariance (diagonal by construction)
+
+    m_tt = np.zeros((T, D), float)  # filtered means
+    P_tt = np.zeros((T, D, D), float)
+    a_t  = np.zeros((T, D), float)  # one-step-ahead means
+    R_t  = np.zeros((T, D, D), float)
+
+    m_prev = m0.copy()
+    P_prev = P0.copy()
+
+    # Forward pass
+    for t in range(T):
+        # Predict
+        a = F @ m_prev + d_t[t]
+        R = F @ P_prev @ F.T + Qmat
+
+        # Update with observation
+        z = Z_t[t]
+        y_t = y[t] - u_t[t]
+        S = float(z @ R @ z.T + sigma2)
+        K = (R @ z.T) / S  # (D,)
+        m = a + K * (y_t - float(z @ a))
+        P = R - np.outer(K, z) @ R
+
+        # store
+        a_t[t] = a
+        R_t[t] = R
+        m_tt[t] = m
+        P_tt[t] = P
+
+        m_prev, P_prev = m, P
+
+    # Backward sampling (FFBS)
+    x = np.zeros((T, D), float)
+    # draw x_T ~ N(m_T, P_T)
+    x[T - 1] = np.random.multivariate_normal(mean=m_tt[T - 1], cov=P_tt[T - 1])
+    for t in range(T - 2, -1, -1):
+        P = P_tt[t]
+        R = R_t[t + 1]
+        a = a_t[t + 1]
+        J = P @ F.T @ inv(R)  # smoother gain
+        mean = m_tt[t] + J @ (x[t + 1] - a)
+        cov = P - J @ R @ J.T
+        # numerical stabilization
+        cov = 0.5 * (cov + cov.T)
+        x[t] = np.random.multivariate_normal(mean=mean, cov=cov)
+
+    return x
+
+
+# =============================================================================
+# Gibbs Sampler (Gaussian DLM)
+# =============================================================================
+
+class GaussianDLmGibbs:
     # --------------------------- Construction --------------------------- #
     def __init__(
         self,
@@ -89,462 +248,393 @@ class DLM_Gibbs:
         level_mode: str = "dynamic",
         trend_mode: str = "dynamic",
         seasonal_mode: str = "dynamic",
-        priors: DLM_Priors = DLM_Priors(),
-        cfg: DLM_Config = DLM_Config(),
+        # Initial state priors for dynamic coords
+        m0_level: float = 0.0, v0_level: float = 1.0,
+        m0_trend: float = 0.0, v0_trend: float = 1.0,
+        m0_season: Sequence[float] | None = None,
+        v0_season: Sequence[float] | None = None,
+        # Priors and config
+        priors: Priors = Priors(),
+        cfg: SamplerConfig = SamplerConfig(),
+        # Deterministic initial values
+        level_value_init: float = 0.0,
+        slope_value_init: float = 0.0,
+        seasonal_vector_init: Optional[Sequence[float]] = None,  # p-1 entries
     ):
-        # Data & modes
+        # Data
         self.y = np.asarray(y, float)
         self.T = int(self.y.size)
         self.period = int(period)
-        assert self.period >= 2, "period must be >= 2"
 
+        # Modes
         assert level_mode in {"dynamic", "deterministic"}
         assert trend_mode in {"dynamic", "deterministic", "none"}
         assert seasonal_mode in {"dynamic", "deterministic", "none"}
-
-        # dynamic trend requires a dynamic level
-        if level_mode == "deterministic" and trend_mode == "dynamic":
-            raise ValueError("trend_mode='dynamic' requires level_mode='dynamic'.")
-
         self.level_mode = level_mode
         self.trend_mode = trend_mode
         self.seasonal_mode = seasonal_mode
 
+        # Priors & config
         self.priors = priors
         self.cfg = cfg
         if cfg.random_seed is not None:
             np.random.seed(cfg.random_seed)
 
-        # ----- latent state layout: ONLY dynamic components ----- #
-        tags: List[str] = []
+        # ---- Latent state layout
+        layout: List[str] = []
         if self.level_mode == "dynamic":
-            tags.append("alpha")
+            layout.append("alpha")
         if self.trend_mode == "dynamic":
-            tags.append("beta")
+            layout.append("beta")
         if self.seasonal_mode == "dynamic":
-            tags.extend([f"gamma_{k}" for k in range(1, self.period)])  # p-1 coords
-        self.tags = tags
-        self.dim = len(tags)
+            layout.extend([f"gamma_{k}" for k in range(1, self.period)])
+        self._layout = layout
+        self.dim = len(layout)
 
-        # indices
-        self.i_alpha = tags.index("alpha") if "alpha" in tags else None
-        self.i_beta  = tags.index("beta")  if "beta"  in tags else None
+        if self.dim == 0 and (self.seasonal_mode != "deterministic") and (self.level_mode != "deterministic"):
+            raise ValueError("At least one contribution to mu_t must exist (dynamic or deterministic).")
+
+        # Indices
+        self.idx_alpha = layout.index("alpha") if "alpha" in layout else None
+        self.idx_beta = layout.index("beta") if "beta" in layout else None
         if self.seasonal_mode == "dynamic":
-            self.i_g0 = tags.index("gamma_1")
-            self.i_gL = self.i_g0 + (self.period - 2)
+            self.idx_gamma_start = layout.index("gamma_1") if "gamma_1" in layout else None
+            self.idx_gamma_end = self.idx_gamma_start + (self.period - 2) if self.idx_gamma_start is not None else None
         else:
-            self.i_g0 = None
-            self.i_gL = None
+            self.idx_gamma_start = None
+            self.idx_gamma_end = None
 
-        # ----- deterministic / static parameters split ----- #
-        # Observation X_obs θ_obs contains:
-        #   - intercept if level deterministic
-        #   - slope (t) whenever trend is deterministic (regardless of level mode)
-        #   - seasonal dummies (first p-1) if seasonal deterministic (last implied)
-        self._slope_in_obs = (self.trend_mode == "deterministic")
-        self._slope_in_transition = False  # <-- IMPORTANT: no drift in alpha transition
+        # ---- Deterministic parameters
+        self.level_value = float(level_value_init)
+        self.slope_value = float(slope_value_init)
 
-        obs_cols: List[str] = []
-        if self.level_mode == "deterministic":
-            obs_cols.append("intercept")
-        if self._slope_in_obs:
-            obs_cols.append("slope_obs")
         if self.seasonal_mode == "deterministic":
-            obs_cols += [f"season{k}" for k in range(1, self.period)]  # last implied by sum-to-zero
-        self.obs_param_names = obs_cols
-        self.p_obs = len(obs_cols)
-        self.theta_obs = np.zeros(self.p_obs, float)
+            if seasonal_vector_init is not None:
+                g_first = np.asarray(seasonal_vector_init, float)
+                if g_first.size != self.period - 1:
+                    raise ValueError("seasonal_vector_init must have length = period-1.")
+            else:
+                if self.priors.m_season is not None:
+                    g_first = np.asarray(self.priors.m_season, float)
+                    if g_first.size != self.period - 1:
+                        raise ValueError("priors.m_season must have length = period-1.")
+                else:
+                    g_first = build_seasonal(self.period)
+            g_last = -np.sum(g_first)
+            self.season_vec = np.concatenate([g_first, [g_last]]).astype(float)
+        else:
+            self.season_vec = None
 
-        # ----- initial state path & variances ----- #
-        self.x = np.zeros((self.T + 1, self.dim), float)  # 0..T
+        # ---- Innovation variances Q (for dynamics): initialize at prior means
+        self.Q = np.zeros(self.dim, float)
+        if self.idx_alpha is not None:
+            self.Q[self.idx_alpha] = self.priors.b_q_alpha / (self.priors.a_q_alpha - 1.0)
+        if self.idx_beta is not None:
+            self.Q[self.idx_beta]  = self.priors.b_q_beta  / (self.priors.a_q_beta  - 1.0)
+        if self.seasonal_mode == "dynamic":
+            self.Q[self.idx_gamma_end] = self.priors.b_q_gamma / (self.priors.a_q_gamma - 1.0)
 
-        # observation & process variances
-        self.R = 1.0
-        self.Qdiag = np.full(self.dim, 1e-2) if self.dim > 0 else np.zeros(0)
+        # ---- Observation variance sigma^2
+        self.sigma2 = self.priors.b_sigma / (self.priors.a_sigma - 1.0) if self.priors.a_sigma > 1.0 else 1.0
 
-        # ---- Truth overlays (optional) ---- #
-        self.true_sigma_y: Optional[float] = None
+        # ---- Initial latent path x_{1:T}
+        self.x = np.zeros((self.T, self.dim), float)
+        if self.seasonal_mode == "dynamic":
+            m0_season_arr = np.zeros(self.period - 1) if m0_season is None else np.asarray(m0_season, float)
+            v0_season_arr = np.ones(self.period - 1)  if v0_season is None else np.asarray(v0_season, float)
+            if m0_season_arr.size != self.period - 1 or v0_season_arr.size != self.period - 1:
+                raise ValueError("m0_season and v0_season must have length p-1 in dynamic mode.")
+
+        m0_list, v0_list = [], []
+        for tag in layout:
+            if tag == "alpha":
+                m0_list.append(float(m0_level)); v0_list.append(float(v0_level))
+            elif tag == "beta":
+                m0_list.append(float(m0_trend)); v0_list.append(float(v0_trend))
+            else:
+                k = int(tag.split("_")[1]) - 1
+                m0_list.append(float(m0_season_arr[k]))
+                v0_list.append(float(v0_season_arr[k]))
+        if self.dim > 0:
+            m0 = np.array(m0_list, float)
+            P0 = np.diag(np.array(v0_list, float))
+            # one FFBS draw with tiny Q to seed a reasonable path
+            sys = _LinearGaussianSystem(T=self.T, period=self.period,
+                                        level_mode=self.level_mode, trend_mode=self.trend_mode,
+                                        seasonal_mode=self.seasonal_mode,
+                                        slope_value=self.slope_value,
+                                        season_vec=self.season_vec)
+            self.x = _kalman_ffbs(self.y, sys, Q=np.maximum(self.Q, 1e-8), sigma2=max(self.sigma2, 1e-3), m0=m0, P0=P0)
+
+        # ---- Storage (filled after knowing n_kept in run())
+        self.keep: Dict[str, np.ndarray] = {}
+
+        # ---- Truth overlays (optional)
+        self.true_sigma2: Optional[float] = None
         self.true_Q: Optional[np.ndarray] = None
         self.true_mu_t: Optional[np.ndarray] = None
+        self.true_alpha_t: Optional[np.ndarray] = None
+        self.true_beta_t: Optional[np.ndarray] = None
+        self.true_gamma_t: Optional[np.ndarray] = None
 
-        # ---- rolling diagnostics ---- #
-        self.last_log_evidence: float = float("nan")
-        self._ema_logZ: Optional[float] = None
-
-        # ---- storage ---- #
-        save_iters = list(range(self.cfg.burn, self.cfg.n_iter, max(1, self.cfg.thin)))
-        self._save_iters = save_iters
-        n_kept = max(0, len(save_iters))
-        self.keep: Dict[str, np.ndarray] = {
-            "mu":       np.zeros((n_kept, self.T), float),
-            "sigma_y":  np.zeros(n_kept, float),     # store std
-            "log_evidence": np.zeros(n_kept, float),
-        }
-        if self.dim > 0:
-            self.keep["x"] = np.zeros((n_kept, self.T, self.dim), float)
-            self.keep["Q"] = np.zeros((n_kept, self.dim), float)
-        # deterministic pieces stored separately
-        if self.level_mode == "deterministic":
-            self.keep["intercept"] = np.zeros(n_kept, float)
-        if self._slope_in_obs:
-            self.keep["slope_obs"] = np.zeros(n_kept, float)
-        if self.seasonal_mode == "deterministic":
-            self.keep["season_pminus1"] = np.zeros((n_kept, self.period - 1), float)
-            self.keep["season_full"]    = np.zeros((n_kept, self.period), float)  # with implied last
-
-    # ------------------------ Truth registration (optional) ------------------------ #
-    def set_truth(self, sigma_y: Optional[float] = None, Q: Optional[np.ndarray] = None) -> None:
-        self.true_sigma_y = sigma_y
+    # --------------------- Truth registration (optional) --------------------- #
+    def set_truth(self, sigma2: Optional[float] = None, Q: Optional[np.ndarray] = None) -> None:
+        self.true_sigma2 = sigma2
         self.true_Q = None if Q is None else np.asarray(Q, float)
 
-    def set_truth_paths(self, mu: Optional[np.ndarray] = None) -> None:
+    def set_truth_paths(self, mu: Optional[np.ndarray] = None,
+                        alpha: Optional[np.ndarray] = None,
+                        beta: Optional[np.ndarray] = None,
+                        gamma: Optional[np.ndarray] = None) -> None:
         self.true_mu_t = None if mu is None else np.asarray(mu, float)
+        self.true_alpha_t = None if alpha is None else np.asarray(alpha, float)
+        self.true_beta_t = None if beta is None else np.asarray(beta, float)
+        self.true_gamma_t = None if gamma is None else np.asarray(gamma, float)
 
-    # ------------------------------- Design matrices ------------------------------ #
-    def _design_matrix_obs(self) -> np.ndarray:
-        """Build X_obs for observation static params θ_obs."""
-        if self.p_obs == 0:
-            return np.zeros((self.T, 0))
-        cols = []
-        t = np.arange(self.T, dtype=float)
-        for name in self.obs_param_names:
-            if name == "intercept":
-                cols.append(np.ones(self.T))
-            elif name == "slope_obs":
-                cols.append(t)
-            elif name.startswith("season"):
-                k = int(name.replace("season", ""))
-                cols.append(((t % self.period) == k).astype(float))  # last implied
-            else:
-                raise RuntimeError(f"Unknown obs param column: {name}")
-        return np.column_stack(cols)
+    # ----------------------------- Helpers --------------------------------- #
+    def _mu_vec_from_states(self, x: np.ndarray) -> np.ndarray:
+        """Compute mu_t given a full state path x_{1:T}."""
+        T = self.T
+        mu = np.zeros(T, float)
+        for t in range(T):
+            m = 0.0
+            if self.idx_alpha is not None:
+                m += float(x[t, self.idx_alpha])
+            if self.seasonal_mode == "dynamic" and self.idx_gamma_end is not None:
+                m += float(x[t, self.idx_gamma_end])
+            if (self.level_mode == "deterministic") and (self.idx_beta is not None):
+                m += float(t) * float(x[t, self.idx_beta])
+            if self.seasonal_mode == "deterministic":
+                m += float(self.season_vec[t % self.period])
+            if self.level_mode == "deterministic" and self.trend_mode == "deterministic":
+                m += self.level_value + self.slope_value * t
+            elif self.level_mode == "deterministic" and self.trend_mode != "deterministic":
+                m += self.level_value
+            return_val = m
+            mu[t] = return_val
+        return mu
 
-    def _offset_from_obs_params(self) -> np.ndarray:
-        if self.p_obs == 0:
-            return np.zeros(self.T)
-        return self._design_matrix_obs() @ self.theta_obs
-
-    def _control_seq(self) -> np.ndarray:
-        """No deterministic drift in transitions."""
+    # ----------------------- Parameter updates ----------------------------- #
+    def _sample_states(self) -> None:
         if self.dim == 0:
-            return np.zeros((self.T, 0))
-        return np.zeros((self.T, self.dim), float)
-
-    # ----------------------------- System matrices ----------------------------- #
-    def _build_F_Q_H(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        D = self.dim
-        F = np.eye(D)
-        Q = np.diag(np.clip(self.Qdiag.copy(), 1e-12, None))
-        H = np.zeros(D)
-
-        # alpha
-        if self.i_alpha is not None:
-            H[self.i_alpha] = 1.0
-            if self.i_beta is not None:
-                F[self.i_alpha, self.i_beta] = 1.0  # drift by beta
-
-        # beta
-        if self.i_beta is not None:
-            F[self.i_beta, self.i_beta] = 1.0
-
-        # seasonal dynamic (p-1 dims)
-        if self.seasonal_mode == "dynamic":
-            # shift gamma1..gamma_{p-2} <- gamma2..gamma_{p-1}
-            for k in range(self.i_g0, self.i_gL):
-                F[k, k] = 0.0
-                F[k, k + 1] = 1.0
-            # newest coord = -sum(prev p-1) + noise
-            F[self.i_gL, self.i_g0:self.i_gL + 1] = -1.0
-            H[self.i_gL] = 1.0  # last coord enters observation
-
-        return F, Q, H.reshape(1, -1)  # H as (1, D)
-
-    # ----------------------- Kalman filter & RTS smoother ---------------------- #
-    def _kalman_innovations_and_filter(
-        self, F, Q, H, R, offset_mu: np.ndarray, b_seq: np.ndarray
-    ) -> Tuple[np.ndarray, List[np.ndarray], float]:
-        """
-        Returns filtered means m[t], covs C[t] for t=0..T and innovation log-likelihood.
-        Diffuse prior: m[0]=0, C[0]=1e6 I.
-        """
-        T, D = self.T, self.dim
-        m = np.zeros((T + 1, D), float)
-        C = [np.eye(D) * 1e6 for _ in range(T + 1)]
-        loglik = 0.0
-
-        for t in range(1, T + 1):
-            # Predict
-            a = F @ m[t - 1]
-            if D > 0:
-                a = a + b_seq[t - 1]
-            Rpred = F @ C[t - 1] @ F.T + Q
-
-            # Forecast & update
-            yhat = (H @ a.reshape(-1, 1)).item() + offset_mu[t - 1]
-            S = (H @ Rpred @ H.T).item() + R
-            v = self.y[t - 1] - yhat
-
-            # Innovations log-likelihood
-            S_safe = max(S, 1e-300)
-            loglik += -0.5 * (math.log(2.0 * math.pi) + math.log(S_safe) + (v * v) / S_safe)
-
-            # Kalman update
-            if D > 0:
-                K = (Rpred @ H.T).reshape(-1) / max(S, 1e-12)
-                m[t] = a + K * v
-                C[t] = Rpred - np.outer(K, K) * S_safe
-            else:
-                m[t] = np.zeros(0)
-                C[t] = np.zeros((0, 0))
-
-        return m, C, float(loglik)
-
-    def _rts_smoother(self, F, Q, m, C, b_seq: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
-        T, D = self.T, self.dim
-        ms = m.copy()
-        Cs = [Ci.copy() for Ci in C]
-        for t in range(T - 1, -1, -1):
-            if D == 0:
-                continue
-            Rpred = F @ C[t] @ F.T + Q
-            J = C[t] @ F.T @ np.linalg.pinv(Rpred)
-            ms[t] = m[t] + J @ (ms[t + 1] - (F @ m[t] + b_seq[t]))
-            Cs[t] = C[t] + J @ (Cs[t + 1] - Rpred) @ J.T
-        return ms, Cs
-
-    # ----------------------------- FFBS state sampling ---------------------------- #
-    def _ffbs(self, F, Q, H, R, offset_mu, b_seq) -> Tuple[np.ndarray, float]:
-        if self.dim == 0:
-            # no dynamic state: only deterministic parameters
-            resid = self.y - offset_mu
-            R_safe = max(R, 1e-12)
-            loglik = -0.5 * np.sum(np.log(2 * np.pi * R_safe) + (resid ** 2) / R_safe)
-            return np.zeros((self.T + 1, 0)), float(loglik)
-
-        m, C, loglik = self._kalman_innovations_and_filter(F, Q, H, R, offset_mu, b_seq)
-        ms, Cs = self._rts_smoother(F, Q, m, C, b_seq)
-
-        T, D = self.T, self.dim
-        x = np.zeros((T + 1, D), float)
-
-        # sample x_T
-        covT = Cs[T] + 1e-12 * np.eye(D)
-        x[T] = np.random.multivariate_normal(ms[T], covT)
-
-        for t in range(T - 1, -1, -1):
-            Rpred = F @ C[t] @ F.T + Q
-            J = C[t] @ F.T @ np.linalg.pinv(Rpred)
-            mean = ms[t] + J @ (x[t + 1] - (F @ m[t] + b_seq[t]))
-            cov = Cs[t] - J @ Rpred @ J.T
-            cov = (cov + cov.T) * 0.5
-            cov += 1e-12 * np.eye(D)
-            x[t] = np.random.multivariate_normal(mean, cov)
-
-        return x, float(loglik)
-
-    # ------------------------------ Static parameter updates ------------------------------ #
-    def _sample_theta_obs(self, R_var: float, x_path: np.ndarray, H: np.ndarray) -> None:
-        if self.p_obs == 0:
             return
-        X = self._design_matrix_obs()
+        # Build system for current deterministic pieces
+        sys = _LinearGaussianSystem(T=self.T, period=self.period,
+                                    level_mode=self.level_mode, trend_mode=self.trend_mode,
+                                    seasonal_mode=self.seasonal_mode,
+                                    slope_value=self.slope_value,
+                                    season_vec=self.season_vec)
+        # initial prior (diffuse-ish via last draw's endpoints)
+        m0 = np.zeros(self.dim)
+        P0 = np.eye(self.dim) * 10.0
+        self.x = _kalman_ffbs(self.y, sys, Q=np.maximum(self.Q, 1e-12), sigma2=max(self.sigma2, 1e-8), m0=m0, P0=P0)
 
-        # subtract dynamic contribution H x_t
-        Hx = np.zeros(self.T)
-        if self.dim > 0:
-            Hx = (H @ x_path[1:].T).ravel()
-        r = self.y - Hx
-
-        s2 = float(self.priors.s_theta ** 2)
-        S0_inv = (1.0 / s2) * np.eye(self.p_obs)
-        m0 = np.full(self.p_obs, float(self.priors.m_theta))
-
-        R_safe = max(R_var, 1e-12)
-        XtX = (X.T @ X) / R_safe
-        XtR = (X.T @ r) / R_safe
-        Sn_inv = S0_inv + XtX
-        Sn = np.linalg.pinv(Sn_inv)
-        mn = Sn @ (S0_inv @ m0 + XtR)
-        Sn = Sn + 1e-12 * np.eye(self.p_obs)
-        self.theta_obs = np.random.multivariate_normal(mn, Sn)
-
-    # --------------------------------- Conjugate variance updates --------------------------------- #
-    def _update_R_IG(self, x_path: np.ndarray, H: np.ndarray) -> float:
-        dyn = np.zeros(self.T)
-        if self.dim > 0:
-            dyn = (H @ x_path[1:].T).ravel()
-        resid = self.y - (dyn + self._offset_from_obs_params())
-        rss = float(resid @ resid)
-        a = self.priors.a_sigma + 0.5 * self.T
-        b = self.priors.b_sigma + 0.5 * rss
-        return float(1.0 / np.random.gamma(a, 1.0 / max(b, 1e-12)))
-
-    def _update_Q_IG(self, x_path: np.ndarray) -> np.ndarray:
-        Qdiag = np.zeros(self.dim)
-
-        # alpha innovations
-        if self.i_alpha is not None:
-            inc = []
-            for t in range(1, self.T + 1):
+    def _sample_Q(self) -> None:
+        pr = self.priors
+        T = self.T
+        if self.idx_alpha is not None:
+            resid = []
+            for t in range(1, T):
                 drift = 0.0
-                if self.i_beta is not None:  # dynamic trend
-                    drift += x_path[t - 1, self.i_beta]
-                inc.append(x_path[t, self.i_alpha] - (x_path[t - 1, self.i_alpha] + drift))
-            inc = np.asarray(inc)
-            rss = float(inc @ inc)
-            a = self.priors.a_Q_alpha + 0.5 * inc.size
-            b = self.priors.b_Q_alpha + 0.5 * rss
-            Qdiag[self.i_alpha] = 1.0 / np.random.gamma(a, 1.0 / max(b, 1e-12))
+                if self.idx_beta is not None:
+                    drift = self.x[t - 1, self.idx_beta]
+                elif self.trend_mode == "deterministic":
+                    drift = self.slope_value
+                mean = self.x[t - 1, self.idx_alpha] + drift
+                resid.append(self.x[t, self.idx_alpha] - mean)
+            rss = float(np.sum(np.square(resid)))
+            a = pr.a_q_alpha + 0.5 * (T - 1)
+            b = pr.b_q_alpha + 0.5 * rss
+            self.Q[self.idx_alpha] = invgamma.rvs(a=a, scale=b)
 
-        # beta innovations
-        if self.i_beta is not None:
-            inc = x_path[1:, self.i_beta] - x_path[:-1, self.i_beta]
-            rss = float(inc @ inc)
-            a = self.priors.a_Q_beta + 0.5 * inc.size
-            b = self.priors.b_Q_beta + 0.5 * rss
-            Qdiag[self.i_beta] = 1.0 / np.random.gamma(a, 1.0 / max(b, 1e-12))
+        if self.idx_beta is not None:
+            resid = self.x[1:, self.idx_beta] - self.x[:-1, self.idx_beta]
+            rss = float(np.sum(np.square(resid)))
+            a = pr.a_q_beta + 0.5 * (T - 1)
+            b = pr.b_q_beta + 0.5 * rss
+            self.Q[self.idx_beta] = invgamma.rvs(a=a, scale=b)
 
-        # seasonal newest coord innovations
         if self.seasonal_mode == "dynamic":
-            inc = []
-            for t in range(1, self.T + 1):
-                prev = x_path[t - 1, self.i_g0:self.i_gL + 1]
-                mean_new = -float(np.sum(prev))
-                inc.append(x_path[t, self.i_gL] - mean_new)
-            inc = np.asarray(inc)
-            rss = float(inc @ inc)
-            a = self.priors.a_Q_gamma + 0.5 * inc.size
-            b = self.priors.b_Q_gamma + 0.5 * rss
-            Qdiag[self.i_gL] = 1.0 / np.random.gamma(a, 1.0 / max(b, 1e-12))
+            g0, gL = self.idx_gamma_start, self.idx_gamma_end
+            resid = []
+            for t in range(1, T):
+                prev_gamma = self.x[t - 1, g0 : gL + 1]
+                mean_new = -np.sum(prev_gamma)
+                resid.append(self.x[t, gL] - mean_new)
+            rss = float(np.sum(np.square(resid)))
+            a = pr.a_q_gamma + 0.5 * (T - 1)
+            b = pr.b_q_gamma + 0.5 * rss
+            self.Q[gL] = invgamma.rvs(a=a, scale=b)
 
-        return Qdiag
+    def _sample_sigma2(self) -> None:
+        mu = self._mu_vec_from_states(self.x)
+        resid = self.y - mu
+        a = self.priors.a_sigma + 0.5 * self.T
+        b = self.priors.b_sigma + 0.5 * float(np.sum(resid * resid))
+        self.sigma2 = invgamma.rvs(a=a, scale=b)
 
-    # --------------------------------- Pretty progress helpers --------------------------------- #
-    def _q_snapshot(self, ema_Q: np.ndarray | None = None) -> str:
-        """Readable Q subset in log10, matching DGEV style."""
-        if self.dim == 0:
-            return ""
-        rows = []
-        def add(label, idx):
-            if idx is None: return
-            q = float(self.Qdiag[idx])
-            logq = np.log10(max(q, 1e-20))
-            if ema_Q is not None:
-                ema = float(ema_Q[idx])
-                logema = np.log10(max(ema, 1e-20))
-                rows.append(f"{label}[log10]: cur={logq:6.2f} ema={logema:6.2f}")
-            else:
-                rows.append(f"{label}[log10]: cur={logq:6.2f}")
-        add("Q_alpha", self.i_alpha)
-        add("Q_beta",  self.i_beta)
-        if self.seasonal_mode == "dynamic":
-            add("Q_gamma(last)", self.i_gL)
-        return " | " + " | ".join(rows)
+    def _sample_level_slope_if_needed(self) -> None:
+        pr = self.priors
+        T = self.T
+        t_idx = np.arange(T, dtype=float)
 
-    def _theta_snapshot_named(self) -> str:
-        if self.p_obs == 0:
-            return ""
-        out = []
-        pos = 0
-        if self.level_mode == "deterministic":
-            out.append(f"intercept≈{self.theta_obs[pos]:.4f}"); pos += 1
-        if self._slope_in_obs:
-            out.append(f"slope_obs≈{self.theta_obs[pos]:.6f}"); pos += 1
-        if self.seasonal_mode == "deterministic":
-            seas = self.theta_obs[pos:pos + (self.period - 1)]
-            out.append("γ_det[:3]≈" + np.array2string(seas[:min(3, seas.size)], precision=3, separator=","))
-        return " | " + " | ".join(out) if out else ""
+        # Case A: level deterministic, trend deterministic -> joint Gaussian regression
+        if self.level_mode == "deterministic" and self.trend_mode == "deterministic":
+            # y = level + slope * t + (dynamic seasonal contribution if any) + eps
+            dyn = np.zeros(T)
+            if self.seasonal_mode == "dynamic" and self.idx_gamma_end is not None:
+                dyn += self.x[:, self.idx_gamma_end]
+            if self.idx_alpha is not None:
+                dyn += self.x[:, self.idx_alpha]
+            if self.seasonal_mode == "deterministic":
+                dyn += self.season_vec[np.mod(np.arange(T), self.period)]
+            y_til = self.y - dyn
+            X = np.vstack([np.ones(T), t_idx]).T
+            # prior N(m, S)
+            m = np.array([pr.m_level, pr.m_slope])
+            S = np.diag([pr.s2_level, pr.s2_slope])
+            Sigma_inv = (X.T @ X) / self.sigma2 + inv(S)
+            Sigma = inv(Sigma_inv)
+            mu = Sigma @ ((X.T @ y_til) / self.sigma2 + inv(S) @ m)
+            draw = np.random.multivariate_normal(mu, Sigma)
+            self.level_value = float(draw[0])
+            self.slope_value = float(draw[1])
+            return
 
-    # --------------------------------- Main sampler --------------------------------- #
+        # Case B: level deterministic, trend dynamic -> sample level by regression
+        if self.level_mode == "deterministic" and self.idx_beta is not None:
+            dyn = np.zeros(T)
+            if self.idx_alpha is not None:
+                dyn += self.x[:, self.idx_alpha]
+            if self.seasonal_mode == "dynamic" and self.idx_gamma_end is not None:
+                dyn += self.x[:, self.idx_gamma_end]
+            if self.seasonal_mode == "deterministic":
+                dyn += self.season_vec[np.mod(np.arange(T), self.period)]
+            dyn += t_idx * self.x[:, self.idx_beta]
+            y_til = self.y - dyn
+            # y_til = level + eps
+            s2_post = 1.0 / (T / self.sigma2 + 1.0 / pr.s2_level)
+            m_post = s2_post * (np.sum(y_til) / self.sigma2 + pr.m_level / pr.s2_level)
+            self.level_value = float(np.random.normal(m_post, np.sqrt(s2_post)))
+            return
+
+        # Case C: level dynamic (alpha present), trend deterministic -> sample slope from alpha transitions
+        if (self.idx_alpha is not None) and (self.trend_mode == "deterministic"):
+            # alpha_t - alpha_{t-1} = slope + noise_alpha
+            d = self.x[1:, self.idx_alpha] - self.x[:-1, self.idx_alpha]
+            Tm1 = d.size
+            s2 = self.Q[self.idx_alpha]
+            # regression with prior N(m_slope, s2_slope)
+            s2_post = 1.0 / (Tm1 / s2 + 1.0 / pr.s2_slope)
+            m_post = s2_post * (np.sum(d) / s2 + pr.m_slope / pr.s2_slope)
+            self.slope_value = float(np.random.normal(m_post, np.sqrt(s2_post)))
+            return
+
+        # Other cases: nothing to update here
+        return
+
+    # --------------------------------- MCMC --------------------------------- #
     def run(self) -> Dict[str, np.ndarray]:
         cfg = self.cfg
-        save_iters = self._save_iters
-        n_kept = self.keep["sigma_y"].size
+
+        # kept draws
+        save_iters = list(range(cfg.burn, cfg.n_iter, cfg.thin))
+        n_kept = max(0, len(save_iters))
+
+        # storage
         keep_idx = 0
+        self.keep = {
+            "sigma2": np.zeros(n_kept, float),
+            "mu":     np.zeros((n_kept, self.T), float),
+        }
+        if self.dim > 0:
+            self.keep["Q"] = np.zeros((n_kept, self.dim), float)
+            if self.idx_alpha is not None:
+                self.keep["alpha_t"] = np.zeros((n_kept, self.T), float)
+            if self.idx_beta is not None:
+                self.keep["beta_t"] = np.zeros((n_kept, self.T), float)
+            if self.seasonal_mode == "dynamic":
+                self.keep["gamma_t"] = np.zeros((n_kept, self.T), float)
+        if self.level_mode == "deterministic":
+            self.keep["level_value"] = np.zeros(n_kept, float)
+        if self.trend_mode == "deterministic":
+            self.keep["slope_value"] = np.zeros(n_kept, float)
+        if self.seasonal_mode == "deterministic":
+            self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
 
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50)
-        ema_Q = np.zeros(self.dim, float) if self.dim > 0 else None
 
-        loop = tqdm(range(cfg.n_iter), disable=not cfg.progress, leave=False)
-        for it in loop:
-            # 1) States via FFBS given current (R, Q, static params)
-            F, Q, H = self._build_F_Q_H()
-            b_seq = self._control_seq()
-            offset = self._offset_from_obs_params()
-            self.x, current_log_ev = self._ffbs(F, Q, H, self.R, offset, b_seq)
+        for it in range(cfg.n_iter):
+            if cfg.progress:
+                print(f"Iteration {it + 1}/{cfg.n_iter}")
 
-            # logZ EMA
-            self.last_log_evidence = float(current_log_ev)
-            self._ema_logZ = self.last_log_evidence if (self._ema_logZ is None) else (0.9 * self._ema_logZ + 0.1 * self.last_log_evidence)
-
-            # 2) deterministic obs params
-            self._sample_theta_obs(R_var=self.R, x_path=self.x, H=H)
-
-            # 3) R | y,x,θ_obs
-            self.R = self._update_R_IG(self.x, H)
-
-            # 4) Q | x
+            # 1) latent states via FFBS
             if self.dim > 0:
-                self.Qdiag = self._update_Q_IG(self.x)
-                if ema_Q is not None:
-                    ema_Q = 0.9 * ema_Q + 0.1 * self.Qdiag
+                self._sample_states()
 
-            # 5) Compact progress line
-            if ((it + 1) % print_every == 0) or (it + 1 == cfg.n_iter):
-                msg = (
-                    f"[it {it+1}/{cfg.n_iter}] "
-                    f"logZ={self.last_log_evidence:.3f} ema={self._ema_logZ:.3f} "
-                    f"σ={math.sqrt(max(self.R,0.0)):.3f}"
-                    f"{self._q_snapshot(ema_Q)}"
-                    f"{self._theta_snapshot_named()}"
-                )
-                if cfg.progress:
-                    loop.set_postfix_str(msg)
+            # 2) dynamic Q
+            if self.dim > 0:
+                self._sample_Q()
 
-            # 6) Save draws
-            if it in save_iters and keep_idx < n_kept:
-                # reconstruct mu_t for this draw
-                if self.dim > 0:
-                    mu = (H @ self.x[1:].T).ravel()
-                else:
-                    mu = np.zeros(self.T)
-                mu += self._offset_from_obs_params()
+            # 3) deterministic structural params (conjugate where applicable)
+            self._sample_level_slope_if_needed()
 
-                self.keep["mu"][keep_idx, :] = mu
-                self.keep["sigma_y"][keep_idx] = math.sqrt(max(self.R, 0.0))
-                self.keep["log_evidence"][keep_idx] = self.last_log_evidence
+            # 4) observation variance
+            self._sample_sigma2()
 
-                if self.dim > 0:
-                    self.keep["x"][keep_idx, :, :] = self.x[1:self.T + 1]
-                    self.keep["Q"][keep_idx, :] = self.Qdiag
-
-                # deterministic pieces saved by name
-                pos = 0
+            # 5) compact progress line
+            if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
+                mu_vec = self._mu_vec_from_states(self.x)
+                info = [
+                    f"sigma={np.sqrt(self.sigma2):.3f}",
+                ]
+                if self.idx_alpha is not None:
+                    info.append(f"Q_alpha={self.Q[self.idx_alpha]:.3e}")
+                if self.idx_beta is not None:
+                    info.append(f"Q_beta={self.Q[self.idx_beta]:.3e}")
+                if self.seasonal_mode == "dynamic" and self.idx_gamma_end is not None:
+                    info.append(f"Q_gamma={self.Q[self.idx_gamma_end]:.3e}")
                 if self.level_mode == "deterministic":
-                    self.keep["intercept"][keep_idx] = self.theta_obs[pos]; pos += 1
-                if self._slope_in_obs:
-                    self.keep["slope_obs"][keep_idx] = self.theta_obs[pos]; pos += 1
+                    info.append(f"level={self.level_value:.3f}")
+                if self.trend_mode == "deterministic":
+                    info.append(f"slope={self.slope_value:.5f}")
+                print("  [status] " + " | ".join(info))
+
+            # 6) store
+            if it in save_iters and keep_idx < n_kept:
+                mu_vec = self._mu_vec_from_states(self.x)
+                self.keep["mu"][keep_idx, :] = mu_vec
+                self.keep["sigma2"][keep_idx] = float(self.sigma2)
+                if self.dim > 0:
+                    self.keep["Q"][keep_idx, :] = self.Q
+                if self.idx_alpha is not None:
+                    self.keep["alpha_t"][keep_idx, :] = self.x[:, self.idx_alpha]
+                if self.idx_beta is not None:
+                    self.keep["beta_t"][keep_idx, :] = self.x[:, self.idx_beta]
+                if self.seasonal_mode == "dynamic":
+                    self.keep["gamma_t"][keep_idx, :] = self.x[:, self.idx_gamma_end]
+                if self.level_mode == "deterministic":
+                    self.keep["level_value"][keep_idx] = self.level_value
+                if self.trend_mode == "deterministic":
+                    self.keep["slope_value"][keep_idx] = self.slope_value
                 if self.seasonal_mode == "deterministic":
-                    seas = self.theta_obs[pos:pos + (self.period - 1)]
-                    self.keep["season_pminus1"][keep_idx, :] = seas
-                    full = np.concatenate([seas, [-float(np.sum(seas))]])
-                    self.keep["season_full"][keep_idx, :] = full
-
+                    self.keep["season_vector"][keep_idx, :] = self.season_vec
                 keep_idx += 1
-
-        if self.cfg.progress:
-            tqdm.write(f"[{it + 1}/{cfg.n_iter}] kept={keep_idx} | final σ={math.sqrt(max(self.R,0.0)):.3f}")
 
         return self.keep
 
-    # --------------------------------- Persistence --------------------------------- #
+    # ------------------------------- Persistence ---------------------------- #
     def save_posterior(self, out_npz_path: str, extra_meta: Optional[dict] = None) -> None:
         _ensure_dir(os.path.dirname(out_npz_path))
 
         arrays = dict(self.keep)
         arrays["y"] = self.y.copy()
-        arrays["x_last"] = self.x[1 : self.T + 1].copy() if self.dim > 0 else np.zeros((self.T, 0))
-        if self.true_mu_t is not None:
-            arrays["true_mu_t"] = np.asarray(self.true_mu_t, float)
+        arrays["x_last"] = self.x.copy() if self.dim > 0 else np.zeros((self.T, 0))
+
+        if self.true_mu_t is not None: arrays["true_mu_t"] = np.asarray(self.true_mu_t, float)
+        if self.true_alpha_t is not None: arrays["true_alpha_t"] = np.asarray(self.true_alpha_t, float)
+        if self.true_beta_t is not None: arrays["true_beta_t"] = np.asarray(self.true_beta_t, float)
+        if self.true_gamma_t is not None: arrays["true_gamma_t"] = np.asarray(self.true_gamma_t, float)
 
         np.savez_compressed(out_npz_path, **arrays)
 
@@ -557,14 +647,14 @@ class DLM_Gibbs:
                 "trend_mode": self.trend_mode,
                 "seasonal_mode": self.seasonal_mode,
             },
-            "latent_state_layout": list(self.tags),
-            "idx_alpha": self.i_alpha,
-            "idx_beta": self.i_beta,
-            "idx_gamma_start": self.i_g0,
-            "idx_gamma_end": self.i_gL,
+            "layout": list(self._layout),
+            "idx_alpha": self.idx_alpha,
+            "idx_beta": self.idx_beta,
+            "idx_gamma_start": self.idx_gamma_start,
+            "idx_gamma_end": self.idx_gamma_end,
             "cfg": asdict(self.cfg),
             "priors": asdict(self.priors),
-            "true_sigma_y": self.true_sigma_y,
+            "true_sigma2": self.true_sigma2,
             "true_Q": (None if self.true_Q is None else np.asarray(self.true_Q, float).tolist()),
         }
         if extra_meta:
@@ -579,168 +669,197 @@ class DLM_Gibbs:
 
 # ------------------------- CLI / Example run & plots ------------------------ #
 if __name__ == "__main__":
-    import argparse
+    import sys, argparse
     import matplotlib.pyplot as plt
-    import sys
     sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-    from simulator.mean_time_series import Mean_Time_Series  # <- your Gaussian simulator
+    from simulator.mean_time_series import Mean_Time_Series  # the Gaussian simulator provided by the user
 
-    parser = argparse.ArgumentParser(description="Gaussian DLM (FFBS+Gibbs)")
-
+    parser = argparse.ArgumentParser(description="Gaussian DLM Gibbs Sampler")
     # Modes
-    parser.add_argument("--level-mode",  choices=["dynamic", "deterministic"], default="dynamic")
-    parser.add_argument("--trend-mode",  choices=["dynamic", "deterministic", "none"], default="deterministic")
+    parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
+    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
-
-    # Data & simulation controls
+    # Basics
     parser.add_argument("--period", type=int, default=12)
-    parser.add_argument("--T", type=int, default=240)
-    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--T", type=int, default=200)
+    # Initial values (shared)
+    parser.add_argument("--level-init", type=float, default=5.0)
+    parser.add_argument("--slope-init", type=float, default=0.02)
 
-    # Truths for simulator (obs sd and process variances)
-    parser.add_argument("--true-sigma", type=float, default=1.5)
-    parser.add_argument("--q-alpha", type=float, default=0.01)
-    parser.add_argument("--q-beta",  type=float, default=0.005)
-    parser.add_argument("--q-gamma", type=float, default=0.02)
+    # True params for simulator
+    parser.add_argument("--true-sigma", type=float, default=2.0)
+    parser.add_argument("--q-alpha", type=float, default=1e-1)
+    parser.add_argument("--q-beta",  type=float, default=1e-5)
+    parser.add_argument("--q-gamma", type=float, default=1e-2)
 
-    # Simulator priors / fixed values
-    parser.add_argument("--m0-level",  type=float, default=5.0)
-    parser.add_argument("--v0-level",  type=float, default=0.25)
-    parser.add_argument("--m0-trend",  type=float, default=0.01)
-    parser.add_argument("--v0-trend",  type=float, default=0.05)
+    # Priors (observation/process variances)
+    parser.add_argument("--prior-a-sigma", type=float, default=2.0)
+    parser.add_argument("--prior-b-sigma", type=float, default=2.0)
+    parser.add_argument("--prior-aq-alpha", type=float, default=1.1)
+    parser.add_argument("--prior-aq-beta", type=float, default=1.1)
+    parser.add_argument("--prior-aq-gamma", type=float, default=1.1)
+    parser.add_argument("--prior-bq-alpha", type=float, default=1)
+    parser.add_argument("--prior-bq-beta", type=float, default=1)
+    parser.add_argument("--prior-bq-gamma", type=float, default=1)
 
-    # Priors (choose a_sigma/b_sigma so mean(b/(a-1)) roughly matches expected σ^2)
-    parser.add_argument("--a-sigma", type=float, default=2.1)
-    parser.add_argument("--b-sigma", type=float, default=3.0)
-    parser.add_argument("--a-Q-alpha", type=float, default=2.5)
-    parser.add_argument("--b-Q-alpha", type=float, default=0.1)
-    parser.add_argument("--a-Q-beta",  type=float, default=2.5)
-    parser.add_argument("--b-Q-beta",  type=float, default=0.1)
-    parser.add_argument("--a-Q-gamma", type=float, default=2.5)
-    parser.add_argument("--b-Q-gamma", type=float, default=0.1)
-    parser.add_argument("--m-theta", type=float, default=0.0)
-    parser.add_argument("--s-theta", type=float, default=10.0)
+    # Deterministic priors
+    parser.add_argument("--prior-m-level", type=float, default=0.0)
+    parser.add_argument("--prior-s2-level", type=float, default=100.0)
+    parser.add_argument("--prior-m-slope", type=float, default=0.0)
+    parser.add_argument("--prior-s2-slope", type=float, default=100.0)
+    parser.add_argument("--prior-m-season", type=str, default=None,
+                        help="Comma-separated first (p-1) means for deterministic seasonal prior (e.g. '0,0,0').")
+    parser.add_argument("--prior-s2-season", type=float, default=25.0)
 
     # Sampler config
-    parser.add_argument("--n-iter", type=int, default=2000)
-    parser.add_argument("--burn",   type=int, default=500)
-    parser.add_argument("--thin",   type=int, default=2)
+    parser.add_argument("--n-iter", type=int, default=10000)
+    parser.add_argument("--burn", type=int, default=1000)
+    parser.add_argument("--thin", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--progress", default=True)
-    parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--progress-every", type=int, default=10,
+                        help="print compact summary every k iterations (0=auto)")
 
     # Output & plotting
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--show-plots", action="store_true")
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     np.random.seed(args.seed)
 
-    # --- Simulate Gaussian series ---
-    sim = Mean_Time_Series(
+    sim_level_mode  = args.level_mode
+    sim_trend_mode  = args.trend_mode
+    sim_season_mode = args.season_mode
+
+    # Simulate data via user's Gaussian simulator
+    mts = Mean_Time_Series(
         sigma=args.true_sigma,
-        level_mode=args.level_mode,
-        trend_mode=args.trend_mode,
-        seasonal_mode=args.season_mode,
+        level_mode=sim_level_mode,
+        trend_mode=sim_trend_mode,
+        seasonal_mode=sim_season_mode,
         period=args.period,
-        q_level=(args.q_alpha if args.level_mode == "dynamic" else 0.0),
-        q_trend=(args.q_beta  if args.trend_mode == "dynamic" else 0.0),
-        q_season=(args.q_gamma if args.season_mode == "dynamic" else 0.0),
-        m0_level=args.m0_level, v0_level=args.v0_level,
-        m0_trend=(args.m0_trend if args.trend_mode != "none" else 0.0), v0_trend=args.v0_trend,
+        q_level=args.q_alpha,
+        q_trend=args.q_beta,
+        q_season=args.q_gamma,
+        m0_level=args.level_init, v0_level=0.2,
+        m0_trend=(args.slope_init if sim_trend_mode != "none" else 0.0), v0_trend=0.05,
         m0_season=[0.0]*(args.period-1), v0_season=[0.5]*(args.period-1),
-        start_date=datetime(2000, 1, 1),
+        start_date=datetime(1980, 1, 1),
     )
 
-    y = np.array([sim.move() or sim.measure() for _ in range(args.T)], float)
-    truth = sim.get_truth_paths(as_numpy=True)
-    mu_true = truth["mu"][1:1 + args.T]
-    dates   = truth["index"][:args.T]
+    y = []
+    for _ in range(args.T):
+        mts.move()
+        y.append(mts.measure())
+    y = np.asarray(y, float)
+
+    truths = mts.get_truth_paths(as_numpy=True)
+    mu_T    = np.asarray(truths["mu"][1:1 + args.T], float)
+    alpha_T = np.asarray(truths["alpha"][1:1 + args.T], float) if sim_level_mode == "dynamic" else None
+    beta_T  = np.asarray(truths["beta"][1:1 + args.T], float)  if sim_trend_mode == "dynamic" else None
+    gamma_T = np.asarray(truths["gamma_last"][1:1 + args.T], float) if sim_season_mode == "dynamic" else None
 
     # Priors & config
-    pri = DLM_Priors(
-        a_sigma=args.a_sigma, b_sigma=args.b_sigma,
-        a_Q_alpha=args.a_Q_alpha, b_Q_alpha=args.b_Q_alpha,
-        a_Q_beta=args.a_Q_beta,   b_Q_beta=args.b_Q_beta,
-        a_Q_gamma=args.a_Q_gamma, b_Q_gamma=args.b_Q_gamma,
-        m_theta=args.m_theta,     s_theta=args.s_theta,
+    def _parse_csv(s: Optional[str]) -> Optional[List[float]]:
+        if s is None: return None
+        s = s.strip()
+        if not s: return None
+        return [float(tok) for tok in s.split(",")]
+
+    m_season_prior = _parse_csv(args.prior_m_season)
+    if m_season_prior is not None and len(m_season_prior) != args.period - 1:
+        raise ValueError(f"--prior-m-season must have length {args.period - 1} (got {len(m_season_prior)}).")
+
+    priors = Priors(
+        a_sigma=float(args.prior_a_sigma), b_sigma=float(args.prior_b_sigma),
+        a_q_alpha=float(args.prior_aq_alpha), b_q_alpha=float(args.prior_bq_alpha),
+        a_q_beta=float(args.prior_aq_beta), b_q_beta=float(args.prior_bq_beta),
+        a_q_gamma=float(args.prior_aq_gamma), b_q_gamma=float(args.prior_bq_gamma),
+        m_level=float(args.prior_m_level), s2_level=float(args.prior_s2_level),
+        m_slope=float(args.prior_m_slope), s2_slope=float(args.prior_s2_slope),
+        m_season=m_season_prior, s2_season=float(args.prior_s2_season),
     )
-    cfg = DLM_Config(
+
+    cfg = SamplerConfig(
         n_iter=args.n_iter, burn=args.burn, thin=args.thin,
         random_seed=args.seed, progress=bool(args.progress),
         progress_every=int(args.progress_every),
     )
 
-    # --- Run sampler ---
-    t0 = time.time()
-    mdl = DLM_Gibbs(
-        y=y, period=args.period,
-        level_mode=args.level_mode, trend_mode=args.trend_mode, seasonal_mode=args.season_mode,
-        priors=pri, cfg=cfg
+    seasonal_init_pminus1 = (
+        np.asarray(m_season_prior, float) if (sim_season_mode == "deterministic" and m_season_prior is not None)
+        else (build_seasonal(args.period) if sim_season_mode == "deterministic" else None)
     )
-    mdl.set_truth(sigma_y=args.true_sigma)
-    mdl.set_truth_paths(mu=mu_true)
 
-    posterior = mdl.run()
-    elapsed = time.time() - t0
-    print(f"Run time: {elapsed:.2f}s")
+    sampler = GaussianDLmGibbs(
+        y=y, period=args.period,
+        level_mode=sim_level_mode, trend_mode=sim_trend_mode, seasonal_mode=sim_season_mode,
+        m0_level=args.level_init, v0_level=0.2,
+        m0_trend=(args.slope_init if sim_trend_mode != "none" else 0.0), v0_trend=0.05,
+        m0_season=(None if sim_season_mode != "dynamic" else [0.0]*(args.period-1)),
+        v0_season=(None if sim_season_mode != "dynamic" else [0.5]*(args.period-1)),
+        priors=priors, cfg=cfg,
+        seasonal_vector_init=seasonal_init_pminus1,
+    )
 
-    # --- Summaries (DGEV-style) ---
-    print(f"Posterior mean sigma_y: {np.mean(posterior['sigma_y']):.3f}  (true {args.true_sigma})")
+    true_Q = []
+    if sim_level_mode == "dynamic": true_Q.append(args.q_alpha)
+    if sim_trend_mode == "dynamic": true_Q.append(args.q_beta)
+    if sim_season_mode == "dynamic": true_Q += [args.q_gamma] + [0.0] * (args.period - 2)
+    sampler.set_truth(sigma2=args.true_sigma**2,
+                      Q=(np.asarray(true_Q, float) if len(true_Q) else None))
+    sampler.set_truth_paths(mu=mu_T, alpha=alpha_T, beta=beta_T, gamma=gamma_T)
 
-    if "Q" in posterior and posterior["Q"].size > 0:
-        means = np.mean(posterior["Q"], axis=0)
-        log10_means = np.log10(np.clip(means, 1e-20, None))
-        print("Posterior mean Q diag (log10):", log10_means)
-
-    # deterministic bits
-    if "intercept" in posterior:
-        print(f"Posterior mean intercept: {float(np.mean(posterior['intercept'])):.4f}")
-    if "slope_obs" in posterior:
-        print(f"Posterior mean slope_obs: {float(np.mean(posterior['slope_obs'])):.6f}")
-    if "season_full" in posterior:
-        sf = posterior["season_full"]
-        print("Posterior mean seasonal (full cycle):", np.mean(sf, axis=0))
-
-    if "log_evidence" in posterior:
-        le = posterior["log_evidence"]
-        print(f"Mean log p(y|θ): {np.nanmean(le):.3f} | Median: {np.nanmedian(le):.3f} | Best: {np.nanmax(le):.3f}")
-
-    # --- Quick plot ---
-    quick_fig = None
-    if not args.no_plots:
-        mu_hat = np.mean(posterior["mu"], axis=0)
-        lo = np.percentile(posterior["mu"], 5, axis=0)
-        hi = np.percentile(posterior["mu"], 95, axis=0)
-
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(12, 4))
-        plt.plot(dates, y, label="y", linewidth=1.0)
-        plt.plot(dates, mu_hat, "--", label="E[mu|y]", linewidth=1.0)
-        plt.fill_between(dates, lo, hi, alpha=0.2, label="90% band")
-        if mu_true is not None and len(mu_true) == args.T:
-            plt.plot(dates, mu_true, ":", label="mu (true)", linewidth=1.0)
-        plt.title(f"DLM fit | level={args.level_mode}, trend={args.trend_mode}, season={args.season_mode}")
-        plt.legend()
-        plt.tight_layout()
-        quick_fig = plt.gcf()
-
-    # --- Save posterior & metadata ---
-    tag = f"{args.level_mode}-{args.trend_mode}-{args.season_mode}"
+    tag = f"{sim_level_mode}-{sim_trend_mode}-{sim_season_mode}"
     out_dir = args.out_dir or os.path.join("results", "simulations", "DLM",
                                            f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     fig_dir = os.path.join(out_dir, "figures")
     _ensure_dir(out_dir); _ensure_dir(fig_dir)
 
-    mdl.save_posterior(
+    t0 = time.time()
+    posterior = sampler.run()
+    elapsed = time.time() - t0
+    print(f"Sampler run time: {elapsed:.2f}s")
+
+    sampler.save_posterior(
         out_npz_path=os.path.join(out_dir, "posterior.npz"),
         extra_meta={"modes": tag, "elapsed_seconds": float(elapsed)},
     )
 
-    if quick_fig is not None:
-        png_path = os.path.join(fig_dir, "quick_overview.png")
-        quick_fig.savefig(png_path, dpi=200, bbox_inches="tight")
-        print(f"[save] Figure -> {png_path}")
+    # ---- Summaries ----
+    print(f"Posterior mean sigma: {np.mean(np.sqrt(posterior['sigma2'])):.3f} (true {args.true_sigma})")
 
-    print(f"[info] Figures will be saved to: {fig_dir}")
+    if sampler.true_Q is not None:
+        tq = np.asarray(sampler.true_Q, float)
+        if sampler.idx_alpha is not None and tq.size > sampler.idx_alpha:
+            print(f"True Q_alpha:         {tq[sampler.idx_alpha]:.6g}")
+        if sampler.idx_beta is not None and tq.size > sampler.idx_beta:
+            print(f"True Q_beta:          {tq[sampler.idx_beta]:.6g}")
+        if sampler.seasonal_mode == "dynamic" and sampler.idx_gamma_end is not None and tq.size > sampler.idx_gamma_end:
+            print(f"True Q_gamma(last):   {tq[sampler.idx_gamma_end]:.6g}")
+
+    if "Q" in posterior and sampler.dim > 0 and posterior["Q"].size > 0:
+        if sampler.idx_alpha is not None:
+            print(f"Posterior mean Q_alpha: {np.mean(posterior['Q'][:, sampler.idx_alpha]):.6g}")
+        if sampler.idx_beta is not None:
+            print(f"Posterior mean Q_beta:  {np.mean(posterior['Q'][:, sampler.idx_beta]):.6g}")
+        if sampler.seasonal_mode == "dynamic":
+            print(f"Posterior mean Q_gamma: {np.mean(posterior['Q'][:, sampler.idx_gamma_end]):.6g}")
+
+    # Quick diagnostic plot
+    if not args.no_plots:
+        mu_mean = posterior["mu"].mean(axis=0)
+        lo = np.percentile(posterior["mu"], 5, axis=0)
+        hi = np.percentile(posterior["mu"], 95, axis=0)
+        plt.figure(figsize=(11, 4))
+        plt.plot(y, label="y", linewidth=1.0)
+        plt.plot(mu_mean, "--", label="E[mu|y]", linewidth=1.2)
+        plt.fill_between(np.arange(len(mu_mean)), lo, hi, alpha=0.15, label="90% band")
+        plt.title(f"Gaussian DLM Gibbs :: {tag}")
+        plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(fig_dir, "mu_fit.png"), dpi=150)
+        if args.show_plots:
+            plt.show()
+        plt.close()
