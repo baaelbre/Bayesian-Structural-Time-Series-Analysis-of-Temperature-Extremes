@@ -961,10 +961,10 @@ class DGEVParticleGibbs:
                 rows.append(f"{label}: cur={logq:6.2f} ema={logema:6.2f}")
             else:
                 rows.append(f"{label}: cur={logq:6.2f}")
-        add("Q_alpha", self.idx_alpha)
-        add("Q_beta", self.idx_beta)
+        add("Q_alpha [log10]", self.idx_alpha)
+        add("Q_beta [log10]", self.idx_beta)
         if self.seasonal_mode == "dynamic":
-            add("Q_gamma(last)", self.idx_gamma_end)
+            add("Q_gamma [log10]", self.idx_gamma_end)
         return (" | " + " | ".join(rows)) if rows else ""
 
     # --------------------------------- MCMC --------------------------------- #
@@ -1194,8 +1194,8 @@ if __name__ == "__main__":
     parser.add_argument("--prior-aq-alpha", type=float, default=1.1)
     parser.add_argument("--prior-aq-beta", type=float, default=1.1)
     parser.add_argument("--prior-aq-gamma", type=float, default=1.1)
-    parser.add_argument("--prior-bq-alpha", type=float, default=1.0)
-    parser.add_argument("--prior-bq-beta", type=float, default=1.0)
+    parser.add_argument("--prior-bq-alpha", type=float, default=1.0) # prior mean of Q_alpha = b/(a-1) = 1/0.1=10
+    parser.add_argument("--prior-bq-beta", type=float, default=1.0) # prior variance of Q_beta = b^2/((a-1)^2*(a-2))=1/(0.1^2*0.1)=1000
     parser.add_argument("--prior-bq-gamma", type=float, default=1.0)
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
