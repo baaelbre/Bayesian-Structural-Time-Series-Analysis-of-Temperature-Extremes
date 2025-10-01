@@ -60,6 +60,81 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
         return float(np.sum(-np.log(sigma) - np.exp(-z) - z))
     return float(np.sum(-np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
 
+def gev_d2loglik_dmu2(y: float, mu: float, sigma: float, xi: float) -> float:
+    """
+    ∂^2/∂μ^2 log g(y|μ,σ,ξ).
+    Used for curvature-based pseudo-measurement variance in UKF.
+    """
+    if sigma <= 0.0 or np.isnan(mu):
+        return float("nan")
+    z = (y - mu) / sigma
+    u = 1.0 + xi * z
+    if u <= 0.0:
+        return float("nan")
+    if abs(xi) < 1e-8:
+        # Gumbel: log g = -log σ - u' - e^{-u'}, with u'=(y-μ)/σ
+        return -np.exp(-(y - mu) / sigma) / (sigma * sigma)
+    # General case
+    # d2/dμ2 log g = (1/σ^2) * [ ξ(ξ+1)/u^2 - (ξ+1) u^{-1/ξ - 2} ]
+    return (1.0 / (sigma * sigma)) * (xi * (xi + 1.0) / (u * u) - (xi + 1.0) * u ** (-1.0 / xi - 2.0))
+
+# =============================================================================
+# UKF helpers
+# =============================================================================
+
+def _chol_psd(M: np.ndarray, jitter: float = 1e-10) -> np.ndarray:
+    """Cholesky with diagonal jitter for PSD matrices."""
+    d = M.shape[0]
+    jitter_val = jitter
+    for _ in range(8):
+        try:
+            return np.linalg.cholesky(M + jitter_val * np.eye(d))
+        except np.linalg.LinAlgError:
+            jitter_val *= 10.0
+    # final fallback
+    return np.linalg.cholesky(M + jitter_val * np.eye(d))
+
+def _unscented_sigma_points(m: np.ndarray, P: np.ndarray,
+                            alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0
+                            ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate sigma points and weights for mean and covariance.
+    Returns (X: [2d+1,d], Wm: [2d+1], Wc: [2d+1]).
+    """
+    d = m.size
+    lam = alpha * alpha * (d + kappa) - d
+    S = _chol_psd((d + lam) * P)
+    X = np.zeros((2 * d + 1, d), float)
+    X[0] = m
+    for i in range(d):
+        col = S[:, i]
+        X[i + 1] = m + col
+        X[i + 1 + d] = m - col
+    Wm = np.full(2 * d + 1, 1.0 / (2.0 * (d + lam)), float)
+    Wc = Wm.copy()
+    Wm[0] = lam / (d + lam)
+    Wc[0] = lam / (d + lam) + (1.0 - alpha * alpha + beta)
+    return X, Wm, Wc
+
+def _log_norm_pdf(x: np.ndarray, mean: np.ndarray, cov: np.ndarray) -> float:
+    """Multivariate normal log-density."""
+    d = mean.size
+    # Try Cholesky
+    L = _chol_psd(cov, 1e-12)
+    diff = x - mean
+    sol = np.linalg.solve(L, diff)
+    quad = sol @ sol
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    return -0.5 * (d * np.log(2.0 * np.pi) + logdet + quad)
+
+def _log_quotient_normals(x: np.ndarray,
+                          m1: np.ndarray, S1: np.ndarray,
+                          m0: np.ndarray, S0: np.ndarray) -> float:
+    """
+    log [ N(x; m1,S1) / N(x; m0,S0) ].
+    """
+    return _log_norm_pdf(x, m1, S1) - _log_norm_pdf(x, m0, S0)
+
 # =============================================================================
 # Priors & Config
 # =============================================================================
@@ -120,8 +195,17 @@ class SamplerConfig:
     step_min: float = 1e-5
     step_max: float = 1.0
 
+    # UKF scaling
+    ukf_alpha: float = 1e-3
+    ukf_beta: float = 2.0
+    ukf_kappa: float = 0.0
+
+    # Curvature-based R caps
+    R_min: float = 1e-6
+    R_max: float = 1e6
+
 # =============================================================================
-# Particle Gibbs with Ancestor Sampling (PGAS) for structural DGEV
+# Particle Gibbs with Ancestor Sampling (PGAS) + UKF proposal
 # =============================================================================
 
 class DGEVParticleGibbs:
@@ -249,7 +333,7 @@ class DGEVParticleGibbs:
         # ---- Storage (filled after knowing n_kept in run())
         self.keep: Dict[str, np.ndarray] = {}
 
-        # ---- MH bookkeeping
+        # ---- MH acceptance
         self.accept = {"logsigma": 0, "xi": 0, "level": 0, "slope": 0, "season": 0}
         self.proposals = {"logsigma": 0, "xi": 0, "level": 0, "slope": 0, "season": 0}
 
@@ -271,7 +355,7 @@ class DGEVParticleGibbs:
         self.last_log_evidence: float = float("nan")
         self.last_pf_diag: Dict[str, float] = {}
 
-    # --------------------- Truth registration (optional) --------------------- #
+    # ----------------------- Truth registration (optional) ----------------------- #
     def set_truth(self, sigma: Optional[float] = None, xi: Optional[float] = None, Q: Optional[np.ndarray] = None) -> None:
         self.true_sigma = sigma
         self.true_xi = xi
@@ -311,29 +395,11 @@ class DGEVParticleGibbs:
         return alpha * new + (1.0 - alpha) * (0.0 if old is None else old)
 
     def _mh_accept(self, logacc: float) -> bool:
-        """Numerically safe MH accept: compare to min(0, logacc)."""
         return (np.log(np.random.rand()) < min(0.0, logacc))
-
-    # ------------------------ Step getters/setters --------------------------- #
-    def _get_step(self, key: str) -> float:
-        if   key == "logsigma": return self.cfg.step_logsigma
-        elif key == "xi":       return self.cfg.step_xi
-        elif key == "level":    return self.cfg.step_level
-        elif key == "slope":    return self.cfg.step_slope
-        elif key == "season":   return self.cfg.step_season
-        else: raise KeyError(key)
-
-    def _set_step(self, key: str, val: float) -> None:
-        v = float(np.clip(val, self.cfg.step_min, self.cfg.step_max))
-        if   key == "logsigma": self.cfg.step_logsigma = v
-        elif key == "xi":       self.cfg.step_xi = v
-        elif key == "level":    self.cfg.step_level = v
-        elif key == "slope":    self.cfg.step_slope = v
-        elif key == "season":   self.cfg.step_season = v
-        else: raise KeyError(key)
 
     # ----------------------------- State model ------------------------------ #
     def _state_mean(self, x_prev: np.ndarray, t: int) -> np.ndarray:
+        """Deterministic evolution mean m_t^- = A x_{t-1} (in structural form)."""
         m = np.zeros_like(x_prev)
 
         # alpha (local level) with drift from beta or deterministic slope
@@ -362,7 +428,7 @@ class DGEVParticleGibbs:
         if self.level_mode == "dynamic":
             return float(x_t[self.idx_alpha]) if self.idx_alpha is not None else 0.0
         base = self.level_value
-        if self.idx_beta is not None:      # dynamic trend
+        if self.idx_beta is not None:      # dynamic trend present
             return float(base + x_t[self.idx_beta] * t)
         if self.trend_mode == "deterministic":
             return float(base + self.slope_value * t)
@@ -387,11 +453,6 @@ class DGEVParticleGibbs:
             diff = x_cur[k] - mean[k]
             out += -0.5 * (math.log(2.0 * math.pi * var) + (diff * diff) / var)
         return float(out)
-
-    def _transition_sample(self, x_prev: np.ndarray, t: int) -> np.ndarray:
-        mean = self._state_mean(x_prev, t)
-        var = np.where(self.Q > 0.0, self.Q, self.cfg.trans_eps)
-        return mean + np.random.normal(0.0, np.sqrt(var), size=self.dim)
 
     def _propagate_initial_path(self, Q_init: np.ndarray) -> None:
         for t in range(1, self.T + 1):
@@ -533,7 +594,6 @@ class DGEVParticleGibbs:
         cur = self.slope_value
         prop = cur + np.random.normal(0.0, step)
 
-        # Observation term matters only if level is deterministic
         if self.level_mode == "deterministic":
             mu_vec_old = self._mu_vec_current()
             self.slope_value = prop
@@ -548,7 +608,6 @@ class DGEVParticleGibbs:
             ll_obs_old = 0.0
             ll_obs_new = 0.0
 
-        # Alpha-transition term matters only if alpha exists
         if self.idx_alpha is not None:
             ll_trans_old = self._alpha_transition_loglike_given_slope(cur)
             ll_trans_new = self._alpha_transition_loglike_given_slope(prop)
@@ -604,20 +663,33 @@ class DGEVParticleGibbs:
             self.accept["season"] += 1
 
     # ------------------- Adaptive step-size ------------------ #
+    def _get_step(self, key: str) -> float:
+        if   key == "logsigma": return self.cfg.step_logsigma
+        elif key == "xi":       return self.cfg.step_xi
+        elif key == "level":    return self.cfg.step_level
+        elif key == "slope":    return self.cfg.step_slope
+        elif key == "season":   return self.cfg.step_season
+        else: raise KeyError(key)
+
+    def _set_step(self, key: str, val: float) -> None:
+        v = float(np.clip(val, self.cfg.step_min, self.cfg.step_max))
+        if   key == "logsigma": self.cfg.step_logsigma = v
+        elif key == "xi":       self.cfg.step_xi = v
+        elif key == "level":    self.cfg.step_level = v
+        elif key == "slope":    self.cfg.step_slope = v
+        elif key == "season":   self.cfg.step_season = v
+        else: raise KeyError(key)
+
     def _adapt_steps(self, it: int) -> None:
         cfg = self.cfg
         if not cfg.adapt_steps:
             return
-
         in_window = (cfg.adapt_until == "all") or (it < cfg.burn)
         if (it + 1) % max(1, cfg.adapt_every) != 0 or (not in_window):
             return
-
-        # decreasing learning-rate
         k = self._adapt_round
         eta = cfg.adapt_eta0 / ((1.0 + k) ** cfg.adapt_eta_decay)
 
-        # eligible scalar keys
         keys: List[str] = ["logsigma", "xi"]
         if self.level_mode == "deterministic":
             keys.append("level")
@@ -627,8 +699,6 @@ class DGEVParticleGibbs:
             keys.append("season")
 
         target = cfg.adapt_target_1d
-        changed = []
-
         for key in keys:
             acc_now = self.accept[key]
             prop_now = self.proposals[key]
@@ -636,33 +706,80 @@ class DGEVParticleGibbs:
             prop_win = prop_now - self._mh_prev_prop[key]
             if prop_win <= 0:
                 continue
-
             rate = acc_win / max(1, prop_win)
             s = self._get_step(key)
             s_new = s * np.exp(eta * (rate - target))   # log-scale update
-
             self._set_step(key, s_new)
-            changed.append((key, s, self._get_step(key), rate))
-
-            # refresh window counters
             self._mh_prev_acc[key] = acc_now
             self._mh_prev_prop[key] = prop_now
-
-        if changed and self.cfg.progress:
-            msg = " | ".join([f"{k}: {old:.4g}→{new:.4g} (acc_win={r:.2f})"
-                              for (k, old, new, r) in changed])
-            print(f"  [adapt] η={eta:.4f} target={target:.2f} :: {msg}")
         self._adapt_round += 1
 
-    # --------------- Conditional SMC with Ancestor Sampling (PGAS) ---------- #
+    # ---------------- UKF proposal for one step (given x_{t-1}) ------------- #
+    def _ukf_proposal_params(self, x_prev: np.ndarray, t: int, y_t: float
+                             ) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        """
+        Build UKF Gaussian proposal q(x_t | x_{t-1}, y_t) = N(m_plus, P_plus),
+        and return also the transition prior N(m_pred, Qdiag) needed for weights.
+        """
+        d = self.dim
+        # Prediction
+        m_pred = self._state_mean(x_prev, t)
+        Qdiag = np.where(self.Q > 0.0, self.Q, self.cfg.trans_eps)
+        P_pred = np.diag(Qdiag)
+
+        if d == 0:
+            return m_pred, P_pred, 0.0, 0.0
+
+        # Sigma points
+        X, Wm, Wc = _unscented_sigma_points(m_pred, P_pred,
+                                            alpha=self.cfg.ukf_alpha,
+                                            beta=self.cfg.ukf_beta,
+                                            kappa=self.cfg.ukf_kappa)
+        # Propagate through h(x)=mu(x,t)
+        z_pts = np.array([self.mu_from_state(xi, t - 1) for xi in X], float)  # scalar per point
+
+        z_mean = float(np.sum(Wm * z_pts))
+        # Curvature-based pseudo measurement noise R
+        curv = gev_d2loglik_dmu2(y_t, z_mean, self.sigma, self.xi)  # may be negative
+        # Observed Fisher ≈ -curv; variance ≈ 1/(-curv)
+        if np.isnan(curv) or curv >= -1e-12:
+            R = self.cfg.R_max
+        else:
+            R = 1.0 / max(-curv, 1.0 / self.cfg.R_max)
+            R = float(np.clip(R, self.cfg.R_min, self.cfg.R_max))
+
+        # Innovation covariance S and cross-covariance C
+        S = float(np.sum(Wc * (z_pts - z_mean) * (z_pts - z_mean))) + R
+        C = np.zeros(d, float)
+        for i in range(X.shape[0]):
+            dx = X[i] - m_pred
+            dz = (z_pts[i] - z_mean)
+            C += Wc[i] * dx * dz
+
+        # Kalman gain and posterior moments
+        if S <= 0.0 or not np.isfinite(S):
+            # fall back to transition prior
+            return m_pred, P_pred, 0.0, 0.0
+        K = C / S  # [d]
+        m_plus = m_pred + K * (y_t - z_mean)
+        P_plus = P_pred - np.outer(K, K) * S
+
+        # Ensure PSD
+        P_plus = 0.5 * (P_plus + P_plus.T)
+        # Add tiny ridge if needed
+        try:
+            _ = _chol_psd(P_plus, 1e-12)
+        except Exception:
+            P_plus += 1e-10 * np.eye(d)
+
+        # Return: proposal params (m_plus,P_plus) and also prior (m_pred, Qdiag) for weight quotient
+        return m_plus, P_plus, m_pred, Qdiag
+
+    # --------------- Conditional SMC with Ancestor Sampling (UKF-PGAS) ------ #
     def _conditional_pgas(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, dict]:
         """
-        Conditional SMC + Ancestor Sampling (PGAS).
-        Returns (parts, w, a, logZ, pf_diag) where:
-          - parts[t, n, :] is particle n at time t
-          - w[t, n] are normalized weights
-          - a[t, n] is ancestor index of particle n at time t
-          - logZ is log p(y|theta) estimate (SMC marginal likelihood)
+        Conditional SMC + Ancestor Sampling (PGAS) using a UKF proposal.
+        Returns (parts, w, a, logZ, pf_diag).
         The reference path is the current self.x[1:T], enforced as particle N.
         """
         N, T, D = self.cfg.n_particles, self.T, self.dim
@@ -677,31 +794,49 @@ class DGEVParticleGibbs:
         if D > 0:
             parts[0, :, :] = self.x[0]  # common x0
 
-        # ----- t = 1: propose N-1 free, set ref as N with AS on a[1, N-1] -----
+        # ---------- t = 1 ----------
+        # propose N-1 from UKF proposal conditional on their own ancestors (which are trivial at t=0)
         for n in range(N - 1):
             if D > 0:
-                parts[1, n, :] = self._transition_sample(parts[0, n, :], t=1)
+                m_plus, P_plus, m_pred, Qdiag = self._ukf_proposal_params(parts[0, n, :], t=1, y_t=self.y[0])
+                parts[1, n, :] = np.random.multivariate_normal(m_plus, P_plus)
             a[1, n] = n
 
+        # set reference particle
         if D > 0:
             parts[1, N - 1, :] = self.x[1].copy()
 
-        # compute weights at t=1
+        # compute log-weights at t=1
         lw = np.zeros(N, float)
         for n in range(N):
             mu = self.mu_from_state(parts[1, n, :] if D > 0 else np.zeros(0), t=0)
-            lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi)
+            # importance weight with quotient of normals (transition/prior over proposal)
+            if D > 0 and n < N - 1:
+                m_plus, P_plus, m_pred, Qdiag = self._ukf_proposal_params(parts[0, n, :], t=1, y_t=self.y[0])
+                lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi) \
+                        + _log_quotient_normals(parts[1, n, :],
+                                                m1=m_pred, S1=np.diag(Qdiag),
+                                                m0=m_plus, S0=P_plus)
+            else:
+                # reference particle (drawn from conditional path): use model likelihood only,
+                # proposal cancels because it's fixed; still correct with prior density f
+                if D > 0:
+                    m_pred = self._state_mean(parts[0, N - 1, :], t=1)
+                    Qdiag = np.where(self.Q > 0.0, self.Q, self.cfg.trans_eps)
+                    lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi) \
+                            + _log_norm_pdf(parts[1, n, :], m_pred, np.diag(Qdiag))
+                else:
+                    lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi)
 
-        # ancestor sampling for reference at t=1 (depends on w[0] which is uniform here)
+        # ancestor sampling for reference at t=1 (based on transition prior)
         if D > 0:
-            # unnormalized previous weights at t=0: equal ⇒ ignore; use transition likelihoods only
             logf = np.array([self._transition_logpdf(parts[0, j, :], parts[1, N - 1, :], t=1) for j in range(N)], float)
             post = self._safe_normalize(np.exp(logf - np.max(logf)))
             a[1, N - 1] = np.random.choice(N, p=post)
         else:
             a[1, N - 1] = N - 1
 
-        # normalize w[1] and update logZ
+        # normalize weights and update logZ
         lw_max = np.max(lw)
         logZ += lw_max + math.log(np.mean(np.exp(lw - lw_max)) + 1e-300)
         w[1, :] = self._safe_normalize(np.exp(lw - lw_max))
@@ -709,7 +844,7 @@ class DGEVParticleGibbs:
         maxw_list.append(float(np.max(w[1, :])))
 
         if self.cfg.progress:
-            print("  Running conditional PGAS...")
+            print("  Running conditional PGAS (UKF proposal)...")
 
         it = tqdm(range(2, T + 1)) if self.cfg.progress else range(2, T + 1)
         for t in it:
@@ -717,19 +852,20 @@ class DGEVParticleGibbs:
             res_p = self._safe_normalize(w[t - 1, :])
             anc = np.random.choice(N, size=N - 1, p=res_p, replace=True)
 
-            # propagate non-reference particles
+            # propagate non-reference particles from UKF proposal
             for n in range(N - 1):
                 a[t, n] = anc[n]
                 if D > 0:
-                    prev = parts[t - 1, a[t, n], :]
-                    parts[t, n, :] = self._transition_sample(prev, t=t)
+                    x_prev = parts[t - 1, a[t, n], :]
+                    m_plus, P_plus, _, _ = self._ukf_proposal_params(x_prev, t=t, y_t=self.y[t - 1])
+                    parts[t, n, :] = np.random.multivariate_normal(m_plus, P_plus)
 
             # set the reference particle and perform ANCESTOR SAMPLING for its parent
             if D > 0:
                 x_ref_t = self.x[t]
                 parts[t, N - 1, :] = x_ref_t.copy()
 
-                # ancestor sampling weights ∝ w[t-1, j] * p(x_ref_t | x_{t-1}^j)
+                # ancestor sampling weights ∝ w[t-1, j] * f(x_ref_t | x_{t-1}^j)
                 logw_prev = np.log(np.clip(w[t - 1, :], 1e-300, None))
                 logf = np.array([self._transition_logpdf(parts[t - 1, j, :], x_ref_t, t=t) for j in range(N)], float)
                 log_post = (logw_prev + logf)
@@ -738,12 +874,33 @@ class DGEVParticleGibbs:
             else:
                 a[t, N - 1] = N - 1
 
-            # ----- compute weights at t
+            # ----- compute weights at time t
             y_idx = t - 1
             lw = np.zeros(N, float)
             for n in range(N):
-                mu = self.mu_from_state(parts[t, n, :] if D > 0 else np.zeros(0), t=y_idx)
-                lw[n] = gev_logpdf(self.y[y_idx], mu, self.sigma, self.xi)
+                if D > 0:
+                    x_cur = parts[t, n, :]
+                    mu = self.mu_from_state(x_cur, t=y_idx)
+                else:
+                    mu = 0.0
+                if n < N - 1 and D > 0:
+                    x_prev = parts[t - 1, a[t, n], :]
+                    m_plus, P_plus, m_pred, Qdiag = self._ukf_proposal_params(x_prev, t=t, y_t=self.y[y_idx])
+                    # log weight: log g + log [ N(x; m_pred,Q) / N(x; m_plus,P_plus) ]
+                    lw[n] = gev_logpdf(self.y[y_idx], mu, self.sigma, self.xi) \
+                            + _log_quotient_normals(x_cur,
+                                                    m1=m_pred, S1=np.diag(Qdiag),
+                                                    m0=m_plus, S0=P_plus)
+                else:
+                    # reference particle weight: g * f (proposal fixed)
+                    if D > 0:
+                        x_prev = parts[t - 1, a[t, n], :]
+                        m_pred = self._state_mean(x_prev, t)
+                        Qdiag = np.where(self.Q > 0.0, self.Q, self.cfg.trans_eps)
+                        lw[n] = gev_logpdf(self.y[y_idx], mu, self.sigma, self.xi) \
+                                + _log_norm_pdf(parts[t, n, :], m_pred, np.diag(Qdiag))
+                    else:
+                        lw[n] = gev_logpdf(self.y[y_idx], mu, self.sigma, self.xi)
 
             lw_max = np.max(lw)
             logZ += lw_max + math.log(np.mean(np.exp(lw - lw_max)) + 1e-300)
@@ -765,20 +922,14 @@ class DGEVParticleGibbs:
         return parts, w, a, float(logZ), pf_diag
 
     def _trace_single_trajectory(self, parts: np.ndarray, a: np.ndarray, w: np.ndarray) -> np.ndarray:
-        """
-        Trace one trajectory from particles+ancestors by sampling k_T ~ w[T]
-        and following ancestors backwards. Returns x_path with shape (T+1, D)
-        (x_0 copied from prior init).
-        """
+        """Trace one trajectory from particles+ancestors by sampling k_T ~ w[T]."""
         N, T, D = self.cfg.n_particles, self.T, self.dim
         if D == 0:
             return self.x
-
         idx = np.zeros(T + 1, dtype=int)
         idx[T] = np.random.choice(N, p=w[T, :])
         for t in range(T, 1, -1):
             idx[t - 1] = a[t, idx[t]]
-
         x_new = self.x.copy()
         x_new[0, :] = parts[0, 0, :] if D > 0 else self.x[0, :]
         for t in range(1, T + 1):
@@ -847,7 +998,6 @@ class DGEVParticleGibbs:
         if self.seasonal_mode == "deterministic":
             self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
 
-        # rolling summaries
         ema_logZ: Optional[float] = None
         ema_Q = np.zeros(self.dim, float) if self.dim > 0 else None
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50)
@@ -856,7 +1006,7 @@ class DGEVParticleGibbs:
             if cfg.progress:
                 print(f"Iteration {it + 1}/{cfg.n_iter}")
 
-            # 1) latent states via PGAS
+            # 1) latent states via PGAS (UKF proposal)
             if self.dim > 0:
                 self.update_states_pgas()
                 current_log_ev = float(self.last_log_evidence)
@@ -895,7 +1045,7 @@ class DGEVParticleGibbs:
             self._adapt_steps(it)
 
             # 5) compact progress line
-            if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
+            if self.cfg.progress and ((it + 1) % print_every == 0 or it == self.cfg.n_iter - 1):
                 acc_logs = self._fmt_acc('logsigma')
                 acc_xi   = self._fmt_acc('xi')
 
@@ -1011,16 +1161,15 @@ class DGEVParticleGibbs:
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
 
-# ------------------------- CLI / Example run & plots ------------------------ #
+# ------------------------- CLI / Example run & summaries -------------------- #
 if __name__ == "__main__":
     import sys, argparse
-    import matplotlib.pyplot as plt
     sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
     from simulator.extremal_time_series import Extremal_Time_Series
     # from simulator.dgev_plotter import DGEVPlotter  # optional
 
-    parser = argparse.ArgumentParser(description="DGEV PGAS Sampler")
+    parser = argparse.ArgumentParser(description="DGEV PGAS Sampler (UKF proposal)")
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="none")
@@ -1055,7 +1204,7 @@ if __name__ == "__main__":
     parser.add_argument("--prior-m-season", type=str, default=None,
                         help="Comma-separated first (p-1) means for deterministic seasonal prior (e.g. '0,0,0').")
     parser.add_argument("--prior-s-season", type=float, default=5.0)
-    
+
     # Sampler config
     parser.add_argument("--n-iter", type=int, default=2000)
     parser.add_argument("--burn", type=int, default=100)
@@ -1081,6 +1230,13 @@ if __name__ == "__main__":
     parser.add_argument("--adapt-target-1d", type=float, default=0.44)
     parser.add_argument("--step-min", type=float, default=1e-5)
     parser.add_argument("--step-max", type=float, default=1.0)
+
+    # UKF params
+    parser.add_argument("--ukf-alpha", type=float, default=1e-3)
+    parser.add_argument("--ukf-beta", type=float, default=2.0)
+    parser.add_argument("--ukf-kappa", type=float, default=0.0)
+    parser.add_argument("--R-min", type=float, default=1e-6)
+    parser.add_argument("--R-max", type=float, default=1e6)
 
     # Output & plotting
     parser.add_argument("--out-dir", type=str, default=None)
@@ -1147,11 +1303,6 @@ if __name__ == "__main__":
         m_season=m_season_prior, s_season=float(args.prior_s_season),
     )
 
-    prior_mean_Q_alpha = priors.b_q_alpha / (priors.a_q_alpha - 1.0) if priors.a_q_alpha > 1.0 else float("inf")
-    prior_var_Q_alpha  = (priors.b_q_alpha**2 / ((priors.a_q_alpha - 1.0)**2 * (priors.a_q_alpha - 2.0))
-                    if priors.a_q_alpha > 2.0 else float("inf"))
-    print(f"[info] Prior on Q_alpha has mean={prior_mean_Q_alpha:.6g} and variance={prior_var_Q_alpha:.6g}.")
-
     cfg = SamplerConfig(
         n_iter=args.n_iter, burn=args.burn, thin=args.thin,
         step_logsigma=args.step_logsigma, step_xi=args.step_xi,
@@ -1167,6 +1318,11 @@ if __name__ == "__main__":
         adapt_target_1d=float(args.adapt_target_1d),
         step_min=float(args.step_min),
         step_max=float(args.step_max),
+        ukf_alpha=float(args.ukf_alpha),
+        ukf_beta=float(args.ukf_beta),
+        ukf_kappa=float(args.ukf_kappa),
+        R_min=float(args.R_min),
+        R_max=float(args.R_max),
     )
 
     seasonal_init_pminus1 = (
@@ -1196,8 +1352,7 @@ if __name__ == "__main__":
     tag = f"{sim_level_mode}-{sim_trend_mode}-{sim_season_mode}"
     out_dir = args.out_dir or os.path.join("results", "simulations", "DGEV",
                                            f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    fig_dir = os.path.join(out_dir, "figures")
-    _ensure_dir(out_dir); _ensure_dir(fig_dir)
+    _ensure_dir(out_dir)
 
     t0 = time.time()
     posterior = sampler.run()
