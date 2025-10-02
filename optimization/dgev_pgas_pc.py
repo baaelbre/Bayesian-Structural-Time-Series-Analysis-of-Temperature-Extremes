@@ -132,7 +132,7 @@ class SamplerConfig:
     progress_every: int = 0  # 0 => auto (~2% of n_iter)
 
     # ---- Adaptive RW–MH options (Robbins–Monro; windowed) ----
-    adapt_steps: bool = False
+    adapt_steps: bool = True
     adapt_every: int = 25
     adapt_until: str = "burn"         # "burn" or "all"
     adapt_target_1d: float = 0.44
@@ -756,7 +756,6 @@ class DGEVParticleGibbs:
             # refresh window counters
             self._mh_prev_acc[key] = acc_now
             self._mh_prev_prop[key] = prop_now
-
         if changed and self.cfg.progress:
             msg = " | ".join([f"{k}: {old:.4g}→{new:.4g} (acc_win={r:.2f})"
                               for (k, old, new, r) in changed])
@@ -1204,7 +1203,7 @@ if __name__ == "__main__":
     # Adaptive RW–MH CLI
     parser.add_argument("--adapt-steps", default=True)
     parser.add_argument("--adapt-every", type=int, default=25)
-    parser.add_argument("--adapt-until", choices=["burn","all"], default="burn")
+    parser.add_argument("--adapt-until", choices=["burn","all"], default="all")
     parser.add_argument("--adapt-eta0", type=float, default=0.05)
     parser.add_argument("--adapt-decay", type=float, default=0.75)
     parser.add_argument("--adapt-target-1d", type=float, default=0.44)
