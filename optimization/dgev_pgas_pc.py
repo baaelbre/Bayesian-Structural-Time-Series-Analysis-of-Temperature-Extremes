@@ -355,6 +355,7 @@ class DGEVParticleGibbs:
         lam_a = _calc_lambda(self.priors.pc_alpha, sd1) if self.idx_alpha is not None else 1.0
         lam_b = _calc_lambda(self.priors.pc_beta,  sd2) if self.idx_beta  is not None else 1.0
         lam_g = _calc_lambda(self.priors.pc_gamma, sdg) if self.seasonal_mode == "dynamic" else 1.0
+        print(f"Auto-calibrated PC prior lambdas: λ_alpha={lam_a:.4g}, λ_beta={lam_b:.4g}, λ_gamma={lam_g:.4g}")
         return lam_a, lam_b, lam_g
 
     # ----------------------- Helpers: norm / ESS / EMA ----------------------- #
@@ -1189,7 +1190,7 @@ if __name__ == "__main__":
     parser.add_argument("--step-level", type=float, default=0.02)
     parser.add_argument("--step-slope", type=float, default=0.0005)
     parser.add_argument("--step-season", type=float, default=0.02)
-    parser.add_argument("--step-log-s-alpha", type=float, default=0.10)
+    parser.add_argument("--step-log-s-alpha", type=float, default=0.25)
     parser.add_argument("--step-log-s-beta",  type=float, default=0.10)
     parser.add_argument("--step-log-s-gamma", type=float, default=0.10)
 
@@ -1201,7 +1202,7 @@ if __name__ == "__main__":
                         help="print compact summary every k iterations (0=auto)")
 
     # Adaptive RW–MH CLI
-    parser.add_argument("--adapt-steps", action="store_true")
+    parser.add_argument("--adapt-steps", default=True)
     parser.add_argument("--adapt-every", type=int, default=25)
     parser.add_argument("--adapt-until", choices=["burn","all"], default="burn")
     parser.add_argument("--adapt-eta0", type=float, default=0.05)

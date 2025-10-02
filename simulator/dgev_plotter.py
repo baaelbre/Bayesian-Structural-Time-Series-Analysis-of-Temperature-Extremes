@@ -722,7 +722,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--run",
         type=str,
-        default="results/simulations/DGEV/dynamic-none-none_20251001_235023",
+        default="results/simulations/DGEV/dynamic-none-none_20251002_150050",
         help="Path to a run directory (containing posterior.npz) or to a posterior.npz file. If given, search is skipped.",
     )
     parser.add_argument(
