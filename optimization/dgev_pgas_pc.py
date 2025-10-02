@@ -1172,10 +1172,10 @@ if __name__ == "__main__":
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
     # PC prior calibration (data-dependent defaults; you can override)
-    parser.add_argument("--pc-frac-alpha", type=float, default=0.10)
+    parser.add_argument("--pc-frac-alpha", type=float, default=0.10) #0.10*MAD(delta y)
     parser.add_argument("--pc-frac-beta",  type=float, default=0.10)
     parser.add_argument("--pc-frac-gamma", type=float, default=0.10)
-    parser.add_argument("--pc-alpha-prob", type=float, default=0.05, help="Tail prob α in P(s>u)=α for all coords.")
+    parser.add_argument("--pc-alpha-prob", type=float, default=0.5, help="Tail prob α in P(s>u)=α for all coords.")
     parser.add_argument("--pc-lambda-alpha", type=float, default=None)
     parser.add_argument("--pc-lambda-beta",  type=float, default=None)
     parser.add_argument("--pc-lambda-gamma", type=float, default=None)
