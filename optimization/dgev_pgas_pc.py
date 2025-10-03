@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import os, math, json, time
-# add `field` to your dataclass imports
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Tuple, Dict, List, Sequence
 
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
+
 
 # =============================================================================
 # Utilities
@@ -41,6 +41,7 @@ def _mad(v: np.ndarray) -> float:
 def _robust_sd(v: np.ndarray) -> float:
     return _mad(np.asarray(v, float)) / 1.4826 if v.size else 0.0
 
+
 # =============================================================================
 # GEV helpers
 # =============================================================================
@@ -69,23 +70,24 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
         return float(np.sum(-np.log(sigma) - np.exp(-z) - z))
     return float(np.sum(-np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
 
+
 # =============================================================================
 # Priors & Config (PC priors on s = sqrt(Q))
 # =============================================================================
 
 @dataclass
 class PCPrior:
-    """PC prior configuration for a single sd s>0:  p(s) = λ exp(-λ s).
-    If lambda_s is None, it will be computed from data as:
-      λ = -log(alpha_prob) / (frac * robust_scale_of_differences)
+    """PC prior for one sd s>0: p(s) = λ exp(-λ s).
+    If lambda_s is None, it is data-calibrated as:
+      λ = -log(alpha_prob) / (frac * robust_scale)
     """
     lambda_s: Optional[float] = None
-    frac: float = 0.10           # u = frac * data_scale
-    alpha_prob: float = 0.05     # P(s > u) = alpha_prob
+    frac: float = 0.10
+    alpha_prob: float = 0.05
 
 @dataclass
 class Priors:
-    # Observation priors (same as before)
+    # Observation
     m_sigma: float = 0.0
     s_sigma: float = 10.0
     m_xi: float = 0.0
@@ -101,7 +103,7 @@ class Priors:
     m_season: Optional[Sequence[float]] = None
     s_season: float = 5.0
 
-    # PC priors for dynamic state-noise sds  (use default_factory!)
+    # PC priors for dynamic state-noise sds
     pc_alpha: PCPrior = field(default_factory=PCPrior)
     pc_beta:  PCPrior = field(default_factory=PCPrior)
     pc_gamma: PCPrior = field(default_factory=PCPrior)
@@ -112,14 +114,14 @@ class SamplerConfig:
     burn: int = 1000
     thin: int = 5
 
-    # RW–MH step sizes (initial values)
+    # RW–MH step sizes (initial)
     step_logsigma: float = 0.05
     step_xi: float = 0.05
     step_level: float = 0.05
     step_slope: float = 0.02
     step_season: float = 0.05
 
-    # New: steps for log-sd proposals (PC priors)
+    # steps for log-sd proposals (PC priors)
     step_log_s_alpha: float = 0.10
     step_log_s_beta:  float = 0.10
     step_log_s_gamma: float = 0.10
@@ -131,7 +133,7 @@ class SamplerConfig:
     progress: bool = True
     progress_every: int = 0  # 0 => auto (~2% of n_iter)
 
-    # ---- Adaptive RW–MH options (Robbins–Monro; windowed) ----
+    # Adaptive RW–MH (Robbins–Monro; windowed)
     adapt_steps: bool = True
     adapt_every: int = 25
     adapt_until: str = "burn"         # "burn" or "all"
@@ -141,12 +143,12 @@ class SamplerConfig:
     step_min: float = 1e-5
     step_max: float = 1.0
 
+
 # =============================================================================
 # Particle Gibbs with Ancestor Sampling (PGAS) for structural DGEV
 # =============================================================================
 
 class DGEVParticleGibbs:
-    # --------------------------- Construction --------------------------- #
     def __init__(
         self,
         y: np.ndarray,
@@ -237,11 +239,9 @@ class DGEVParticleGibbs:
         self.xi       = float(self.priors.m_xi)
 
         # ---- Innovation sds and variances (for dynamics) with PC priors
-        # s = sqrt(Q); we store both for convenience
         self.s = np.zeros(self.dim, float)       # innovation standard deviations
         self.Q = np.zeros(self.dim, float)       # innovation variances
 
-        # Calibrate PC lambdas from data if not provided
         lam_alpha, lam_beta, lam_gamma = self._auto_pc_lambdas()
 
         # Initialize s to PC-prior median: med(s)=log(2)/λ
@@ -258,7 +258,6 @@ class DGEVParticleGibbs:
             self.s[self.idx_gamma_end] = s_med
             self.Q[self.idx_gamma_end] = s_med**2
 
-        # ---- PC lambdas stored
         self.lambda_alpha = lam_alpha if self.idx_alpha is not None else None
         self.lambda_beta  = lam_beta  if self.idx_beta  is not None else None
         self.lambda_gamma = lam_gamma if self.seasonal_mode == "dynamic" else None
@@ -283,10 +282,9 @@ class DGEVParticleGibbs:
                 v0_list.append(float(v0_season_arr[k]))
         if self.dim > 0:
             self.x[0] = np.random.normal(np.array(m0_list), np.sqrt(np.array(v0_list)))
-            # very small jitter to start a plausible path
             self._propagate_initial_path(Q_init=np.ones(self.dim) * 1e-6)
 
-        # ---- Storage (filled after knowing n_kept in run())
+        # ---- Storage
         self.keep: Dict[str, np.ndarray] = {}
 
         # ---- MH bookkeeping
@@ -299,12 +297,12 @@ class DGEVParticleGibbs:
             "log_s_alpha": 0, "log_s_beta": 0, "log_s_gamma": 0
         }
 
-        # ---- adaptation bookkeeping (windowed deltas)
+        # Adaptation bookkeeping (windowed)
         self._mh_prev_acc = dict(self.accept)
         self._mh_prev_prop = dict(self.proposals)
         self._adapt_round = 0
 
-        # ---- Truth overlays (optional)
+        # Optional truth overlays
         self.true_sigma: Optional[float] = None
         self.true_xi: Optional[float] = None
         self.true_Q: Optional[np.ndarray] = None
@@ -313,11 +311,11 @@ class DGEVParticleGibbs:
         self.true_beta_t: Optional[np.ndarray] = None
         self.true_gamma_t: Optional[np.ndarray] = None
 
-        # ---- PF diagnostics
+        # PF diagnostics
         self.last_log_evidence: float = float("nan")
         self.last_pf_diag: Dict[str, float] = {}
-        
-            # --------------------- Truth registration (optional) --------------------- #
+
+    # --------------------- Truth registration (optional) --------------------- #
     def set_truth(self, sigma: Optional[float] = None, xi: Optional[float] = None, Q: Optional[np.ndarray] = None) -> None:
         self.true_sigma = sigma
         self.true_xi = xi
@@ -334,21 +332,15 @@ class DGEVParticleGibbs:
 
     # --------------------- Data-dependent PC lambdas --------------------- #
     def _auto_pc_lambdas(self) -> Tuple[float, float, float]:
-        """Return (lambda_alpha, lambda_beta, lambda_gamma) using data-scaled defaults
-        unless provided in priors. Uses robust SD of differences.
-        """
+        """Return (lambda_alpha, lambda_beta, lambda_gamma) using data-scaled defaults unless provided."""
         y = self.y
-        # Level: first differences
         sd1 = _robust_sd(np.diff(y)) if y.size >= 2 else 0.0
-        # Trend: second differences
         sd2 = _robust_sd(np.diff(y, n=2)) if y.size >= 3 else 0.0
-        # Seasonal: fallback to first differences unless a better proxy is available
         sdg = sd1
 
         def _calc_lambda(pc: PCPrior, sd: float) -> float:
             if pc.lambda_s is not None and pc.lambda_s > 0.0:
                 return float(pc.lambda_s)
-            # u = frac * sd (guard from degenerate scales)
             u = max(1e-12, pc.frac * max(1e-12, sd))
             return float(-math.log(max(1e-12, pc.alpha_prob)) / u)
 
@@ -483,7 +475,6 @@ class DGEVParticleGibbs:
 
     # ----------- PC prior MH updates for sds: z = log s, s = exp(z) ---------- #
     def _update_log_sd_single(self, key: str, idx: Optional[int], lambda_s: Optional[float]) -> None:
-        """Generic MH update for one sd (alpha/beta/gamma-last)."""
         if idx is None or lambda_s is None:
             return
         step = self._get_step(key)
@@ -491,9 +482,8 @@ class DGEVParticleGibbs:
         z_prop = z_cur + np.random.normal(0.0, step)
         s_cur, s_prop = math.exp(z_cur), math.exp(z_prop)
 
-        # Transition residual sums for this coordinate
+        # Residuals per coordinate
         if key == "log_s_alpha":
-            # alpha_t - (alpha_{t-1} + drift)
             resid = []
             for t in range(1, self.T + 1):
                 drift = 0.0
@@ -506,11 +496,10 @@ class DGEVParticleGibbs:
             rss = float(np.sum(np.square(resid)))
             T_eff = self.T
         elif key == "log_s_beta":
-            # beta_t - beta_{t-1}
             resid = self.x[1:, idx] - self.x[:-1, idx]
             rss = float(np.sum(np.square(resid)))
             T_eff = self.T
-        else:  # "log_s_gamma": last seasonal component innovation
+        else:  # gamma-last
             g0, gL = self.idx_gamma_start, self.idx_gamma_end
             resid = []
             for t in range(1, self.T + 1):
@@ -520,11 +509,11 @@ class DGEVParticleGibbs:
             rss = float(np.sum(np.square(resid)))
             T_eff = self.T
 
-        # Log-likelihood part for Gaussian innovations with sd s: -T*log s - rss/(2 s^2)
+        # Gaussian innovations ll: -T*log s - rss/(2 s^2)
         ll_cur = -(T_eff * z_cur) - (rss * math.exp(-2.0 * z_cur) / 2.0)
         ll_prop = -(T_eff * z_prop) - (rss * math.exp(-2.0 * z_prop) / 2.0)
 
-        # PC prior on s: log p(s) = -lambda * s  => in z: -lambda * e^z  (no Jacobian: we parameterize in z)
+        # PC prior in z: log p(s)= -λ e^z
         lp_cur = -lambda_s * s_cur
         lp_prop = -lambda_s * s_prop
 
@@ -612,7 +601,6 @@ class DGEVParticleGibbs:
             self.accept["level"] += 1
 
     def _alpha_transition_loglike_given_slope(self, slope: float) -> float:
-        """Transition ll for alpha when trend is deterministic. 0 if alpha absent."""
         if self.idx_alpha is None:
             return 0.0
         var = self.Q[self.idx_alpha] if self.Q[self.idx_alpha] > 0.0 else self.cfg.trans_eps
@@ -636,7 +624,6 @@ class DGEVParticleGibbs:
         cur = self.slope_value
         prop = cur + np.random.normal(0.0, step)
 
-        # Observation term matters only if level is deterministic
         if self.level_mode == "deterministic":
             mu_vec_old = self._mu_vec_current()
             self.slope_value = prop
@@ -651,7 +638,6 @@ class DGEVParticleGibbs:
             ll_obs_old = 0.0
             ll_obs_new = 0.0
 
-        # Alpha-transition term matters only if alpha exists
         if self.idx_alpha is not None:
             ll_trans_old = self._alpha_transition_loglike_given_slope(cur)
             ll_trans_new = self._alpha_transition_loglike_given_slope(prop)
@@ -716,11 +702,9 @@ class DGEVParticleGibbs:
         if (it + 1) % max(1, cfg.adapt_every) != 0 or (not in_window):
             return
 
-        # decreasing learning-rate
         k = self._adapt_round
         eta = cfg.adapt_eta0 / ((1.0 + k) ** cfg.adapt_eta_decay)
 
-        # eligible scalar keys
         keys: List[str] = ["logsigma", "xi"]
         if self.level_mode == "deterministic":
             keys.append("level")
@@ -736,7 +720,6 @@ class DGEVParticleGibbs:
             keys.append("log_s_gamma")
 
         target = cfg.adapt_target_1d
-        changed = []
 
         for key in keys:
             acc_now = self.accept[key]
@@ -748,30 +731,22 @@ class DGEVParticleGibbs:
 
             rate = acc_win / max(1, prop_win)
             s = self._get_step(key)
-            s_new = s * np.exp(eta * (rate - target))   # log-scale update
-
+            s_new = s * np.exp(eta * (rate - target))
             self._set_step(key, s_new)
-            changed.append((key, s, self._get_step(key), rate))
 
-            # refresh window counters
             self._mh_prev_acc[key] = acc_now
             self._mh_prev_prop[key] = prop_now
-        if changed and self.cfg.progress:
-            msg = " | ".join([f"{k}: {old:.4g}→{new:.4g} (acc_win={r:.2f})"
-                              for (k, old, new, r) in changed])
-            print(f"  [adapt] η={eta:.4f} target={target:.2f} :: {msg}")
         self._adapt_round += 1
 
     # --------------- Conditional SMC with Ancestor Sampling (PGAS) ---------- #
     def _conditional_pgas(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, dict]:
         """
-        Conditional SMC + Ancestor Sampling (PGAS).
-        Returns (parts, w, a, logZ, pf_diag) where:
+        Returns (parts, w, a, logZ, pf_diag):
           - parts[t, n, :] is particle n at time t
           - w[t, n] are normalized weights
           - a[t, n] is ancestor index of particle n at time t
-          - logZ is log p(y|theta) estimate (SMC marginal likelihood)
-        The reference path is the current self.x[1:T], enforced as particle N.
+          - logZ is log p(y|theta) estimate
+        The reference path is current self.x[1:T], enforced as particle N.
         """
         N, T, D = self.cfg.n_particles, self.T, self.dim
         parts = np.zeros((T + 1, N, D), float) if D > 0 else np.zeros((T + 1, N, 0), float)
@@ -785,7 +760,7 @@ class DGEVParticleGibbs:
         if D > 0:
             parts[0, :, :] = self.x[0]  # common x0
 
-        # ----- t = 1: propose N-1 free, set ref as N with AS on a[1, N-1] -----
+        # t = 1: sample N-1 free; set ref as N with AS
         for n in range(N - 1):
             if D > 0:
                 parts[1, n, :] = self._transition_sample(parts[0, n, :], t=1)
@@ -794,13 +769,11 @@ class DGEVParticleGibbs:
         if D > 0:
             parts[1, N - 1, :] = self.x[1].copy()
 
-        # compute weights at t=1
         lw = np.zeros(N, float)
         for n in range(N):
             mu = self.mu_from_state(parts[1, n, :] if D > 0 else np.zeros(0), t=0)
             lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi)
 
-        # ancestor sampling for reference at t=1
         if D > 0:
             logf = np.array([self._transition_logpdf(parts[0, j, :], parts[1, N - 1, :], t=1) for j in range(N)], float)
             post = self._safe_normalize(np.exp(logf - np.max(logf)))
@@ -808,7 +781,6 @@ class DGEVParticleGibbs:
         else:
             a[1, N - 1] = N - 1
 
-        # normalize w[1] and update logZ
         lw_max = np.max(lw)
         logZ += lw_max + math.log(np.mean(np.exp(lw - lw_max)) + 1e-300)
         w[1, :] = self._safe_normalize(np.exp(lw - lw_max))
@@ -820,18 +792,15 @@ class DGEVParticleGibbs:
 
         it = tqdm(range(2, T + 1)) if self.cfg.progress else range(2, T + 1)
         for t in it:
-            # ----- resample ancestors for non-reference particles
             res_p = self._safe_normalize(w[t - 1, :])
             anc = np.random.choice(N, size=N - 1, p=res_p, replace=True)
 
-            # propagate non-reference particles
             for n in range(N - 1):
                 a[t, n] = anc[n]
                 if D > 0:
                     prev = parts[t - 1, a[t, n], :]
                     parts[t, n, :] = self._transition_sample(prev, t=t)
 
-            # reference path at t and ANCESTOR SAMPLING
             if D > 0:
                 x_ref_t = self.x[t]
                 parts[t, N - 1, :] = x_ref_t.copy()
@@ -844,7 +813,6 @@ class DGEVParticleGibbs:
             else:
                 a[t, N - 1] = N - 1
 
-            # ----- compute weights at t
             y_idx = t - 1
             lw = np.zeros(N, float)
             for n in range(N):
@@ -893,29 +861,69 @@ class DGEVParticleGibbs:
         self.last_pf_diag = pf_diag
 
     # --------------------------- Progress helpers --------------------------- #
-    def _fmt_acc(self, key: str) -> str:
-        a, p = self.accept[key], self.proposals[key]
-        pct = (100.0 * a / p) if p > 0 else 0.0
-        return f"{a}/{p} ({pct:4.1f}%)"
+    def _acc_pct(self, key: str) -> str:
+        a, p = self.accept.get(key, 0), self.proposals.get(key, 0)
+        if p <= 0:
+            return "0.0%"
+        return f"{100.0 * a / p:0.1f}%"
 
-    def _q_snapshot(self, ema_Q: np.ndarray | None = None) -> str:
-        rows = []
-        def add(label, idx):
-            if idx is None:
-                return
-            q = float(self.Q[idx])
-            logq = np.log10(max(q, 1e-20))
-            if ema_Q is not None:
-                ema = float(ema_Q[idx])
-                logema = np.log10(max(ema, 1e-20))
-                rows.append(f"{label}: cur={logq:6.2f} ema={logema:6.2f}")
-            else:
-                rows.append(f"{label}: cur={logq:6.2f}")
-        add("Q_alpha", self.idx_alpha)
-        add("Q_beta", self.idx_beta)
-        if self.seasonal_mode == "dynamic":
-            add("Q_gamma(last)", self.idx_gamma_end)
-        return (" | " + " | ".join(rows)) if rows else ""
+    def _format_Q_slot(self, label: str, idx: Optional[int], acc_key: Optional[str]) -> str:
+        if idx is None:
+            return "/"
+        q = float(self.Q[idx])
+        acc = self._acc_pct(acc_key) if acc_key else "0.0%"
+        return f"{label} = {q:.3e} ({acc})"
+
+    def _format_det_slot_scalar(self, name: str, value: float, acc_key: str) -> str:
+        return f"{name} = {value:.4f} ({self._acc_pct(acc_key)})"
+
+    def _format_det_season(self) -> str:
+        # Show full vector if short; otherwise first 4 entries
+        if self.season_vec is None:
+            return "γ = [] (0.0%)"
+        vec = self.season_vec
+        if vec.size <= 4:
+            vals = ", ".join(f"{v:.3f}" for v in vec)
+        else:
+            head = ", ".join(f"{v:.3f}" for v in vec[:4])
+            vals = f"{head}, ..."
+        return f"γ = [{vals}] ({self._acc_pct('season')})"
+
+    def _progress_line(self, it: int, ema_logZ: Optional[float]) -> str:
+        # Common head
+        head = (f"[it {it+1}/{self.cfg.n_iter}] "
+                f"logZ={self.last_log_evidence:.3f} "
+                f"ema={float(ema_logZ) if ema_logZ is not None else float('nan'):.3f}"
+               )
+
+        # Observation params
+        obs = f"| σ={np.exp(self.logsigma):.3f} ({self._acc_pct('logsigma')}) " \
+              f"ξ={self.xi:.3f} ({self._acc_pct('xi')})"
+
+        # Q-block or slashes depending on dynamics
+        q_alpha = self._format_Q_slot("Q_α", self.idx_alpha, "log_s_alpha") if self.level_mode == "dynamic" else "/"
+        q_beta  = self._format_Q_slot("Q_β", self.idx_beta,  "log_s_beta")  if self.trend_mode == "dynamic" else "/"
+        q_gamma = self._format_Q_slot("Q_γ", self.idx_gamma_end, "log_s_gamma") if self.seasonal_mode == "dynamic" else "/"
+        q_block = f"| {q_alpha}, {q_beta}, {q_gamma}"
+
+        # Deterministic block
+        det_pieces: List[str] = []
+        if self.level_mode == "deterministic":
+            det_pieces.append(self._format_det_slot_scalar("α", self.level_value, "level"))
+        if self.trend_mode == "deterministic":
+            det_pieces.append(self._format_det_slot_scalar("β", self.slope_value, "slope"))
+        if self.seasonal_mode == "deterministic":
+            det_pieces.append(self._format_det_season())
+        det_block = ("| " + " ".join(det_pieces)) if det_pieces else ""
+
+        # PF block
+        pf = ""
+        if self.last_pf_diag:
+            d = self.last_pf_diag
+            pf = f"| PF: ESS(mean/min)={d['ess_mean']:.1f}/{d['ess_min']:.1f} MaxW(max)={d['maxw_max']:.4f}"
+
+        # Spacing exactly as requested: head + space + obs + two spaces before Q, etc.
+        return f"{head} | {obs.split('|')[1].strip()}  {q_block}  {det_block} {pf}".rstrip()
 
     # --------------------------------- MCMC --------------------------------- #
     def run(self) -> Dict[str, np.ndarray]:
@@ -949,9 +957,7 @@ class DGEVParticleGibbs:
         if self.seasonal_mode == "deterministic":
             self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
 
-        # rolling summaries
         ema_logZ: Optional[float] = None
-        ema_Q = np.zeros(self.dim, float) if self.dim > 0 else None
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50)
 
         for it in range(cfg.n_iter):
@@ -967,79 +973,33 @@ class DGEVParticleGibbs:
                 current_log_ev = float(gev_loglike_sum(self.y, mu_vec_now, self.sigma, self.xi))
 
             ema_logZ = self._ema(ema_logZ, current_log_ev, alpha=0.1)
-            if cfg.progress:
-                print(f"  log p(y | theta) [PF states-marginalized] = {current_log_ev:.6f}")
 
-            # 2) dynamic process sds (PC prior MH updates)
+            # 2) dynamic process sds
             if self.dim > 0:
-                if cfg.progress: print("  Updating process sds (PC prior)...")
                 self.update_process_sds()
                 self.Q = self.s * self.s
-                if ema_Q is not None:
-                    ema_Q = 0.9 * ema_Q + 0.1 * self.Q
 
             # 3) deterministic structural params
             if self.level_mode == "deterministic":
-                if cfg.progress: print("  Updating deterministic level...")
                 self.update_level_value()
             if self.trend_mode == "deterministic":
-                if cfg.progress: print("  Updating deterministic slope...")
                 self.update_slope()
             if self.seasonal_mode == "deterministic":
-                if cfg.progress: print("  Updating deterministic seasonality...")
                 self.update_season_vec()
 
             # 4) observation params
-            if cfg.progress: print("  Updating logsigma / xi ...")
             self.update_logsigma()
             self.update_xi()
 
-            # --- adapt proposal scales if enabled ---
+            # 5) adapt proposal scales if enabled
             self._adapt_steps(it)
 
-            # 5) compact progress line
+            # 6) compact progress line (every k)
             if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
-                acc_logs = self._fmt_acc('logsigma')
-                acc_xi   = self._fmt_acc('xi')
+                line = self._progress_line(it, ema_logZ)
+                print(line)
 
-                det_info = ""
-                if self.level_mode == "deterministic":
-                    det_info += f" | acc(level)={self._fmt_acc('level')} value={self.level_value:.4f}"
-                if self.trend_mode == "deterministic":
-                    det_info += f" | acc(slope)={self._fmt_acc('slope')} value={self.slope_value:.4f}"
-                if self.seasonal_mode == "deterministic":
-                    preview = np.array2string(self.season_vec[:min(3, self.period)], precision=3, separator=",")
-                    det_info += f" | acc(season)={self._fmt_acc('season')} γ[:3]={preview} ..."
-
-                # PC prior updates
-                acc_sa = self._fmt_acc('log_s_alpha') if self.idx_alpha is not None else "n/a"
-                acc_sb = self._fmt_acc('log_s_beta')  if self.idx_beta  is not None else "n/a"
-                acc_sg = self._fmt_acc('log_s_gamma') if self.seasonal_mode == "dynamic" else "n/a"
-                pc_info = f" | acc(log s_α/β/γ)={acc_sa}/{acc_sb}/{acc_sg}"
-
-                q_info = self._q_snapshot(ema_Q) if self.dim > 0 else ""
-                pf_info = ""
-                if self.last_pf_diag:
-                    d = self.last_pf_diag
-                    pf_info = f" | PF: ESS(mean/min)={d['ess_mean']:.1f}/{d['ess_min']:.1f} MaxW(max)={d['maxw_max']:.4f}"
-
-                print(
-                    f"[it {it+1}/{cfg.n_iter}] "
-                    f"logZ={current_log_ev:.3f} ema={ema_logZ:.3f} "
-                    f"σ={np.exp(self.logsigma):.3f} ξ={self.xi:.3f} "
-                    f"{pc_info}{det_info}{q_info}{pf_info}"
-                )
-
-                # Early warnings
-                if self.dim > 0 and np.any(self.Q < 1e-14):
-                    print(
-                        f"  [warn] Q extremely small at idx {np.where(self.Q < 1e-14)[0].tolist()} "
-                        f"(min Q={float(np.min(self.Q)):.3e})."
-                    )
-                if self.last_pf_diag and self.last_pf_diag["ess_min"] < 0.2 * self.cfg.n_particles:
-                    print("  [warn] PF degeneracy (ESS_min < 0.2*N). Consider more particles/regularization.)")
-
-            # 6) store
+            # 7) store
             if it in save_iters and keep_idx < n_kept:
                 mu_vec = self._mu_vec_current()
                 self.keep["mu"][keep_idx, :] = mu_vec
@@ -1064,17 +1024,8 @@ class DGEVParticleGibbs:
                 keep_idx += 1
 
         if cfg.progress:
-            print(
-                f"[{it + 1}/{cfg.n_iter}] "
-                f"acc(logsigma)={self._fmt_acc('logsigma')} "
-                f"acc(xi)={self._fmt_acc('xi')} "
-                f"acc(level)={self._fmt_acc('level')} "
-                f"acc(slope)={self._fmt_acc('slope')} "
-                f"acc(season)={self._fmt_acc('season')} "
-                f"acc(log s_α)={self._fmt_acc('log_s_alpha')} "
-                f"acc(log s_β)={self._fmt_acc('log_s_beta')} "
-                f"acc(log s_γ)={self._fmt_acc('log_s_gamma')}"
-            )
+            # Final one-liner, same style
+            print(self._progress_line(cfg.n_iter - 1, ema_logZ))
         return self.keep
 
     # ------------------------------- Persistence ---------------------------- #
@@ -1128,23 +1079,25 @@ class DGEVParticleGibbs:
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
 
+
 # ------------------------- CLI / Example run & plots ------------------------ #
 if __name__ == "__main__":
     import sys, argparse
-    # Optional plotting if you want (not required for core sampler)
-    # import matplotlib.pyplot as plt
     sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
     from simulator.extremal_time_series import Extremal_Time_Series
 
     parser = argparse.ArgumentParser(description="DGEV PGAS Sampler (PC priors on process sds)")
+
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
-    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="none")
+    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
     parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
+
     # Basics
     parser.add_argument("--period", type=int, default=4)
     parser.add_argument("--T", type=int, default=100)
+
     # Initial values (shared)
     parser.add_argument("--level-init", type=float, default=5.0)
     parser.add_argument("--slope-init", type=float, default=0.02)
@@ -1171,11 +1124,12 @@ if __name__ == "__main__":
                         help="Comma-separated first (p-1) means for deterministic seasonal prior (e.g. '0,0,0').")
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
-    # PC prior calibration (data-dependent defaults; you can override)
-    parser.add_argument("--pc-frac-alpha", type=float, default=0.10) #0.10*MAD(delta y)
+    # PC prior calibration
+    parser.add_argument("--pc-frac-alpha", type=float, default=0.10)
     parser.add_argument("--pc-frac-beta",  type=float, default=0.10)
     parser.add_argument("--pc-frac-gamma", type=float, default=0.10)
-    parser.add_argument("--pc-alpha-prob", type=float, default=0.5, help="Tail prob α in P(s>u)=α for all coords.")
+    parser.add_argument("--pc-alpha-prob", type=float, default=0.1,
+                        help="Tail prob α in P(s>u)=α for all coords.")
     parser.add_argument("--pc-lambda-alpha", type=float, default=None)
     parser.add_argument("--pc-lambda-beta",  type=float, default=None)
     parser.add_argument("--pc-lambda-gamma", type=float, default=None)
@@ -1187,7 +1141,7 @@ if __name__ == "__main__":
     parser.add_argument("--step-logsigma", type=float, default=0.2)
     parser.add_argument("--step-xi", type=float, default=0.2)
     parser.add_argument("--step-level", type=float, default=0.02)
-    parser.add_argument("--step-slope", type=float, default=0.0005)
+    parser.add_argument("--step-slope", type=float, default=0.01)
     parser.add_argument("--step-season", type=float, default=0.02)
     parser.add_argument("--step-log-s-alpha", type=float, default=0.25)
     parser.add_argument("--step-log-s-beta",  type=float, default=0.10)
@@ -1204,16 +1158,14 @@ if __name__ == "__main__":
     parser.add_argument("--adapt-steps", default=True)
     parser.add_argument("--adapt-every", type=int, default=25)
     parser.add_argument("--adapt-until", choices=["burn","all"], default="all")
-    parser.add_argument("--adapt-eta0", type=float, default=0.05)
+    parser.add_argument("--adapt-eta0", type=float, default=0.1)
     parser.add_argument("--adapt-decay", type=float, default=0.75)
     parser.add_argument("--adapt-target-1d", type=float, default=0.44)
     parser.add_argument("--step-min", type=float, default=1e-5)
     parser.add_argument("--step-max", type=float, default=1.0)
 
-    # Output & plotting
+    # Output
     parser.add_argument("--out-dir", type=str, default=None)
-    parser.add_argument("--no-plots", action="store_true")
-    parser.add_argument("--show-plots", action="store_true")
 
     args = parser.parse_args()
     np.random.seed(args.seed)
@@ -1329,8 +1281,7 @@ if __name__ == "__main__":
     tag = f"{sim_level_mode}-{sim_trend_mode}-{sim_season_mode}"
     out_dir = args.out_dir or os.path.join("results", "simulations", "DGEV",
                                            f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    fig_dir = os.path.join(out_dir, "figures")
-    _ensure_dir(out_dir); _ensure_dir(fig_dir)
+    _ensure_dir(out_dir)
 
     t0 = time.time()
     posterior = sampler.run()

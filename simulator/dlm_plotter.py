@@ -488,7 +488,7 @@ if __name__ == "__main__":
     parser.add_argument("--root", type=str, default="results/simulations/DLM",
                         help="Search root (e.g. 'results/simulations/DLM').")
     parser.add_argument("--level", type=float, default=0.90, help="Credible interval level for bands.")
-    parser.add_argument("--show", action="store_true", help="Show figures interactively.")
+    parser.add_argument("--show", default=True, help="Show figures interactively.")
     parser.add_argument("--skip-states", action="store_true", help="Skip stacked states panel.")
     parser.add_argument("--skip-separate", action="store_true", help="Skip separate component figures.")
     args = parser.parse_args()

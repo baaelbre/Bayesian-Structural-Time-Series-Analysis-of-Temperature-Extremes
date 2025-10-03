@@ -1,0 +1,89 @@
+{
+  "T": 200,
+  "dim": 1,
+  "period": 12,
+  "modes": "dynamic-deterministic-none",
+  "layout": [
+    "alpha"
+  ],
+  "idx_alpha": 0,
+  "idx_beta": null,
+  "idx_g_start": null,
+  "idx_g_end": null,
+  "cfg": {
+    "n_iter": 2000,
+    "burn": 200,
+    "thin": 1,
+    "random_seed": 7,
+    "progress": true,
+    "progress_every": 10,
+    "step_logsigma": 0.1811955195831561,
+    "step_level": 0.02,
+    "step_slope": 0.016132477464752097,
+    "step_season": 0.02,
+    "step_log_s_alpha": 0.22121699958807786,
+    "step_log_s_beta": 0.1,
+    "step_log_s_gamma": 0.1,
+    "adapt_steps": true,
+    "adapt_every": 25,
+    "adapt_until": "all",
+    "adapt_target_1d": 0.44,
+    "adapt_eta0": 0.1,
+    "adapt_eta_decay": 0.75,
+    "step_min": 1e-05,
+    "step_max": 1.0
+  },
+  "priors": {
+    "m_sigma": 1.0,
+    "s_sigma": 1.0,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0,
+    "pc_alpha": {
+      "lambda_s": null,
+      "frac": 0.1,
+      "alpha_prob": 0.5
+    },
+    "pc_beta": {
+      "lambda_s": null,
+      "frac": 0.1,
+      "alpha_prob": 0.5
+    },
+    "pc_gamma": {
+      "lambda_s": null,
+      "frac": 0.1,
+      "alpha_prob": 0.5
+    }
+  },
+  "pc_lambdas": {
+    "alpha": 5.412278359786189,
+    "beta": null,
+    "gamma": null
+  },
+  "true_sigma": 2.0,
+  "true_Q": [
+    0.05
+  ],
+  "accept": {
+    "logsigma": 648,
+    "level": 0,
+    "slope": 2000,
+    "season": 0,
+    "log_s_alpha": 573,
+    "log_s_beta": 0,
+    "log_s_gamma": 0
+  },
+  "proposals": {
+    "logsigma": 2000,
+    "level": 0,
+    "slope": 2000,
+    "season": 0,
+    "log_s_alpha": 2000,
+    "log_s_beta": 0,
+    "log_s_gamma": 0
+  },
+  "elapsed_seconds": 139.41313076019287
+}
