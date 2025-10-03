@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
     parser.add_argument("--adapt-steps", default=True)
     parser.add_argument("--adapt-every", type=int, default=25)
     parser.add_argument("--adapt-until", choices=["burn","all"], default="all")
-    parser.add_argument("--adapt-eta0", type=float, default=0.1)
+    parser.add_argument("--adapt-eta0", type=float, default=0.2)
     parser.add_argument("--adapt-decay", type=float, default=0.75)
     parser.add_argument("--adapt-target-1d", type=float, default=0.44)
     parser.add_argument("--step-min", type=float, default=1e-5)
