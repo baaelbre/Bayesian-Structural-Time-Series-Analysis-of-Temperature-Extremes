@@ -1135,8 +1135,8 @@ if __name__ == "__main__":
     parser.add_argument("--pc-lambda-gamma", type=float, default=None)
 
     # Sampler config
-    parser.add_argument("--n-iter", type=int, default=2000)
-    parser.add_argument("--burn", type=int, default=100)
+    parser.add_argument("--n-iter", type=int, default=4000)
+    parser.add_argument("--burn", type=int, default=1000)
     parser.add_argument("--thin", type=int, default=1)
     parser.add_argument("--step-logsigma", type=float, default=0.2)
     parser.add_argument("--step-xi", type=float, default=0.2)
