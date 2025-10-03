@@ -1,9 +1,10 @@
 # experiments/compare_dlm_ig_vs_pc.py
 from __future__ import annotations
 
+from datetime import datetime
 import os, math, json, time, csv
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,43 +16,126 @@ from optimization.kalman_gibbs import DLMGibbs as DLM_IG, Priors as PriorsIG, Sa
 from optimization.kalman_gibbs_pc import DLMGibbs as DLM_PC, Priors as PriorsPC, PCPrior, SamplerConfig as CfgPC
 from simulator.mean_time_series import Mean_Time_Series
 
+# Optional SciPy for inverse-gamma quantiles (used to match IG priors).
+try:
+    from scipy.stats import invgamma
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
 # ===========================
-# Utilities: dirs & sampling
+# Utilities
 # ===========================
 def ensure_dir(path: str) -> None:
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
-def sample_inv_gamma(a: float, b: float, size: int, rng: np.random.Generator) -> np.ndarray:
-    # If v ~ IG(a,b), then 1/v ~ Gamma(a, scale=1/b)
-    g = rng.gamma(shape=a, scale=1.0 / b, size=size)
-    return 1.0 / g
+def _mad_sd(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    if x.size == 0:
+        return 0.0
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)) / 0.67448975)  # MAD -> sd
 
-def pc_lambda_from_ig(a: float, b: float, alpha_tail: float = 0.05,
-                      n:int = 200000, seed: int = 123) -> Tuple[float, float]:
-    """
-    Calibrate PC prior p(s)=λ exp(-λ s) by matching tail:
-      Draw v~IG(a,b), s=sqrt(v); let u be the (1-α) quantile of s.
-      Choose λ so that P_PC(s > u) = α  =>  λ = -log(α)/u.
-    Returns (λ, u).
-    """
-    rng = np.random.default_rng(seed)
-    v = sample_inv_gamma(a, b, size=n, rng=rng)
-    s = np.sqrt(v)
-    u = float(np.quantile(s, 1.0 - alpha_tail))
-    lam = -math.log(max(alpha_tail, 1e-16)) / max(u, 1e-16)
-    return lam, u
+def _robust_sigma_from_d1(d1: np.ndarray) -> float:
+    # sigma ≈ sd(Δy) / sqrt(2) (robust)
+    return _mad_sd(np.asarray(d1, float)) / math.sqrt(2.0) if d1.size else 1.0
 
-def logsigma_normal_from_ig(a_sigma: float, b_sigma: float,
-                            n:int = 200000, seed: int = 123) -> Tuple[float, float]:
+def seasonal_diff(y: np.ndarray, period: int) -> np.ndarray:
+    if len(y) <= period:
+        return np.array([], float)
+    return np.asarray(y[period:] - y[:-period], float)
+
+def calibrate_scales_from_y(
+    y: np.ndarray,
+    period: int,
+    denoise_sigma: bool = True,
+    ridge_frac: float = 0.05,          # gentle ridge to avoid collapse for tiny q
+    floor_frac_of_y: float = 1e-4,     # floors relative to MAD(y)
+) -> Dict[str, float]:
     """
-    Monte-Carlo match Normal(log σ) to IG(a_sigma,b_sigma) on σ².
+    Robust empirical scales for calibration:
+      - sigma_hat ~ measurement noise (from Δy)
+      - s_alpha   ~ level innovation sd (from Δy, minus noise; ridged)
+      - s_beta    ~ trend innovation sd (from Δ²y, minus noise; ridged)
+      - s_gamma   ~ seasonal closure sd (from seasonal Δ; minus noise; ridged)
     """
-    rng = np.random.default_rng(seed)
-    s2 = sample_inv_gamma(a_sigma, b_sigma, size=n, rng=rng)
-    s = np.sqrt(s2)
-    ls = np.log(np.clip(s, 1e-20, None))
-    return float(ls.mean()), float(ls.std(ddof=1))
+    y = np.asarray(y, float)
+    d1 = np.diff(y)
+    d2 = np.diff(y, n=2)
+    ds = seasonal_diff(y, period)
+
+    sd1 = _mad_sd(d1)
+    sd2 = _mad_sd(d2)
+    sdg = _mad_sd(ds) if ds.size else sd1
+
+    Sy = max(_mad_sd(y), 1e-12)  # global scale for floors
+    eps = floor_frac_of_y * Sy
+
+    if denoise_sigma and d1.size:
+        sigma_hat = _robust_sigma_from_d1(d1)
+
+        # subtract iid noise contributions; ridge to avoid zero
+        s2_a = max(sd1**2 - 2.0 * sigma_hat**2, ridge_frac * sd1**2)
+        s2_b = max(sd2**2 - 6.0 * sigma_hat**2, ridge_frac * sd2**2)
+        s2_g = max(sdg**2 - 2.0 * sigma_hat**2, ridge_frac * sdg**2)
+
+        s_alpha = math.sqrt(s2_a)
+        s_beta  = math.sqrt(s2_b)
+        s_gamma = math.sqrt(s2_g)
+    else:
+        sigma_hat = sd1 / math.sqrt(2.0) if d1.size else 1.0
+        s_alpha, s_beta, s_gamma = sd1, sd2, sdg
+
+    return dict(
+        sigma_hat=max(sigma_hat, eps),
+        s_alpha=max(s_alpha, eps),
+        s_beta=max(s_beta, eps),
+        s_gamma=max(s_gamma, eps),
+        Sy=Sy
+    )
+
+def pc_lambda_from_scale(
+    s_hat: float,
+    *,
+    frac: float = 0.25,           # MILDER: 25% of scale
+    alpha_tail: float = 0.10,     # MILDER: 10% tail
+    u_min: Optional[float] = None,
+    y_scale: Optional[float] = None
+) -> float:
+    """
+    PC prior p(s)=λ exp(-λ s) matched by P(s > u) = alpha_tail, u = max(frac*s_hat, u_min).
+    We default to milder (frac=0.25, alpha=0.10). Use y_scale to set a tiny-but-safe floor.
+    """
+    if (u_min is None or u_min <= 0) and y_scale is not None:
+        u_min = 1e-4 * max(y_scale, 1e-12)
+    u = max(frac * max(s_hat, 0.0), (u_min if u_min is not None else 0.0), 1e-12)
+    return float(-math.log(max(alpha_tail, 1e-16)) / u)
+
+def ig_params_from_scale_quantile(
+    s_hat: float,
+    *,
+    frac: float = 0.25,         # MILDER: 25% of scale
+    alpha_tail: float = 0.10,   # MILDER: 10% tail
+    a_shape: float = 2.0
+) -> Tuple[float, float]:
+    """
+    Choose IG(a,b) prior on variance v so that P(s > frac*s_hat) = alpha_tail for s = sqrt(v).
+    With inverse-gamma, quantiles scale linearly in 'scale' b:
+      Let u2 = (frac*s_hat)^2 and q0 = InvGamma_ppf(1-alpha ; a, scale=1),
+      then set b = u2 / q0.
+    """
+    u = max(frac * max(s_hat, 0.0), 1e-12)
+    u2 = u * u
+    if not _HAVE_SCIPY:
+        # Fallback: roughly center mean at ~u^2 for a>1 (very weak)
+        a = float(max(1.1, a_shape))
+        b = float((a - 1.0) * u2)
+        return a, b
+
+    q0 = float(invgamma.ppf(1.0 - alpha_tail, a_shape, scale=1.0))
+    b = float(u2 / max(1e-24, q0))
+    return float(a_shape), b
 
 # ==================
 # Evaluation metrics
@@ -96,8 +180,7 @@ class MCMCSpec:
 
 def simulate_series(setting: Setting):
     """
-    Use your Mean_Time_Series to generate a **level-only** stochastic series:
-      level_mode='dynamic', trend_mode='none', seasonal_mode='none'
+    Level-only stochastic series: level='dynamic', trend='none', season='none'.
     """
     mts = Mean_Time_Series(
         sigma=setting.sigma_true,
@@ -106,45 +189,67 @@ def simulate_series(setting: Setting):
         seasonal_mode="none",
         period=setting.period,
         q_level=setting.q_level_true,
-        q_trend=0.0,            # ignored (trend none)
-        q_season=0.0,           # ignored (season none)
+        q_trend=0.0,
+        q_season=0.0,
         m0_level=0.0, v0_level=1.0,
         m0_trend=0.0, v0_trend=1.0,
-        # season lists (required by simulator; unused under 'none')
         m0_season=[0.0]*(setting.period-1),
         v0_season=[1.0]*(setting.period-1),
         start_date=None,
     )
 
-    # Generate T observations
     y = []
     for _ in range(setting.T):
         mts.move(); y.append(mts.measure())
     y = np.asarray(y, float)
 
     truths = mts.get_truth_paths(as_numpy=True)
-    # Simulator records an initial state at t=0 then t=1..T; align to length T:
     mu_T    = truths["mu"][1:1 + setting.T]
     alpha_T = truths["alpha"][1:1 + setting.T]
-
     return y, mu_T, alpha_T
 
-def run_one(setting: Setting,
-            ig_prior: Dict[str, float],
-            mcmc: MCMCSpec,
-            out_dir: str) -> Dict[str, Dict[str, float]]:
+def run_one(
+    setting: Setting,
+    # shared (but milder) tail statement for both PC & IG
+    tail_alpha_sigma: float = 0.10,
+    tail_frac_sigma: float = 0.25,
+    tail_alpha_alpha: float = 0.10,
+    tail_frac_alpha: float = 0.25,
+    # IG shapes (mild; a=2 gives finite mean, heavier tails than big shapes)
+    ig_a_sigma: float = 2.0,
+    ig_a_alpha: float = 2.0,
+    mcmc: MCMCSpec = MCMCSpec(),
+    out_dir: str = ".",
+) -> Dict[str, Dict[str, float]]:
 
     ensure_dir(out_dir)
 
-    # ----- simulate with your simulator
+    # ----- simulate
     y, mu_true, alpha_true = simulate_series(setting)
 
-    # ---------------- IG–conjugate sampler ----------------
+    # ----- shared, data-driven calibration (robust; gentle ridge; floors)
+    cal = calibrate_scales_from_y(
+        y, period=setting.period,
+        denoise_sigma=True, ridge_frac=0.05, floor_frac_of_y=1e-4
+    )
+    sigma_hat   = cal["sigma_hat"]
+    s_alpha_hat = cal["s_alpha"]
+    Sy          = cal["Sy"]
+
+    # ================= IG (conjugate) =================
+    # IG priors matched to the SAME tail statements as PC
+    a_sigma, b_sigma = ig_params_from_scale_quantile(
+        s_hat=sigma_hat, frac=tail_frac_sigma, alpha_tail=tail_alpha_sigma, a_shape=ig_a_sigma
+    )
+    a_alpha, b_alpha = ig_params_from_scale_quantile(
+        s_hat=s_alpha_hat, frac=tail_frac_alpha, alpha_tail=tail_alpha_alpha, a_shape=ig_a_alpha
+    )
+
     pri_ig = PriorsIG(
-        a_sigma=float(ig_prior["a_sigma"]), b_sigma=float(ig_prior["b_sigma"]),
-        a_alpha=float(ig_prior["a_alpha"]), b_alpha=float(ig_prior["b_alpha"]),
-        a_beta=1.0, b_beta=1.0,   # unused here
-        a_gamma=1.0, b_gamma=1.0, # unused here
+        a_sigma=float(a_sigma), b_sigma=float(b_sigma),
+        a_alpha=float(a_alpha), b_alpha=float(b_alpha),
+        a_beta=1.0, b_beta=1.0,      # unused here
+        a_gamma=1.0, b_gamma=1.0,    # unused here
     )
     cfg_ig = CfgIG(
         n_iter=mcmc.n_iter, burn=mcmc.burn, thin=mcmc.thin,
@@ -154,7 +259,7 @@ def run_one(setting: Setting,
         y=y, period=setting.period,
         level_mode="dynamic", trend_mode="none", seasonal_mode="none",
         m0_level=0.0, v0_level=1.0,
-        sigma2_init=setting.sigma_true**2,
+        sigma2_init=max(1e-12, setting.sigma_true**2),
         q_alpha_init=max(1e-12, setting.q_level_true),
         priors=pri_ig, cfg=cfg_ig
     )
@@ -165,8 +270,8 @@ def run_one(setting: Setting,
     post_ig = mdl_ig.run()
     t_ig = time.time() - t0
 
-    mu_ig = post_ig["mu"]                   # (S,T)
-    sig2_ig = post_ig["sigma2"]             # (S,)
+    mu_ig = post_ig["mu"]
+    sig2_ig = post_ig["sigma2"]
     qalpha_ig = post_ig.get("q_alpha", np.full(mu_ig.shape[0], np.nan))
 
     mu_mean_ig = mu_ig.mean(axis=0)
@@ -181,26 +286,30 @@ def run_one(setting: Setting,
 
     np.savez_compressed(os.path.join(out_dir, "posterior_ig.npz"),
                         y=y, mu_draws=mu_ig, sigma2_draws=sig2_ig, qalpha_draws=qalpha_ig,
-                        mu_true=mu_true)
+                        mu_true=mu_true,
+                        # calibration record
+                        a_sigma=a_sigma, b_sigma=b_sigma, a_alpha=a_alpha, b_alpha=b_alpha,
+                        sigma_hat=sigma_hat, s_alpha_hat=s_alpha_hat,
+                        tail_frac_sigma=tail_frac_sigma, tail_alpha_sigma=tail_alpha_sigma,
+                        tail_frac_alpha=tail_frac_alpha, tail_alpha_alpha=tail_alpha_alpha)
 
-    # ---------------- PC–prior sampler ----------------
-    # Match Normal(log σ) to IG prior on σ²
-    m_logs, s_logs = logsigma_normal_from_ig(ig_prior["a_sigma"], ig_prior["b_sigma"],
-                                             seed=setting.seed+11)
-    # Match PC λ to IG prior on level sd tail at α=0.05
-    lam_alpha, u_match = pc_lambda_from_ig(ig_prior["a_alpha"], ig_prior["b_alpha"],
-                                           alpha_tail=0.05, seed=setting.seed+13)
+    # ================= PC (rate-Exponential on sd) =================
+    lam_alpha = pc_lambda_from_scale(
+        s_alpha_hat, frac=tail_frac_alpha, alpha_tail=tail_alpha_alpha, y_scale=Sy
+    )
 
     pri_pc = PriorsPC(
-        m_sigma=m_logs, s_sigma=s_logs,
-        pc_alpha=PCPrior(lambda_s=lam_alpha, frac=0.10, alpha_prob=0.05),
+        # "uninformative-ish" center for log-sigma: around log(sigma_hat)
+        m_sigma=float(np.log(max(1e-12, sigma_hat))),
+        s_sigma=1.0,  # broad
+        pc_alpha=PCPrior(lambda_s=lam_alpha, frac=tail_frac_alpha, alpha_prob=tail_alpha_alpha),
         pc_beta=PCPrior(lambda_s=None),
         pc_gamma=PCPrior(lambda_s=None),
     )
     cfg_pc = CfgPC(
         n_iter=mcmc.n_iter, burn=mcmc.burn, thin=mcmc.thin,
         random_seed=mcmc.seed, progress=mcmc.progress, progress_every=50,
-        step_logsigma=0.15, step_log_s_alpha=0.2,
+        step_logsigma=0.15, step_log_s_alpha=0.20,
         adapt_steps=True, adapt_every=25, adapt_until="burn",
         adapt_eta0=0.08, adapt_eta_decay=0.75, adapt_target_1d=0.44
     )
@@ -208,7 +317,7 @@ def run_one(setting: Setting,
         y=y, period=setting.period,
         level_mode="dynamic", trend_mode="none", seasonal_mode="none",
         m0_level=0.0, v0_level=1.0,
-        sigma2_init=setting.sigma_true**2,
+        sigma2_init=max(1e-12, setting.sigma_true**2),
         q_alpha_init=max(1e-12, setting.q_level_true),
         priors=pri_pc, cfg=cfg_pc
     )
@@ -219,8 +328,8 @@ def run_one(setting: Setting,
     post_pc = mdl_pc.run()
     t_pc = time.time() - t0
 
-    mu_pc = post_pc["mu"]                      # (S,T)
-    sigma_pc = post_pc["sigma"]                # (S,) already σ
+    mu_pc = post_pc["mu"]
+    sigma_pc = post_pc["sigma"]  # already σ
     if "Q" in post_pc and post_pc["Q"].size:
         qalpha_pc = post_pc["Q"][:, 0]
     else:
@@ -238,11 +347,22 @@ def run_one(setting: Setting,
 
     np.savez_compressed(os.path.join(out_dir, "posterior_pc.npz"),
                         y=y, mu_draws=mu_pc, sigma_draws=sigma_pc, qalpha_draws=qalpha_pc,
-                        mu_true=mu_true, lam_alpha=lam_alpha, u_match=u_match,
-                        m_logs=m_logs, s_logs=s_logs)
+                        mu_true=mu_true,
+                        lam_alpha=lam_alpha,
+                        tail_frac_sigma=tail_frac_sigma, tail_alpha_sigma=tail_alpha_sigma,
+                        tail_frac_alpha=tail_frac_alpha, tail_alpha_alpha=tail_alpha_alpha,
+                        sigma_hat=sigma_hat, s_alpha_hat=s_alpha_hat)
+
+    # minimal calibration diagnostics
+    u_alpha = tail_frac_alpha * s_alpha_hat
+    print(f"[cal] sd(Δy)~{_mad_sd(np.diff(y)):.3g}  σ̂={sigma_hat:.3g}  ŝ_α={s_alpha_hat:.3g}  "
+          f"u_α={u_alpha:.3g}  λ_PC={lam_alpha:.3g}  (q_true={setting.q_level_true:g})")
 
     res = {"IG": metrics_ig, "PC": metrics_pc,
-           "_truth": {"sigma_true": setting.sigma_true, "q_alpha_true": setting.q_level_true}}
+           "_truth": {"sigma_true": setting.sigma_true, "q_alpha_true": setting.q_level_true},
+           "_calib": {"sigma_hat": sigma_hat, "s_alpha_hat": s_alpha_hat,
+                      "ig": {"a_sigma": a_sigma, "b_sigma": b_sigma, "a_alpha": a_alpha, "b_alpha": b_alpha},
+                      "pc": {"lambda_alpha": lam_alpha}}}
     with open(os.path.join(out_dir, "metrics.json"), "w") as f:
         json.dump(res, f, indent=2)
     return res
@@ -250,24 +370,30 @@ def run_one(setting: Setting,
 # =========================
 # Experiment grid runner
 # =========================
-def main():
-    OUT = os.path.join("results", "experiments", "IG_vs_PC_level_only_simulator")
+if __name__ == "__main__":
+    OUT = os.path.join("results", "experiments", "DLM", "IG_vs_PC_RW1_" + f"{datetime.now():%Y%m%d_%H%M%S}")
     ensure_dir(OUT)
 
-    # Tiny process-noise grid
-    q_grid = [1e-10, 1e-8, 1e-6, 1e-4]
+    # Process-noise grid (level RW1)
+    q_grid = [1e-8, 1e-6, 1e-4, 1e-2]
     T = 500
-    period = 12   # any >=2 is fine; season='none' so this is calendar only
+    period = 12
     sigma_true = 2.0
     reps = 3
     base_seed = 202409
 
-    # IG priors (weak-ish)
-    ig_prior = {"a_sigma": 1.0, "b_sigma": 1.0,
-                "a_alpha": 1.0, "b_alpha": 1.0}
+    # Shared tail statements (M I L D E R)
+    TAIL_ALPHA_SIGMA = 0.10
+    TAIL_FRAC_SIGMA  = 0.25
+    TAIL_ALPHA_ALPHA = 0.10
+    TAIL_FRAC_ALPHA  = 0.25
+
+    # IG shapes (mild/heavy-tailed; a=2)
+    IG_A_SIGMA = 2.0
+    IG_A_ALPHA = 2.0
 
     # MCMC settings
-    mcmc = MCMCSpec(n_iter=3000, burn=1000, thin=2, seed=777, progress=False)
+    mcmc = MCMCSpec(n_iter=3000, burn=1000, thin=2, seed=777, progress=True)
 
     rows = []
     for q in q_grid:
@@ -278,7 +404,18 @@ def main():
             tag = f"T{T}_P{period}_sig{sigma_true}_q{q:.0e}_rep{rep+1}"
             out_dir = os.path.join(OUT, tag)
             print(f"\n=== {tag} ===")
-            res = run_one(setting, ig_prior, mcmc, out_dir)
+
+            res = run_one(
+                setting=setting,
+                tail_alpha_sigma=TAIL_ALPHA_SIGMA,
+                tail_frac_sigma=TAIL_FRAC_SIGMA,
+                tail_alpha_alpha=TAIL_ALPHA_ALPHA,
+                tail_frac_alpha=TAIL_FRAC_ALPHA,
+                ig_a_sigma=IG_A_SIGMA,
+                ig_a_alpha=IG_A_ALPHA,
+                mcmc=mcmc,
+                out_dir=out_dir
+            )
 
             rows.append({
                 "tag": tag, "model": "IG", "T": T, "period": period,
@@ -318,7 +455,7 @@ def main():
             sub = sub.sort_values("q_true")
             plt.plot(sub["q_true"], sub["rmse_mu"], marker="o", label=model)
         plt.xscale("log"); plt.xlabel("True Q_level"); plt.ylabel("RMSE of μ_t")
-        plt.title("RMSE(μ) vs true Q (level-only)"); plt.legend()
+        plt.title("RMSE(μ) vs true Q (level-only, mild data-driven priors)"); plt.legend()
         p1 = os.path.join(OUT, "rmse_vs_q.png"); plt.tight_layout(); plt.savefig(p1, dpi=160)
 
         # Coverage vs q_true
@@ -328,7 +465,7 @@ def main():
             plt.plot(sub["q_true"], sub["cov90_mu"], marker="o", label=model)
         plt.xscale("log"); plt.axhline(0.90, linestyle="--", alpha=0.6)
         plt.xlabel("True Q_level"); plt.ylabel("90% coverage of μ_t")
-        plt.title("Coverage(μ) vs true Q (level-only)"); plt.legend()
+        plt.title("Coverage(μ) vs true Q (level-only, mild data-driven priors)"); plt.legend()
         p2 = os.path.join(OUT, "coverage_vs_q.png"); plt.tight_layout(); plt.savefig(p2, dpi=160)
 
         # MLPD vs q_true
@@ -337,12 +474,9 @@ def main():
             sub = sub.sort_values("q_true")
             plt.plot(sub["q_true"], sub["mlpd"], marker="o", label=model)
         plt.xscale("log"); plt.xlabel("True Q_level"); plt.ylabel("Mean log predictive density")
-        plt.title("MLPD vs true Q (level-only)"); plt.legend()
+        plt.title("MLPD vs true Q (level-only, mild data-driven priors)"); plt.legend()
         p3 = os.path.join(OUT, "mlpd_vs_q.png"); plt.tight_layout(); plt.savefig(p3, dpi=160)
 
         print(f"Saved plots:\n - {p1}\n - {p2}\n - {p3}")
     except Exception as e:
         print(f"Plotting skipped ({e}).")
-
-if __name__ == "__main__":
-    main()
