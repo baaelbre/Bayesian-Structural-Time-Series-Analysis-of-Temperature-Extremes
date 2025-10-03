@@ -1,12 +1,14 @@
 # %% simulator/dlm_plotter.py
 import os
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import matplotlib.pyplot as plt
 import json
 
+
 def _ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
 
 # =========================
 # Small MCMC utilities
@@ -24,6 +26,7 @@ def _acf(x, max_lag=40):
         ac[k] = float(np.dot(x[: n - k], x[k:])) / denom
     return ac
 
+
 def _ess(x, max_lag=100):
     ac = _acf(x, max_lag=max_lag)
     if not np.all(np.isfinite(ac)) or ac.size <= 1:
@@ -35,6 +38,7 @@ def _ess(x, max_lag=100):
         s += 2.0 * ac[k]
     n = len(x)
     return float(n) / (1.0 + s)
+
 
 def _geweke_z(x, first_frac=0.1, last_frac=0.5):
     x = np.asarray(x, float)
@@ -53,20 +57,24 @@ def _geweke_z(x, first_frac=0.1, last_frac=0.5):
     denom = np.sqrt(va + vb) + 1e-300
     return (ma - mb) / denom
 
+
 # =========================
-# Plotter (aligned to GaussianDLmGibbs outputs)
+# Plotter (aligned to conjugate DLM Gibbs outputs)
 # =========================
 class DLMPlotter:
     """
-    Plotting helper for the conjugate Gaussian DLM Gibbs sampler (GaussianDLmGibbs).
+    Plotting helper for the conjugate Gaussian DLM Gibbs sampler.
 
     Expected bundle:
-      draws: posterior arrays saved by GaussianDLmGibbs.save_posterior()
-             keys like: "mu", "sigma2", optional "Q", optional dynamic paths
-             ("x" OR separate "alpha_t", "beta_t", "gamma_t"), deterministic
-             pieces ("level_value", "slope_value", "season_vector"), data "y",
-             and optional truth arrays: "true_mu_t", "true_alpha_t", ...
-      meta:  dict with at least {"T", "period", "modes": {"level_mode","trend_mode","seasonal_mode"}}
+      draws: saved arrays; keys include:
+             - "mu" (n_keep, T), "sigma2" (n_keep,)
+             - "q_alpha","q_beta","q_gamma" (each optional, n_keep,)
+             - "x" (n_keep, T, dim) optional time paths (packed as in sampler) OR
+               separate "alpha_t","beta_t","gamma_t" (n_keep, T)
+             - deterministic: "level_value","slope_value","season_vector" (n_keep,*)
+             - "y", optional truths: "true_mu_t","true_alpha_t","true_beta_t","true_gamma_t"
+      meta:  dict with at least {"T","period", and either "modes" string "lev-trend-seas"
+             or "modes": {"level_mode","trend_mode","seasonal_mode"}}.
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
@@ -79,11 +87,26 @@ class DLMPlotter:
         # Core dims
         self.T = int(meta.get("T") or draws["mu"].shape[1])
         self.period = int(meta.get("period", 12))
-        modes = meta.get("modes", {}).split("-")
-        # meta from DLmGibbs.save_posterior uses *_mode keys
-        self.level_mode  = modes[0]
-        self.trend_mode  = modes[1]
-        self.season_mode = modes[2]
+
+        # Modes: robust to string tag or dict
+        modes = meta.get("modes", None)
+        if isinstance(modes, str):
+            toks = modes.split("-")
+            if len(toks) == 3:
+                self.level_mode, self.trend_mode, self.season_mode = toks
+            else:
+                # fallback to dict keys if malformed
+                mm = meta.get("modes", {})
+                self.level_mode = mm.get("level_mode", "dynamic")
+                self.trend_mode = mm.get("trend_mode", "none")
+                self.season_mode = mm.get("seasonal_mode", "none")
+        elif isinstance(modes, dict):
+            self.level_mode = modes.get("level_mode", "dynamic")
+            self.trend_mode = modes.get("trend_mode", "none")
+            self.season_mode = modes.get("seasonal_mode", "none")
+        else:
+            # ultimate fallback
+            self.level_mode, self.trend_mode, self.season_mode = "dynamic", "none", "none"
 
         # Optional truth overlays
         self.true_mu    = draws.get("true_mu_t")
@@ -99,7 +122,7 @@ class DLMPlotter:
         self.hi_q = 1.0 - self.lo_q
         self.band_label = f"{int(round(self.level * 100))}% band"
 
-        # Figure out dynamic-state indexing if a packed 'x' is present
+        # Dynamic-state indexing if a packed 'x' is present
         self.has_x = ("x" in draws) and (draws["x"].ndim == 3)
         self.idx_alpha = self.idx_beta = self.idx_gamma_end = None
         if self.has_x:
@@ -133,23 +156,17 @@ class DLMPlotter:
         return v * np.ones((1, self.T), dtype=float)
 
     def _season_ts_from_draws(self) -> Optional[np.ndarray]:
-        """
-        Build seasonal contribution time series (n_keep, T) for deterministic seasonality.
-        GaussianDLmGibbs saves per-draw full 'season_vector' if season_mode == 'deterministic'.
-        """
+        """Build deterministic seasonal time series (n_keep, T) from per-draw 'season_vector' (n_keep, p)."""
         if self.season_mode != "deterministic":
             return None
-        Seas = self.draws.get("season_vector", None)  # (n_keep, period)
+        Seas = self.draws.get("season_vector", None)
         if Seas is None:
             return None
-        Seas = np.asarray(Seas, float)
+        Seas = np.asarray(Seas, float)  # (n_keep, p)
         n_keep, p = Seas.shape
         reps = int(np.ceil(self.T / p))
-        idx = np.arange(self.T) % p
-        tiled = np.tile(Seas, (1, reps))[:, : self.T]  # (n_keep, T)
-        # gather per-time index
-        out = np.take_along_axis(tiled.reshape(n_keep, reps, p).reshape(n_keep, -1), idx[None, :], axis=1)
-        return out
+        tiled = np.tile(Seas, reps)[:, : self.T]  # repeat entire pattern
+        return tiled
 
     def _get_alpha_draws(self) -> Optional[np.ndarray]:
         if self.level_mode != "dynamic":
@@ -172,13 +189,33 @@ class DLMPlotter:
             return self.draws["x"][:, :, self.idx_gamma_end]
         return self.draws.get("gamma_t", None)
 
+    def _get_qs(self) -> List[Tuple[str, np.ndarray, str]]:
+        """Collect any available process-variance posteriors."""
+        out: List[Tuple[str, np.ndarray, str]] = []
+        if ("q_alpha" in self.draws) and self.level_mode == "dynamic":
+            out.append(("q_alpha", np.asarray(self.draws["q_alpha"], float), r"$q_\alpha$"))
+        if ("q_beta"  in self.draws) and self.trend_mode == "dynamic":
+            out.append(("q_beta",  np.asarray(self.draws["q_beta"],  float), r"$q_\beta$"))
+        if ("q_gamma" in self.draws) and self.season_mode == "dynamic":
+            out.append(("q_gamma", np.asarray(self.draws["q_gamma"], float), r"$q_\gamma$"))
+        return out
+
     # ---------- figures ----------
     def plot_diagnostics(self, save_dir: Optional[str] = None, fname_prefix: str = "diagnostics", show: bool = True):
+        """
+        Panels:
+          [0] trace σ
+          [1] trace for available q_* (overlaid)
+          [2] μ vs y with band (and true μ, if provided)
+          [3] posterior σ
+          [4] posterior q_* (overlaid, with legend)
+          [5] running mean of σ
+        """
         n_keep = self.draws["mu"].shape[0]
         fig, axs = plt.subplots(2, 3, figsize=(12, 8))
         axs = axs.ravel()
 
-        # trace & hist for sigma (from sigma2)
+        # σ traces/hist
         s2 = np.asarray(self.draws.get("sigma2", np.array([])))
         if s2.size > 0:
             sig = np.sqrt(np.clip(s2, 0, None))
@@ -192,18 +229,17 @@ class DLMPlotter:
         else:
             axs[0].axis("off"); axs[3].axis("off")
 
-        # Q diag traces/hists if present — show in log10 as requested
-        Q = self.draws.get("Q", None)
-        if Q is not None and Q.ndim == 2 and Q.shape[0] == n_keep:
-            logQ = np.log10(np.clip(Q, 1e-20, None))
-            axs[1].set_title("trace: selected Q [log10]")
-            for j in range(min(Q.shape[1], 2)):
-                axs[1].plot(logQ[:, j], lw=1, alpha=0.85, label=f"log10 Q[{j}]")
+        # q_* traces/hists (overlaid)
+        qs = self._get_qs()
+        if qs:
+            axs[1].set_title("trace: process variances")
+            for key, arr, lab in qs:
+                axs[1].plot(arr, lw=1, alpha=0.9, label=lab)
             axs[1].legend()
 
-            axs[4].set_title("posterior: selected Q [log10]")
-            for j in range(min(Q.shape[1], 2)):
-                axs[4].hist(logQ[:, j], bins=30, density=True, alpha=0.65, label=f"log10 Q[{j}]")
+            axs[4].set_title("posterior: process variances")
+            for key, arr, lab in qs:
+                axs[4].hist(arr[np.isfinite(arr)], bins=30, density=True, alpha=0.65, label=lab)
             axs[4].legend()
         else:
             axs[1].axis("off"); axs[4].axis("off")
@@ -220,9 +256,8 @@ class DLMPlotter:
         axs[2].set_title(r"$\mu_t$ vs data")
         axs[2].legend()
 
-        # Running mean of σ & simple ACF (use σ if available)
+        # Running mean of σ
         if s2.size > 0:
-            sig = np.sqrt(np.clip(s2, 0, None))
             axs[5].plot(np.cumsum(sig) / np.arange(1, sig.size + 1))
             axs[5].set_title(r"$\sigma$ running mean")
         else:
@@ -441,6 +476,9 @@ class DLMPlotter:
                 else: plt.close(fig)
 
     def plot_quick_hist_panel(self, save_dir: Optional[str] = None, fname_prefix: str = "quick_hist", show: bool = True):
+        """
+        Fast 1x3 histogram panel: σ, q_alpha (if present), q_beta (else q_gamma if present).
+        """
         fig, axes = plt.subplots(1, 3, figsize=(14, 4))
         # sigma
         s2 = self.draws.get("sigma2", None)
@@ -448,14 +486,16 @@ class DLMPlotter:
             axes[0].hist(np.sqrt(np.clip(s2, 0, None)), bins=40, density=True)
         axes[0].set_title(r"$\sigma \mid y$")
 
-        # Q in log10
-        Q = self.draws.get("Q", None)
-        if Q is not None and Q.ndim == 2 and Q.shape[1] >= 1:
-            axes[1].hist(np.log10(np.clip(Q[:, 0], 1e-20, None)), bins=40, density=True)
-            axes[1].set_title(r"$\log_{10} Q[0] \mid y$")
-            if Q.shape[1] > 1:
-                axes[2].hist(np.log10(np.clip(Q[:, 1], 1e-20, None)), bins=40, density=True)
-                axes[2].set_title(r"$\log_{10} Q[1] \mid y$")
+        # choose two q's to show if available
+        qs = self._get_qs()
+        if qs:
+            # first q
+            axes[1].hist(qs[0][1][np.isfinite(qs[0][1])], bins=40, density=True)
+            axes[1].set_title(fr"{qs[0][2]} | y")
+            # second q if any
+            if len(qs) > 1:
+                axes[2].hist(qs[1][1][np.isfinite(qs[1][1])], bins=40, density=True)
+                axes[2].set_title(fr"{qs[1][2]} | y")
             else:
                 axes[2].axis("off")
         else:
@@ -471,6 +511,7 @@ class DLMPlotter:
             plt.show()
         else:
             plt.close(fig)
+
 
 # ----------------------------- #
 # CLI: Load a posterior and plot

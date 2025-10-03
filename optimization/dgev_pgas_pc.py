@@ -1130,7 +1130,7 @@ if __name__ == "__main__":
     parser.add_argument("--pc-frac-gamma", type=float, default=0.10)
     parser.add_argument("--pc-alpha-prob", type=float, default=0.1,
                         help="Tail prob α in P(s>u)=α for all coords.")
-    parser.add_argument("--pc-lambda-alpha", type=float, default=None)
+    parser.add_argument("--pc-lambda-alpha", type=float, default=20) # default=20 gives u ~ 0.1 for frac=0.1 (overrides)
     parser.add_argument("--pc-lambda-beta",  type=float, default=None)
     parser.add_argument("--pc-lambda-gamma", type=float, default=None)
 
@@ -1141,9 +1141,9 @@ if __name__ == "__main__":
     parser.add_argument("--step-logsigma", type=float, default=0.2)
     parser.add_argument("--step-xi", type=float, default=0.2)
     parser.add_argument("--step-level", type=float, default=0.02)
-    parser.add_argument("--step-slope", type=float, default=0.01)
+    parser.add_argument("--step-slope", type=float, default=0.001)
     parser.add_argument("--step-season", type=float, default=0.02)
-    parser.add_argument("--step-log-s-alpha", type=float, default=0.25)
+    parser.add_argument("--step-log-s-alpha", type=float, default=0.22)
     parser.add_argument("--step-log-s-beta",  type=float, default=0.10)
     parser.add_argument("--step-log-s-gamma", type=float, default=0.10)
 
