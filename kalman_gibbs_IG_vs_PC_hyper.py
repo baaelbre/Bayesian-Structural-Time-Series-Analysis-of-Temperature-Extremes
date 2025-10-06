@@ -413,7 +413,7 @@ if __name__ == "__main__":
     IG_A_ALPHA = 2.0
 
     # MCMC settings
-    mcmc = MCMCSpec(n_iter=3000, burn=1000, thin=2, seed=777, progress=True)
+    mcmc = MCMCSpec(n_iter=5000, burn=1000, thin=2, seed=777, progress=True)
 
     rows = []
     for q in q_grid:

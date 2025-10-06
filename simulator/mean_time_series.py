@@ -59,7 +59,6 @@ class Mean_Time_Series:
                  v0_level=1.0,
                  m0_trend=0.0,
                  v0_trend=1.0,
-                 # SEASONAL PRIOR MUST BE LENGTH (period-1)
                  m0_season=None,   # list/array of length period-1
                  v0_season=None,   # list/array of length period-1
                  start_date=None):
@@ -320,136 +319,179 @@ class Mean_Time_Series:
     def get_truth_paths(self, as_numpy=True):
         to_arr = np.asarray if as_numpy else (lambda x: list(x))
         return {
-            "alpha": to_arr(self.alpha_path),
-            "beta": to_arr(self.beta_path),
-            "gamma_last": to_arr(self.gamma_last_path),
-            "mu": to_arr(self.mu_path),
+            "alpha_t": to_arr(self.alpha_path),
+            "beta_t": to_arr(self.beta_path),
+            "gamma_t": to_arr(self.gamma_last_path),
+            "mu_t": to_arr(self.mu_path),
             "index": list(self.index),
         }
 
 # ------------------------------------------------------------
 # Demo: generate and visualize all 18 (level x trend x season)
 # ------------------------------------------------------------
+# ------------------------------------------------------------
+# CLI: generate a single time series with full control
+# ------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
     import pandas as pd
-    np.random.seed(42)
 
-    T = 200
-    period = 12
-    SIGMA = 2.0
+    def _csv_floats(s: str | None) -> list[float] | None:
+        if s is None or s.strip() == "":
+            return None
+        return [float(x) for x in s.split(",")]
 
-    # Full seasonal *shape* for convenience (length = period),
-    # but we will pass only the first period-1 entries to m0_season.
-    seas_vec_full = [
-        np.cos(2 * np.pi * k / period) + 0.25 * np.cos(4 * np.pi * k / period)
-        for k in range(period)
-    ]
-    m0_season_det = seas_vec_full[: period - 1]        # length = period-1
-    v0_season_det = [0.0] * (period - 1)               # deterministic → zero variance
-    m0_season_dyn = [0.0] * (period - 1)               # dynamic prior mean
-    v0_season_dyn = [0.5] * (period - 1)               # dynamic prior variance
-    m0_season_none = [0.0] * (period - 1)              # none → zeros
-    v0_season_none = [1.0] * (period - 1)              # arbitrary (unused)
+    def _parse_date(s: str | None):
+        if not s:
+            return None
+        # Accept YYYY, YYYY-MM, or YYYY-MM-DD
+        parts = [int(p) for p in s.split("-")]
+        if len(parts) == 1:
+            return datetime(parts[0], 1, 1)
+        if len(parts) == 2:
+            return datetime(parts[0], parts[1], 1)
+        if len(parts) == 3:
+            return datetime(parts[0], parts[1], parts[2])
+        raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
 
-    level_grid    = ["dynamic", "deterministic"]               # 2
-    trend_grid    = ["dynamic", "deterministic", "none"]       # 3
-    seasonal_grid = ["dynamic", "deterministic", "none"]       # 3  -> 18 in total
+    p = argparse.ArgumentParser(
+        description="Simulate a structural Gaussian time series (level/trend/season with independent modes)."
+    )
 
-    fig, axes = plt.subplots(6, 3, figsize=(14, 12), sharex=True)
-    axes = axes.flatten()
-    run_id = 0
-    rows = []
+    # Core simulation controls
+    p.add_argument("--T", type=int, default=200, help="Number of observations to generate.")
+    p.add_argument("--period", type=int, default=12, help="Seasonal period (>=2). 12=monthly, 4=quarterly, else yearly steps.")
+    p.add_argument("--sigma", type=float, default=2.0, help="Observation noise SD.")
+    p.add_argument("--start-date", type=str, default="2000-01-01", help="Start date (YYYY[-MM[-DD]]).")
 
-    # Optional tests (wrapped if not installed)
-    try:
-        from statsmodels.tsa.stattools import adfuller, kpss
-        have_tests = True
-    except Exception:
-        have_tests = False
+    # Modes
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
-    for lev in level_grid:
-        for tr in trend_grid:
-            for seas in seasonal_grid:
-                run_id += 1
+    # Innovations (q_*) — only used for dynamic components
+    p.add_argument("--q-level", type=float, default=0.05)
+    p.add_argument("--q-trend", type=float, default=0.002)
+    p.add_argument("--q-season", type=float, default=0.15)
 
-                # Seasonal priors per mode (must be length period-1)
-                if seas == "deterministic":
-                    m0_season = m0_season_det
-                    v0_season = v0_season_det
-                    q_season  = 0.15   # harmless; ignored by deterministic mode
-                elif seas == "dynamic":
-                    m0_season = m0_season_dyn
-                    v0_season = v0_season_dyn
-                    q_season  = 0.15
-                else:  # seas == "none"
-                    m0_season = m0_season_none
-                    v0_season = v0_season_none
-                    q_season  = 0.15   # harmless; ignored by 'none'
+    # Priors / fixed values
+    p.add_argument("--m0-level", type=float, default=5.0)
+    p.add_argument("--v0-level", type=float, default=0.25)
+    p.add_argument("--m0-trend", type=float, default=0.015)
+    p.add_argument("--v0-trend", type=float, default=0.05)
+    p.add_argument("--m0-season", type=str, default="", help="Comma-separated length (period-1) means for seasonal states.")
+    p.add_argument("--v0-season", type=str, default="", help="Comma-separated length (period-1) variances for seasonal states.")
 
-                mts = Mean_Time_Series(
-                    sigma=SIGMA,
-                    level_mode=lev,
-                    trend_mode=tr,
-                    seasonal_mode=seas,
-                    period=period,
-                    # Stochastic variances (only matter when component is latent)
-                    q_level=0.05,
-                    q_trend=0.02,
-                    q_season=q_season,
-                    # Priors / fixed values via m0_*
-                    m0_level=5.0,                     # prior mean for alpha_0 or fixed level
-                    v0_level=0.25,
-                    m0_trend=(0.015 if tr != "none" else 0.0),
-                    v0_trend=0.05,
-                    m0_season=m0_season,
-                    v0_season=v0_season,
-                    start_date=datetime(2000, 1, 1),
-                )
+    # I/O & misc
+    p.add_argument("--seed", type=int, default=42, help="Random seed.")
+    p.add_argument("--plot", default=True, help="Show matplotlib figures.")
+    p.add_argument("--save-csv", type=str, default="", help="Path to save CSV with date,y,mu,alpha,beta,gamma_last.")
+    p.add_argument("--print-summary", default=True, help="Print a small summary table at the end.")
 
-                y = []
-                for _ in range(T):
-                    mts.move()
-                    y.append(mts.measure())
+    args = p.parse_args()
+    np.random.seed(args.seed)
 
-                truths = mts.get_truth_paths(as_numpy=True)
-                y_T     = np.asarray(y, dtype=float)
-                mu_T    = truths["mu"][1:1 + T]
-                dates_T = truths["index"][:T]
+    # Build seasonal vectors (period-1) if provided or default to zeros / ones
+    m0_season = _csv_floats(args.m0_season)
+    v0_season = _csv_floats(args.v0_season)
+    if m0_season is None:
+        m0_season = [5] * (args.period - 1)
+    if v0_season is None:
+        # sensible defaults: variance 0 for deterministic season, else 0.5
+        v_default = 0.0 if args.seasonal_mode == "deterministic" else 0.5
+        v0_season = [v_default] * (args.period - 1)
 
-                # Plot
-                ax = axes[run_id - 1]
-                ax.plot(dates_T, y_T, label=r"$y_t$", linewidth=1.0)
-                ax.plot(dates_T, mu_T, "--", label=r"$\mu_t$", linewidth=1.0)
-                ax.set_title(f"{run_id:02d}: level={lev}, trend={tr}, season={seas}", fontsize=9)
-                ax.grid(True)
-                if run_id in (16,17,18):  # bottom row
-                    ax.set_xlabel("time")
-                if run_id in (1,4,7,10,13,16):
-                    ax.set_ylabel("value")
-                if run_id == 1:
-                    ax.legend(fontsize=8, loc="upper left")
+    start_date = _parse_date(args.start_date)
 
-                # Tests (optional)
-                adf_p = kpss_p = np.nan
-                if have_tests:
-                    try:
-                        adf_p = adfuller(y_T, autolag="AIC")[1]
-                    except Exception:
-                        pass
-                    try:
-                        kpss_p = kpss(y_T, regression="ct", nlags="auto")[1]
-                    except Exception:
-                        pass
+    mts = Mean_Time_Series(
+        sigma=args.sigma,
+        level_mode=args.level_mode,
+        trend_mode=args.trend_mode,
+        seasonal_mode=args.seasonal_mode,
+        period=args.period,
+        q_level=args.q_level,
+        q_trend=args.q_trend,
+        q_season=args.q_season,
+        m0_level=args.m0_level,
+        v0_level=args.v0_level,
+        m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend),
+        v0_trend=args.v0_trend,
+        m0_season=m0_season,
+        v0_season=v0_season,
+        start_date=start_date,
+    )
 
-                rows.append({
-                    "id": run_id, "level": lev, "trend": tr, "season": seas,
-                    "adf_p": adf_p, "kpss_p": kpss_p
-                })
+    # Simulate
+    y = []
+    for _ in range(args.T):
+        mts.move()
+        y.append(mts.measure())
 
-    plt.tight_layout()
-    plt.show()
+    truths = mts.get_truth_paths(as_numpy=True)
+    y_arr     = np.asarray(y, float)
+    mu_arr    = truths["mu_t"][1:1 + args.T]
+    alpha_arr = truths["alpha_t"][1:1 + args.T]
+    beta_arr  = truths["beta_t"][1:1 + args.T]
+    gamma_arr = truths["gamma_t"][1:1 + args.T]
+    dates_T   = truths["index"][:args.T]
 
-    # Small summary table
-    df = pd.DataFrame(rows)
-    with np.printoptions(suppress=True, precision=4):
-        print(df)
+    # Pack into DataFrame
+    df = pd.DataFrame({
+        "date": dates_T,
+        "y_t": y_arr,
+        "mu_t": mu_arr,
+        "alpha_t": alpha_arr,
+        "beta_t": beta_arr,
+        "gamma_t": gamma_arr,
+    })
+
+    # Save?
+    if args.save_csv:
+        out = args.save_csv
+        df.to_csv(out, index=False)
+        print(f"Saved {len(df)} rows to {out}")
+
+    # Summary?
+    if args.print_summary:
+        with np.printoptions(suppress=True, precision=4):
+            print("\n--- Summary ---")
+            print(f"level_mode={args.level_mode}, trend_mode={args.trend_mode}, seasonal_mode={args.seasonal_mode}")
+            print(f"sigma={args.sigma}, q_level={args.q_level}, q_trend={args.q_trend}, q_season={args.q_season}")
+            print(f"m0_level={args.m0_level}, v0_level={args.v0_level}, "
+                  f"m0_trend={(0.0 if args.trend_mode=='none' else args.m0_trend)}, v0_trend={args.v0_trend}")
+            print(f"m0_season={m0_season}")
+            print(f"v0_season={v0_season}")
+            print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
+            print(f"y mean={y_arr.mean():.3f}, sd={y_arr.std(ddof=1):.3f}")
+
+    # Plots?
+    if args.plot:
+        # Figure 1: y and mu
+        plt.figure(figsize=(10, 4))
+        plt.plot(dates_T, y_arr, label=r"$y_t$", linewidth=1.0)
+        plt.plot(dates_T, mu_arr, "--", label=r"$\mu_t$", linewidth=1.0)
+        ttl = f"level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode}"
+        plt.title(ttl)
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+
+        # Figure 2: truth paths alpha, beta, gamma_last
+        fig2, ax2 = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
+        ax2[0].plot(dates_T, alpha_arr, linewidth=1.0)
+        ax2[0].set_ylabel(r"$\alpha_t$")
+        ax2[0].grid(True)
+
+        ax2[1].plot(dates_T, beta_arr, linewidth=1.0)
+        ax2[1].set_ylabel(r"$\beta_t$")
+        ax2[1].grid(True)
+
+        ax2[2].plot(dates_T, gamma_arr, linewidth=1.0)
+        ax2[2].set_ylabel(r"$\gamma_t$")
+        ax2[2].set_xlabel("time")
+        ax2[2].grid(True)
+
+        fig2.suptitle("Truth paths")
+        fig2.tight_layout()
+
+        plt.show()
