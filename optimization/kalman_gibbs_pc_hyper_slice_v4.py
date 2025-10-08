@@ -918,13 +918,15 @@ class DLMGibbsConjugate:
 
 # ------------------------- CLI / Example run ------------------------------- #
 if __name__ == "__main__":
-    import argparse
-    import sys
+    import argparse, os, time, math, sys
     import matplotlib.pyplot as plt
     import pandas as pd
+    from datetime import datetime
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(base_dir)
 
-    sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-    from simulator.mean_time_series import Mean_Time_Series  # assumes it's importable
+    # import your simulator rewritten to the same (newest-first) convention
+    from simulator.mean_time_series import Mean_Time_Series
 
     def _parse_date(s: str | None):
         if not s:
@@ -935,22 +937,28 @@ if __name__ == "__main__":
         elif len(parts) == 3: return datetime(parts[0], parts[1], parts[2])
         raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
 
+    def _csv_floats_or_none(s: str | None):
+        if s is None: return None
+        s = s.strip()
+        if s == "": return None
+        return [float(z) for z in s.split(",") if z.strip() != ""]
+
     p = argparse.ArgumentParser(
         description=(
-            "Kalman-FFBS + conjugate Gibbs for Gaussian DLM. "
-            "Process sds use PC priors (slice) with Gamma hyperpriors on λ. "
-            "σ² uses a Gamma prior on precision; P0_* are Inverse-Gamma."
+            "Kalman FFBS + conjugate/PC Gibbs for Gaussian DLM "
+            "(level/trend/season). Seasonal state is newest-first, "
+            "observation loads the first seasonal coord."
         )
     )
 
-    # Simulation
+    # --- Simulation controls ---
     p.add_argument("--T", type=int, default=500)
     p.add_argument("--period", type=int, default=12)
     p.add_argument("--start-date", type=str, default="2000-01-01")
 
     p.add_argument("--level-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.05)
@@ -961,47 +969,45 @@ if __name__ == "__main__":
     p.add_argument("--v0-level", type=float, default=0.25)
     p.add_argument("--m0-trend", type=float, default=0.015)
     p.add_argument("--v0-trend", type=float, default=0.05)
-    p.add_argument("--m0-season", type=str, default=None, help="comma-separated list for m0_season (length p-1)")
-    p.add_argument("--v0-season", type=str, default=None, help="comma-separated list for v0_season (length p-1)")
+    p.add_argument("--m0-season", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--v0-season", type=str, default=None, help="comma-separated (length p-1)")
 
-    # Inference priors (conjugate)
-    p.add_argument("--prior-a-sigma", type=float, default=2.0)  # precision Gamma(shape)
-    p.add_argument("--prior-b-sigma", type=float, default=1.0)  # precision Gamma(rate)
+    # --- Inference priors ---
+    p.add_argument("--prior-a-sigma", type=float, default=2.0)
+    p.add_argument("--prior-b-sigma", type=float, default=1.0)
 
-    # Priors for (deterministic & dynamic) initial means m0_* ~ N(m, s^2)
     p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
-    p.add_argument("--prior-m-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-s-m0-beta", type=float, default=10.0)
-    p.add_argument("--prior-m-m0-gamma", type=str, default=None, help="comma-separated list for m0_gamma prior means (length p-1)")
+    p.add_argument("--prior-m-m0-beta",  type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta",  type=float, default=10.0)
+    p.add_argument("--prior-m-m0-gamma", type=str, default=None, help="comma-separated (length p-1, newest-first)")
     p.add_argument("--prior-s-m0-gamma", type=float, default=5.0)
 
-    # Priors for initial-state variances P0_* ~ InvGamma(a, b)
     p.add_argument("--prior-a-P0-alpha", type=float, default=2.0)
     p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
-    p.add_argument("--prior-a-P0-beta", type=float, default=2.0)
-    p.add_argument("--prior-b-P0-beta", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-beta",  type=float, default=2.0)
+    p.add_argument("--prior-b-P0-beta",  type=float, default=1.0)
     p.add_argument("--prior-a-P0-gamma", type=float, default=2.0)
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
 
-    # PC priors + (optional) Gamma hyperpriors on lambda for process sds
-    p.add_argument("--pc-frac-alpha", type=float, default=0.10)
-    p.add_argument("--pc-frac-beta", type=float, default=0.10)
-    p.add_argument("--pc-frac-gamma", type=float, default=0.10)
-    p.add_argument("--pc-alpha-prob", type=float, default=0.05)
+    # --- PC priors for process sds (with optional fixed lambdas) ---
+    p.add_argument("--pc-frac-alpha",  type=float, default=0.10)
+    p.add_argument("--pc-frac-beta",   type=float, default=0.10)
+    p.add_argument("--pc-frac-gamma",  type=float, default=0.10)
+    p.add_argument("--pc-alpha-prob",  type=float, default=0.05)
     p.add_argument("--pc-lambda-alpha", type=float, default=None)
-    p.add_argument("--pc-lambda-beta", type=float, default=None)
+    p.add_argument("--pc-lambda-beta",  type=float, default=None)
     p.add_argument("--pc-lambda-gamma", type=float, default=None)
     p.add_argument("--pc-a-lambda-alpha", type=float, default=1.0)
     p.add_argument("--pc-b-lambda-alpha", type=float, default=1.0)
-    p.add_argument("--pc-a-lambda-beta", type=float, default=1.0)
-    p.add_argument("--pc-b-lambda-beta", type=float, default=1.0)
+    p.add_argument("--pc-a-lambda-beta",  type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-beta",  type=float, default=1.0)
     p.add_argument("--pc-a-lambda-gamma", type=float, default=1.0)
     p.add_argument("--pc-b-lambda-gamma", type=float, default=1.0)
 
-    # Sampler config & slice
-    p.add_argument("--n-iter", type=int, default=4000)
-    p.add_argument("--burn", type=int, default=1000)
+    # --- Sampler config & slice ---
+    p.add_argument("--n-iter", type=int, default=10000)
+    p.add_argument("--burn", type=int, default=5000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
@@ -1010,38 +1016,34 @@ if __name__ == "__main__":
     p.add_argument("--slice-m", type=int, default=40)
     p.add_argument("--slice-max-shrink", type=int, default=1000)
 
-    # Initial values (optional)
+    # --- Initial values for inference ---
     p.add_argument("--sigma-init", type=float, default=2.0)  # sd (will be squared)
     p.add_argument("--s-alpha-init", type=float, default=1e-2)
-    p.add_argument("--s-beta-init", type=float, default=1e-3)
+    p.add_argument("--s-beta-init",  type=float, default=1e-3)
     p.add_argument("--s-gamma-init", type=float, default=1.0)
-    p.add_argument("--m0-gamma-init", type=str, default=None, help="comma-separated list for m0_gamma init (length p-1)")
+    p.add_argument("--m0-gamma-init", type=str, default=None, help="comma-separated (length p-1, newest-first)")
     p.add_argument("--P0-alpha-init", type=float, default=0.25)
-    p.add_argument("--P0-beta-init", type=float, default=0.05)
+    p.add_argument("--P0-beta-init",  type=float, default=0.05)
     p.add_argument("--P0-gamma-init", type=float, default=0.25)
 
-    # I/O
+    # --- I/O & plotting ---
     p.add_argument("--out-dir", type=str, default="results/simulations/DLM")
-
-    # Plotting & prints
     p.add_argument("--plot", default=True)
     p.add_argument("--print-summary", default=True)
-
-    # Seasonal observation convention
-    p.add_argument("--season-obs", choices=["last", "first"], default="last",
-                   help="Which seasonal coord loads into y_t. 'last' matches the simulator; 'first' matches LaTeX.")
 
     args = p.parse_args()
     np.random.seed(args.seed)
 
     start_date = _parse_date(args.start_date)
-    if args.m0_season is None:
-        args.m0_season = np.random.normal(0.0, 10.0, size=args.period - 1).tolist()
-    if args.v0_season is None:
-        args.v0_season = [0.25] * (args.period - 1)
-    # If not given, use a neutral prior mean for seasonal (centered at zero)
-    pri_gamma_vec = None
-    # ---- Simulate data ----
+    m0_season = _csv_floats_or_none(args.m0_season)
+    v0_season = _csv_floats_or_none(args.v0_season)
+    if m0_season is None:
+        # neutral newest-first initial seasonal (length p-1)
+        m0_season = [0.0] * (args.period - 1)
+    if v0_season is None:
+        v0_season = [0.25] * (args.period - 1)
+
+    # --- Simulate data (simulator uses same newest-first convention) ---
     sim_level_mode = args.level_mode if args.level_mode != "none" else "deterministic"
     mts = Mean_Time_Series(
         sigma=args.sigma,
@@ -1056,8 +1058,8 @@ if __name__ == "__main__":
         v0_level=(args.v0_level if sim_level_mode == "dynamic" else 0.0),
         m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend),
         v0_trend=(args.v0_trend if args.trend_mode == "dynamic" else 0.0),
-        m0_season=args.m0_season,
-        v0_season=args.v0_season,
+        m0_season=m0_season,   # length p-1, newest-first
+        v0_season=v0_season,   # length p-1
         start_date=start_date,
     )
 
@@ -1068,19 +1070,23 @@ if __name__ == "__main__":
     y = np.asarray(y, float)
 
     truths = mts.get_truth_paths(as_numpy=True)
-    mu_T = truths["mu_t"][1 : 1 + args.T]
+    mu_T    = truths["mu_t"][1 : 1 + args.T]
     alpha_T = truths["alpha_t"][1 : 1 + args.T]
-    beta_T = truths["beta_t"][1 : 1 + args.T]
+    beta_T  = truths["beta_t"][1 : 1 + args.T]
     gamma_T = truths["gamma_t"][1 : 1 + args.T]
     dates_T = truths["index"][: args.T]
 
-    # ---- Priors ----
-    if args.m0_gamma_init is not None and isinstance(args.m0_gamma_init, str):
+    # --- Initial seasonal mean for sampler (newest-first, length p-1) ---
+    if args.m0_gamma_init is not None:
         m0_gamma_init = [float(z) for z in args.m0_gamma_init.split(",") if z.strip() != ""]
     else:
-        # crude seasonal init (median-of-month) centered and drop the implied last
+        # crude seasonal init: de-meaned median-of-season; take first p-1 entries (newest-first)
         S = np.array([np.median(y[k::args.period]) for k in range(args.period)], float)
-        m0_gamma_init = (S - S.mean())[:-1]
+        base = S - S.mean()
+        m0_gamma_init = base[: args.period - 1].tolist()
+
+    # --- Priors and config ---
+    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
 
     priors = Priors(
         a_sigma=float(args.prior_a_sigma),
@@ -1132,6 +1138,7 @@ if __name__ == "__main__":
         slice_max_shrink=int(args.slice_max_shrink),
     )
 
+    # --- Build and run sampler (matches newest-first convention) ---
     sampler = DLMGibbsConjugate(
         y=y,
         period=int(args.period),
@@ -1146,13 +1153,13 @@ if __name__ == "__main__":
         P0_alpha_init=float(args.P0_alpha_init),
         m0_beta_init=float(args.m0_trend if args.trend_mode != "none" else 0.0),
         P0_beta_init=float(args.P0_beta_init),
-        m0_gamma_init=m0_gamma_init,
+        m0_gamma_init=m0_gamma_init,  # newest-first, length p-1
         P0_gamma_init=float(args.P0_gamma_init),
         priors=priors,
         cfg=cfg,
     )
 
-    # Store truths for overlays (optional)
+    # (optional) attach truths for saving/diagnostics
     sampler.set_truth(
         sigma=mts.sigma,
         Q=(mts.q_level, mts.q_trend, mts.q_season),
@@ -1163,133 +1170,44 @@ if __name__ == "__main__":
         P0_trend=mts.v0_trend,
         P0_season=mts.v0_season,
     )
-    sampler.set_truth_paths(
-        mu=mu_T,
-        alpha=(alpha_T if args.level_mode == "dynamic" else None),
-        beta=(beta_T if args.trend_mode == "dynamic" else None),
-        gamma=(gamma_T if args.seasonal_mode == "dynamic" else None),
-    )
+    sampler.set_truth_paths(mu=mu_T,
+                            alpha=(alpha_T if args.level_mode == "dynamic" else None),
+                            beta=(beta_T if args.trend_mode == "dynamic" else None),
+                            gamma=(gamma_T if args.seasonal_mode == "dynamic" else None))
 
-    # ---- Print quick summaries ----
     if args.print_summary:
         with np.printoptions(suppress=True, precision=4):
             print("\n--- Summary (simulation) ---")
-            print(f"level_mode={mts.level_mode}, trend_mode={mts.trend_mode}, seasonal_mode={mts.seasonal_mode}")
-            print(
-                f"sigma(sim)={mts.sigma}, "
-                f"q_level={mts.q_level if mts.level_mode=='dynamic' else 0.0}, "
-                f"q_trend={mts.q_trend if mts.trend_mode=='dynamic' else 0.0}, "
-                f"q_season={mts.q_season if mts.seasonal_mode=='dynamic' else 0.0}"
-            )
-            if mts.level_mode == "none":
-                print("m0_level=0.0 (none), P0_level=0.0 (none)")
-            else:
-                print(f"m0_level={mts.m0_level}, P0_level={mts.v0_level if mts.level_mode=='dynamic' else 0.0}")
-            if mts.trend_mode == "none":
-                print("m0_trend=0.0 (none), P0_trend=0.0 (none)")
-            else:
-                print(
-                    f"m0_trend={(0.0 if mts.trend_mode=='none' else mts.m0_trend)}, "
-                    f"P0_trend={mts.v0_trend if mts.trend_mode=='dynamic' else 0.0}"
-                )
-            if mts.seasonal_mode == "none":
-                print(f"m0_season={[0.0]*(mts.period-1)} (none), P0_season=0.0 (none)")
-            else:
-                m0_season_str = np.array2string(np.array(args.m0_season), precision=2, suppress_small=True)
-                if args.seasonal_mode == "dynamic":
-                    P0_season_str = np.array2string(np.array(args.v0_season), precision=2, suppress_small=True)
-                else:
-                    P0_season_str = "0.0"
-                print(f"m0_season={m0_season_str}, P0_season={P0_season_str}")
+            print(f"level={mts.level_mode}, trend={mts.trend_mode}, season={mts.seasonal_mode}")
+            print(f"sigma={mts.sigma}, q_level={mts.q_level}, q_trend={mts.q_trend}, q_season={mts.q_season}")
+            print(f"m0_level={mts.m0_level}, v0_level={mts.v0_level}")
+            print(f"m0_trend={mts.m0_trend}, v0_trend={mts.v0_trend}")
+            print(f"m0_season={mts.m0_season}, v0_season={mts.v0_season}")
             print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
             print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
 
-    # ---- Run ----
     t0 = time.time()
     post = sampler.run()
     elapsed = time.time() - t0
     print(f"Run time: {elapsed:.2f}s")
 
-    # ---- Save posterior ----
     out_dir = os.path.join(
         args.out_dir,
         f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
     )
-    _ensure_dir(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
     sampler.save_posterior(
-        out_npz_path=os.path.join(out_dir, "posterior.npz"), extra_meta={"elapsed_seconds": float(elapsed)}
+        out_npz_path=os.path.join(out_dir, "posterior.npz"),
+        extra_meta={"elapsed_seconds": float(elapsed)}
     )
 
-    # ---- Pack and optionally save data frame ----
-    df = pd.DataFrame(
-        {
-            "date": dates_T,
-            "y_t": y,
-            "mu_t_truth": mu_T,
-            "alpha_t_truth": alpha_T,
-            "beta_t_truth": beta_T,
-            "gamma_t_truth": gamma_T,
-        }
-    )
-
-    # ---- Print quick summaries ----
-    if args.print_summary:
-        with np.printoptions(suppress=True, precision=4):
-            print("\n--- Summary (posterior means) ---")
-            print(f"σ: {np.mean(post['sigma']):.4g}")
-            if "Q_alpha" in post:
-                m = float(np.mean(post["Q_alpha"]))
-                print(f"Q_alpha: {m:.4g}  (√Q_alpha ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_alpha: n/a (level deterministic or none)")
-            if "Q_beta" in post:
-                m = float(np.mean(post["Q_beta"]))
-                print(f"Q_beta:  {m:.4g}  (√Q_beta  ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_beta: n/a (trend deterministic or none)")
-            if "Q_gamma" in post:
-                m = float(np.mean(post["Q_gamma"]))
-                print(f"Q_gamma: {m:.4g}  (√Q_gamma ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_gamma: n/a (season deterministic or none)")
-            if "lambda_alpha" in post:
-                print(f"λ_alpha: {np.mean(post['lambda_alpha']):.4g}")
-            if "lambda_beta" in post:
-                print(f"λ_beta:  {np.mean(post['lambda_beta']):.4g}")
-            if "lambda_gamma" in post:
-                print(f"λ_gamma: {np.mean(post['lambda_gamma']):.4g}")
-            if "m0_alpha" in post:
-                if args.level_mode == "dynamic":
-                    print(f"m0_alpha: {np.mean(post['m0_alpha']):.4g}, P0_alpha: {np.mean(post['P0_alpha']):.4g}")
-                elif args.level_mode == "deterministic":
-                    print(f"m0_alpha: {np.mean(post['m0_alpha']):.4g} (det), P0_alpha: n/a (det)")
-            else:
-                print("m0_alpha: n/a")
-            if "m0_beta" in post:
-                if args.trend_mode == "dynamic":
-                    print(f"m0_beta:  {np.mean(post['m0_beta']):.4g}, P0_beta:  {np.mean(post['P0_beta']):.4g}")
-                elif args.trend_mode == "deterministic":
-                    print(f"m0_beta:  {np.mean(post['m0_beta']):.4g} (det), P0_beta: n/a (det)")
-            else:
-                print("m0_beta: n/a")
-            if "m0_gamma" in post:
-                means = np.mean(post["m0_gamma"], axis=0)
-                # no rolling: print as stored (g1..g_{p-1}); implied last is -sum
-                if args.seasonal_mode == "dynamic":
-                    print(f"m0_gamma: {means}, P0_gamma: {np.mean(post['P0_gamma']):.4g}")
-                elif args.seasonal_mode == "deterministic":
-                    print(
-                        f"m0_gamma: {np.array2string(means, precision=2, suppress_small=True)}, (det), P0_gamma: n/a (det)"
-                    )
-
-    # ---- Optional plots ----
     if args.plot:
         mu_hat = post["mu"].mean(axis=0)
         plt.figure(figsize=(10, 4))
         plt.plot(dates_T, y, label=r"$y_t$", linewidth=1.0)
         plt.plot(dates_T, mu_T, "--", label=r"$\mu_t$ (truth)", linewidth=1.0)
         plt.plot(dates_T, mu_hat, "-.", label=r"$\hat{\mu}_t$ (post mean)", linewidth=1.0)
-        ttl = f"DLM: level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode}, season_obs={args.season_obs}"
+        ttl = f"DLM: level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode}"
         plt.title(ttl)
         plt.grid(True)
         plt.legend()
