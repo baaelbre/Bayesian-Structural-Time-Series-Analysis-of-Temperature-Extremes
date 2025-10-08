@@ -29,19 +29,20 @@ class Mean_Time_Series:
       - deterministic: m0_* is the fixed value (vector for season); v0_* ignored
       - none (trend/season only): behaves as m0_* = 0 (vector of zeros for season)
 
-    Seasonality (STRICT)
-    --------------------
-      - m0_season and v0_season MUST be lists/1D arrays of length (period-1).
-      - deterministic: full seasonal vector is [m0_season, -sum(m0_season)] (sum-to-zero).
-      - none: m0_season should be all zeros; implied last is 0 too.
-      - dynamic: the (period-1) latent coords have priors m0_season/v0_season; each step
-        the new last coord is drawn with mean = -sum(previous coords), var = q_season.
+    Seasonal convention (LaTeX-consistent)
+    --------------------------------------
+      State stores the (period-1) seasonal coordinates in *newest-first* order:
+        [γ_t, γ_{t-1}, ..., γ_{t-(p-2)}].
 
-    Auto-overrides when a requested dynamic component cannot evolve
-    ----------------------------------------------------------------
-      - If q_* == 0 or v0_* == 0:
-          * if m0_* == 0  -> mode := "none"  (except level: becomes 'deterministic')
-          * else          -> mode := "deterministic"
+      Evolution (for dynamic seasonality):
+        γ_t = -∑_{j=1}^{p-1} γ_{t-j} + ε_{γ,t},  ε_{γ,t} ~ N(0, q_season)
+        Then the vector shifts right: [γ_t, γ_{t-1}, ..., γ_{t-(p-2)}].
+
+      Observation uses the *first* seasonal coord (the current γ_t).
+
+      INPUT ordering for m0_season is *oldest→newest*:
+        m0_season = (γ_{-(p-2)}, ..., γ_{-1}, γ_0).
+      This is flipped internally to newest-first storage.
     """
 
     def __init__(self,
@@ -59,8 +60,8 @@ class Mean_Time_Series:
                  v0_level=1.0,
                  m0_trend=0.0,
                  v0_trend=1.0,
-                 m0_season=None,   # list/array of length period-1
-                 v0_season=None,   # list/array of length period-1
+                 m0_season=None,   # list/array length (period-1): (γ_{-(p-2)},...,γ_{-1},γ_0)
+                 v0_season=None,   # list/array length (period-1) matching m0_season
                  start_date=None):
 
         # ---------- basic checks on modes ----------
@@ -90,15 +91,19 @@ class Mean_Time_Series:
         if v0_season is None:
             v0_season = [1.0] * (self.period - 1)
 
-        self.m0_season = np.asarray(m0_season, dtype=float).reshape(-1)
-        self.v0_season = np.asarray(v0_season, dtype=float).reshape(-1)
+        m0_season = np.asarray(m0_season, dtype=float).reshape(-1)
+        v0_season = np.asarray(v0_season, dtype=float).reshape(-1)
 
-        if self.m0_season.size != self.period - 1:
+        if m0_season.size != self.period - 1:
             raise ValueError(f"m0_season must have length period-1 = {self.period-1}.")
-        if self.v0_season.size != self.period - 1:
+        if v0_season.size != self.period - 1:
             raise ValueError(f"v0_season must have length period-1 = {self.period-1}.")
-        if np.any(self.v0_season < 0.0) or self.v0_level < 0.0 or self.v0_trend < 0.0:
+        if np.any(v0_season < 0.0) or self.v0_level < 0.0 or self.v0_trend < 0.0:
             raise ValueError("All prior variances must be >= 0.")
+
+        # Flip to newest-first internal storage: [γ_0, γ_{-1}, ..., γ_{-(p-2)}]
+        self.m0_season = m0_season[::-1].copy()
+        self.v0_season = v0_season[::-1].copy()
 
         # ---------- auto-overrides for dynamic components ----------
         # Level: cannot be 'none'
@@ -130,8 +135,9 @@ class Mean_Time_Series:
 
         # For season deterministic: build full vector of length period with sum-zero
         if self.seasonal_mode == "deterministic":
-            last = -float(np.sum(self.m0_season))
-            self.fixed_season = list(self.m0_season.astype(float)) + [last]
+            # Use input order (oldest->newest) for printing; full vector (period) must sum to zero
+            last = -float(np.sum(m0_season))
+            self.fixed_season = list(m0_season.astype(float)) + [last]
         elif self.seasonal_mode == "none":
             # not used in mu, but keep a consistent implied vector (all zeros)
             self.fixed_season = [0.0] * self.period
@@ -158,7 +164,7 @@ class Mean_Time_Series:
                 elif tag == "beta":
                     m0_vec.append(self.m0_trend); v0_vec.append(self.v0_trend)
                 else:
-                    # g1..g_{p-1}: use the provided lists m0_season / v0_season
+                    # g1..g_{p-1} (newest-first already)
                     k = int(tag[1:])  # k in 1..(p-1)
                     m0_vec.append(self.m0_season[k - 1])
                     v0_vec.append(self.v0_season[k - 1])
@@ -175,7 +181,7 @@ class Mean_Time_Series:
         self.mu_path = []
         self.alpha_path = []
         self.beta_path = []
-        self.gamma_last_path = []
+        self.gamma_path = []   # current γ_t each step
 
         # initial record
         self._record_truth()
@@ -192,7 +198,7 @@ class Mean_Time_Series:
         return None
 
     def _get_season_vec(self):
-        """Return the (period-1) seasonal latent vector if dynamic; else []."""
+        """Return the (period-1) seasonal latent vector (newest-first) if dynamic; else []."""
         if self.seasonal_mode != "dynamic":
             return []
         start = 0
@@ -204,7 +210,7 @@ class Mean_Time_Series:
     def _alpha_contribution(self):
         """
         Level + (linear trend contribution) at time t.
-        If level is dynamic, its state already includes the current level (and we add no t-multiplication).
+        If level is dynamic, its state already includes the current level (no t-multiplication).
         If level is deterministic, we add trend * t here (dynamic or deterministic, if present).
         """
         t = self.t
@@ -232,8 +238,8 @@ class Mean_Time_Series:
 
     def _seasonal_contribution(self):
         if self.seasonal_mode == "dynamic":
-            g_vec = self._get_season_vec()
-            return float(g_vec[-1]) if len(g_vec) else 0.0
+            g_vec = self._get_season_vec()  # newest-first
+            return float(g_vec[0]) if len(g_vec) else 0.0   # observe FIRST coord = γ_t
         elif self.seasonal_mode == "deterministic":
             return float(self.fixed_season[self.t % self.period])
         else:
@@ -242,12 +248,12 @@ class Mean_Time_Series:
     def _record_truth(self):
         alpha_c = self._alpha_contribution()
         beta_v  = self._beta_value_for_path()
-        gamma_c = self._seasonal_contribution()
+        gamma_c = self._seasonal_contribution()  # γ_t (current)
         mu_t    = float(alpha_c + gamma_c)
 
         self.alpha_path.append(alpha_c)
         self.beta_path.append(beta_v)
-        self.gamma_last_path.append(gamma_c)
+        self.gamma_path.append(gamma_c)
         self.mu_path.append(mu_t)
 
     # ----------------- one-step evolution -----------------
@@ -256,7 +262,7 @@ class Mean_Time_Series:
         Advance t -> t+1.
           alpha_{t+1} = alpha_t + drift + N(0, q_level)
           beta_{t+1}  = beta_t  + N(0, q_trend)
-          season: shift g[1..p-1], draw new last with mean = -sum(prev), var = q_season
+          season (dynamic): draw γ_t = -sum(past) + ε, then shift right to keep newest-first.
         """
         if self.n_latent == 0:
             self.t += 1
@@ -280,15 +286,15 @@ class Mean_Time_Series:
             i = self._state_layout.index("beta")
             new_x[i] = self.x_t[i] + np.random.normal(0.0, np.sqrt(self.q_trend))
 
-        # season (period-1 vector)
+        # season (period-1 vector, newest-first)
         if self.seasonal_mode == "dynamic":
             start = 0
             if "alpha" in self._state_layout: start += 1
             if "beta"  in self._state_layout: start += 1
-            g_prev = list(self.x_t[start:])  # length = period-1
+            g_prev = list(self.x_t[start:])  # [γ_{t-1}, γ_{t-2}, ...] before update it's currently [γ_0, γ_{-1}, ...]
             mean_new = -float(np.sum(g_prev))
-            g_new_last = np.random.normal(mean_new, np.sqrt(self.q_season))
-            g_new_vec = (g_prev[1:] + [g_new_last]) if len(g_prev) > 0 else [g_new_last]
+            g_new_first = np.random.normal(mean_new, np.sqrt(self.q_season))  # this is γ_t
+            g_new_vec = [g_new_first] + g_prev[:-1] if len(g_prev) > 0 else [g_new_first]
             new_x[start:] = np.array(g_new_vec)
 
         self.x_t = new_x
@@ -321,14 +327,12 @@ class Mean_Time_Series:
         return {
             "alpha_t": to_arr(self.alpha_path),
             "beta_t": to_arr(self.beta_path),
-            "gamma_t": to_arr(self.gamma_last_path),
+            "gamma_t": to_arr(self.gamma_path),  # current seasonal effect
             "mu_t": to_arr(self.mu_path),
             "index": list(self.index),
         }
 
-# ------------------------------------------------------------
-# Demo: generate and visualize all 18 (level x trend x season)
-# ------------------------------------------------------------
+
 # ------------------------------------------------------------
 # CLI: generate a single time series with full control
 # ------------------------------------------------------------
@@ -379,27 +383,27 @@ if __name__ == "__main__":
     p.add_argument("--v0-level", type=float, default=0.25)
     p.add_argument("--m0-trend", type=float, default=0.015)
     p.add_argument("--v0-trend", type=float, default=0.05)
-    p.add_argument("--m0-season", type=str, default="", help="Comma-separated length (period-1) means for seasonal states.")
-    p.add_argument("--v0-season", type=str, default="", help="Comma-separated length (period-1) variances for seasonal states.")
+    p.add_argument("--m0-season", type=str, default="", help="Comma-separated length (period-1): (γ_{-(p-2)},...,γ_{-1},γ_0).")
+    p.add_argument("--v0-season", type=str, default="", help="Comma-separated length (period-1) variances.")
 
     # I/O & misc
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
     p.add_argument("--plot", default=True, help="Show matplotlib figures.")
-    p.add_argument("--save-csv", type=str, default="", help="Path to save CSV with date,y,mu,alpha,beta,gamma_last.")
+    p.add_argument("--save-csv", type=str, default="", help="Path to save CSV with date,y,mu,alpha,beta,gamma.")
     p.add_argument("--print-summary", default=True, help="Print a small summary table at the end.")
 
     args = p.parse_args()
     np.random.seed(args.seed)
 
-    # Build seasonal vectors (period-1) if provided or default to zeros / ones
-    m0_season = _csv_floats(args.m0_season)
-    v0_season = _csv_floats(args.v0_season)
-    if m0_season is None:
-        m0_season = [5] * (args.period - 1)
-    if v0_season is None:
-        # sensible defaults: variance 0 for deterministic season, else 0.5
-        v_default = 0.0 if args.seasonal_mode == "deterministic" else 0.5
-        v0_season = [v_default] * (args.period - 1)
+    # Build seasonal vectors (period-1) if provided or default
+    def _maybe_parse(s, default_val):
+        out = _csv_floats(s)
+        return out if out is not None else [default_val] * (args.period - 1)
+
+    m0_season = _maybe_parse(args.m0_season, 5.0)
+    # sensible defaults: variance 0 for deterministic season, else 0.5
+    v_default = 0.0 if args.seasonal_mode == "deterministic" else 0.5
+    v0_season = _maybe_parse(args.v0_season, v_default)
 
     start_date = _parse_date(args.start_date)
 
@@ -436,6 +440,7 @@ if __name__ == "__main__":
     dates_T   = truths["index"][:args.T]
 
     # Pack into DataFrame
+    import pandas as pd
     df = pd.DataFrame({
         "date": dates_T,
         "y_t": y_arr,
@@ -459,8 +464,8 @@ if __name__ == "__main__":
             print(f"sigma={args.sigma}, q_level={args.q_level}, q_trend={args.q_trend}, q_season={args.q_season}")
             print(f"m0_level={args.m0_level}, v0_level={args.v0_level}, "
                   f"m0_trend={(0.0 if args.trend_mode=='none' else args.m0_trend)}, v0_trend={args.v0_trend}")
-            print(f"m0_season={m0_season}")
-            print(f"v0_season={v0_season}")
+            print(f"m0_season (oldest→newest) = {m0_season}")
+            print(f"v0_season (oldest→newest) = {v0_season}")
             print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
             print(f"y mean={y_arr.mean():.3f}, sd={y_arr.std(ddof=1):.3f}")
 
@@ -476,7 +481,7 @@ if __name__ == "__main__":
         plt.legend()
         plt.tight_layout()
 
-        # Figure 2: truth paths alpha, beta, gamma_last
+        # Figure 2: truth paths alpha, beta, gamma
         fig2, ax2 = plt.subplots(3, 1, figsize=(10, 7), sharex=True)
         ax2[0].plot(dates_T, alpha_arr, linewidth=1.0)
         ax2[0].set_ylabel(r"$\alpha_t$")
