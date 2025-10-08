@@ -934,7 +934,7 @@ if __name__ == "__main__":
 
     p.add_argument("--level-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.05)
@@ -985,8 +985,8 @@ if __name__ == "__main__":
     p.add_argument("--pc-b-lambda-gamma", type=float, default=1.0)
 
     # Sampler config & slice
-    p.add_argument("--n-iter", type=int, default=4000)
-    p.add_argument("--burn", type=int, default=1000)
+    p.add_argument("--n-iter", type=int, default=10000)
+    p.add_argument("--burn", type=int, default=5000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
