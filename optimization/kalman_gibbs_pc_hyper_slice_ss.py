@@ -1284,10 +1284,11 @@ if __name__ == "__main__":
     p.add_argument("--T", type=int, default=500)
     p.add_argument("--period", type=int, default=12)
     p.add_argument("--start-date", type=str, default="2000-01-01")
-
-    p.add_argument("--level-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    
+    # --- Simulation controls (modes independent from fit) ---
+    p.add_argument("--sim-level-mode",   choices=["dynamic","deterministic","none"], default="deterministic")
+    p.add_argument("--sim-trend-mode",   choices=["dynamic","deterministic","none"], default="deterministic")
+    p.add_argument("--sim-season-mode",  choices=["dynamic","deterministic","none"], default="deterministic")
 
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.05)
@@ -1301,6 +1302,11 @@ if __name__ == "__main__":
     p.add_argument("--m0-season", type=str, default=None, help="comma-separated (length p-1, newest-first)")
     p.add_argument("--v0-season", type=str, default=None, help="comma-separated (length p-1)")
 
+    # --- Fitted model config (modes) ---
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    
     # --- Inference priors ---
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
     p.add_argument("--prior-b-sigma", type=float, default=1.0)
@@ -1336,9 +1342,9 @@ if __name__ == "__main__":
 
     # --- Spike & Slab toggles ---
     p.add_argument("--spike-slab", default=True, help="Enable spike&slab on process noises")
-    p.add_argument("--pi-alpha-on", type=float, default=0.5, help="Prior inclusion prob for alpha noise")
-    p.add_argument("--pi-beta-on",  type=float, default=0.5, help="Prior inclusion prob for beta noise")
-    p.add_argument("--pi-gamma-on", type=float, default=0.5, help="Prior inclusion prob for gamma noise")
+    p.add_argument("--pi-alpha-on", type=float, default=0.1, help="Prior inclusion prob for alpha noise")
+    p.add_argument("--pi-beta-on",  type=float, default=0.1, help="Prior inclusion prob for beta noise")
+    p.add_argument("--pi-gamma-on", type=float, default=0.1, help="Prior inclusion prob for gamma noise")
 
     # --- Sampler config & slice ---
     p.add_argument("--n-iter", type=int, default=10000)
@@ -1378,25 +1384,28 @@ if __name__ == "__main__":
     if v0_season is None:
         v0_season = [0.25] * (args.period - 1)
 
-    # --- Simulate data (simulator uses same newest-first convention) ---
-    sim_level_mode = args.level_mode if args.level_mode != "none" else "deterministic"
+    sim_level_mode  = args.sim_level_mode
+    sim_trend_mode  = args.sim_trend_mode
+    sim_season_mode = args.sim_season_mode
+
     mts = Mean_Time_Series(
         sigma=args.sigma,
         level_mode=sim_level_mode,
-        trend_mode=args.trend_mode,
-        seasonal_mode=args.seasonal_mode,
+        trend_mode=sim_trend_mode,
+        seasonal_mode=sim_season_mode,
         period=args.period,
-        q_level=(args.q_level if sim_level_mode == "dynamic" else 0.0),
-        q_trend=(args.q_trend if args.trend_mode == "dynamic" else 0.0),
-        q_season=(args.q_season if args.seasonal_mode == "dynamic" else 0.0),
-        m0_level=(0.0 if args.level_mode == "none" else args.m0_level),
-        v0_level=(args.v0_level if sim_level_mode == "dynamic" else 0.0),
-        m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend),
-        v0_trend=(args.v0_trend if args.trend_mode == "dynamic" else 0.0),
-        m0_season=m0_season,   # length p-1, newest-first
-        v0_season=v0_season,   # length p-1
+        q_level =(args.q_level  if sim_level_mode  == "dynamic" else 0.0),
+        q_trend =(args.q_trend  if sim_trend_mode  == "dynamic" else 0.0),
+        q_season=(args.q_season if sim_season_mode == "dynamic" else 0.0),
+        m0_level=(0.0 if sim_level_mode == "none" else args.m0_level),
+        v0_level=(args.v0_level if sim_level_mode  == "dynamic" else 0.0),
+        m0_trend=(0.0 if sim_trend_mode == "none" else args.m0_trend),
+        v0_trend=(args.v0_trend if sim_trend_mode  == "dynamic" else 0.0),
+        m0_season=m0_season,
+        v0_season=v0_season,
         start_date=start_date,
     )
+
 
     y = []
     for _ in range(args.T):
