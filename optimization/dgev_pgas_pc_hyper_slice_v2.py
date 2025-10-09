@@ -1062,23 +1062,27 @@ class DGEVParticleGibbs:
         return f"[{head}, …]"
 
     def _progress_line(self, it: int) -> str:
+        # inline acceptance rate as percentage (no extra method)
+        def pct(key: str) -> str:
+            p = self.proposals.get(key, 0)
+            a = self.accept.get(key, 0)
+            return "0.0%" if p <= 0 else f"{100.0 * a / p:.1f}%"
+
         parts = [f"[it {it + 1}/{self.cfg.n_iter}]"]
         parts.append(f"logZ={self.last_log_evidence:.3f}")
-        parts.append(f"σ={math.exp(self.logsigma):.3f} ({self.accept['logsigma']}/{self.proposals['logsigma']})")
-        parts.append(f"ξ={self.xi:.3f} ({self.accept['xi']}/{self.proposals['xi']})")
+        parts.append(f"σ={math.exp(self.logsigma):.3f} ({pct('logsigma')})")
+        parts.append(f"ξ={self.xi:.3f} ({pct('xi')})")
 
-        # Q / λ as you already had it ...
+        # Q block (uses current s_* where present)
         if self.idx_alpha is not None:
-            parts.append(f"Qα={self.s_alpha**2:.4g}" if hasattr(self, "s_alpha") else f"Qα={self.Q[self.idx_alpha]:.4g}")
+            parts.append(f"Qα={self.s_alpha**2:.4g}")
         if self.idx_beta is not None:
-            parts.append(f"Qβ={self.s_beta**2:.4g}" if hasattr(self, "s_beta") else f"Qβ={self.Q[self.idx_beta]:.4g}")
+            parts.append(f"Qβ={self.s_beta**2:.4g}")
         if self.seasonal_mode == "dynamic":
-            if hasattr(self, "s_gamma"):
-                parts.append(f"Qγ={self.s_gamma**2:.4g}")
-            else:
-                parts.append(f"Qγ={self.Q[self.idx_gamma_end]:.4g}")
+            parts.append(f"Qγ={self.s_gamma**2:.4g}")
 
-        def _lam(lam, present, fixed):
+        # λ display (mark fixed with '(fix)')
+        def lam_str(lam, present, fixed):
             if not present: return "-"
             if fixed is not None: return f"{fixed:.3g}(fix)"
             return "-" if lam is None else f"{lam:.3g}"
@@ -1086,14 +1090,14 @@ class DGEVParticleGibbs:
         parts.append(
             "λ=("
             + ",".join([
-                _lam(getattr(self, "lambda_alpha", None), self.idx_alpha is not None, getattr(self.priors.pc_alpha, "lambda_s", None)),
-                _lam(getattr(self, "lambda_beta",  None), self.idx_beta  is not None, getattr(self.priors.pc_beta,  "lambda_s", None)),
-                _lam(getattr(self, "lambda_gamma", None), self.seasonal_mode == "dynamic", getattr(self.priors.pc_gamma, "lambda_s", None)),
+                lam_str(getattr(self, "lambda_alpha", None), self.idx_alpha is not None, getattr(self.priors.pc_alpha, "lambda_s", None)),
+                lam_str(getattr(self, "lambda_beta",  None), self.idx_beta  is not None, getattr(self.priors.pc_beta,  "lambda_s", None)),
+                lam_str(getattr(self, "lambda_gamma", None), self.seasonal_mode == "dynamic", getattr(self.priors.pc_gamma, "lambda_s", None)),
             ])
             + ")"
         )
 
-        # m0/P0 or slope display
+        # m0/P0 or slope (with percent accept for deterministic pieces)
         if self.level_mode != "none":
             if hasattr(self, "m0_alpha"):
                 p0a = (self.P0_alpha if self.level_mode == "dynamic" else 0.0)
@@ -1102,28 +1106,27 @@ class DGEVParticleGibbs:
                 parts.append("m0α=/ P0α=/")
 
         if self.trend_mode == "dynamic":
-            # true state prior for β
             if hasattr(self, "m0_beta"):
                 parts.append(f"m0β={self.m0_beta:.4g} P0β={self.P0_beta:.4g}")
             else:
                 parts.append("m0β=/ P0β=/")
         elif self.trend_mode == "deterministic":
-            # your requested behavior: show slope as “m0β”
-            parts.append(f"m0β={self.slope_value:.4g} P0β=0 ({self.accept.get('slope',0)}/{self.proposals.get('slope',0)})")
-
+            parts.append(f"m0β={self.slope_value:.4g} P0β=0 ({pct('slope')})")
 
         if self.seasonal_mode != "none":
-            if hasattr(self, "m0_gamma"):
-                p0g = (self.P0_gamma if self.seasonal_mode == "dynamic" else 0.0)
-                head = self.m0_gamma if self.seasonal_mode == "dynamic" else (self.season_vec[:-1] if self.season_vec is not None else [])
-                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in (head[:6] if len(head) > 6 else head)) + (", …]" if len(head) > 6 else "]")
-                parts.append(f"m0γ={head_str} P0γ={p0g:.4g}")
+            if self.seasonal_mode == "dynamic" and hasattr(self, "m0_gamma"):
+                head = self.m0_gamma
+                head_show = head[:6] if len(head) > 6 else head
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) + (", …]" if len(head) > 6 else "]")
+                parts.append(f"m0γ={head_str} P0γ={self.P0_gamma:.4g}")
             elif self.seasonal_mode == "deterministic" and self.season_vec is not None:
                 head = self.season_vec[:-1]
-                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in (head[:6] if len(head) > 6 else head)) + (", …]" if len(head) > 6 else "]")
-                parts.append(f"m0γ={head_str} P0γ=0")
+                head_show = head[:6] if len(head) > 6 else head
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) + (", …]" if len(head) > 6 else "]")
+                parts.append(f"m0γ={head_str} P0γ=0 ({pct('season')})")
 
         return " | ".join(parts)
+
 
     # --------------------------------- MCMC --------------------------------- #
     def run(self) -> Dict[str, np.ndarray]:
@@ -1320,7 +1323,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-date", type=str, default="2000-01-01")
 
     parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
-    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="deterministic")
+    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="none")
     parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
 
     # Truth / simulator params
@@ -1388,7 +1391,7 @@ if __name__ == "__main__":
 
     # RW–MH steps (observation + deterministic params)
     parser.add_argument("--step-logsigma", type=float, default=0.2)
-    parser.add_argument("--step-xi",       type=float, default=0.2)
+    parser.add_argument("--step-xi",       type=float, default=0.02)
     parser.add_argument("--step-level",    type=float, default=0.02)
     parser.add_argument("--step-slope",    type=float, default=0.001)
     parser.add_argument("--step-season",   type=float, default=0.02)
@@ -1414,17 +1417,10 @@ if __name__ == "__main__":
                         help="Print compact progress every k iterations (default 1 = every line).")
     parser.add_argument("--out-dir", type=str, default="results/simulations/DGEV")
 
-    parser.add_argument("--plot",        action="store_true")
-    parser.add_argument("--no-plot",     dest="plot", action="store_false")
-    parser.set_defaults(plot=True)
+    parser.add_argument("--plot", default=True)
+    parser.add_argument("--print-summary", default=True)
+    parser.add_argument("--progress", default=True)
 
-    parser.add_argument("--print-summary",        action="store_true")
-    parser.add_argument("--no-print-summary",     dest="print_summary", action="store_false")
-    parser.set_defaults(print_summary=True)
-
-    parser.add_argument("--progress",        action="store_true")
-    parser.add_argument("--no-progress",     dest="progress", action="store_false")
-    parser.set_defaults(progress=True)
 
     args = parser.parse_args()
     np.random.seed(args.seed)
