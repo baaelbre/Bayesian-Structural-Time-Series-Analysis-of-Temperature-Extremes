@@ -807,6 +807,9 @@ class DGEVParticleGibbs:
             self._mh_prev_acc[key] = acc_now
             self._mh_prev_prop[key] = prop_now
         self._adapt_round += 1
+        if self.cfg.progress:
+            step_info = ", ".join([f"{key}={self._get_step(key):.4g}" for key in keys])
+            print(f"  [adapt] it={it+1}, η={eta:.4g}, steps: {step_info}")
 
     # ---------------- Conditional SMC (Bootstrap) + ESS-triggered resampling ------- #
     @staticmethod
@@ -884,8 +887,8 @@ class DGEVParticleGibbs:
         maxw_list.append(float(np.max(w[1, :])))
 
         if self.cfg.progress:
-            eta = self.cfg.ess_threshold_frac
-            print(f"  Running conditional PGAS (Bootstrap proposal, ESS-triggered; η={eta:.2f}, N={N})")
+            print(f"  Running conditional PGAS (Bootstrap proposal;\
+                ESS threshold={self.cfg.ess_threshold_frac:.2f}, N={N})")
 
         # ----- t = 2..T
         it = tqdm(range(2, T + 1)) if self.cfg.progress else range(2, T + 1)
@@ -1064,45 +1067,62 @@ class DGEVParticleGibbs:
         parts.append(f"σ={math.exp(self.logsigma):.3f} ({self.accept['logsigma']}/{self.proposals['logsigma']})")
         parts.append(f"ξ={self.xi:.3f} ({self.accept['xi']}/{self.proposals['xi']})")
 
-        def _lam(lam, present, fixed):
-            if not present:
-                return "-"
-            if fixed is not None:
-                return f"{fixed:.3g}(fix)"
-            return "-" if lam is None else f"{lam:.3g}"
-
+        # Q / λ as you already had it ...
         if self.idx_alpha is not None:
-            parts.append(f"Qα={self.s_alpha**2:.4g}")
+            parts.append(f"Qα={self.s_alpha**2:.4g}" if hasattr(self, "s_alpha") else f"Qα={self.Q[self.idx_alpha]:.4g}")
         if self.idx_beta is not None:
-            parts.append(f"Qβ={self.s_beta**2:.4g}")
+            parts.append(f"Qβ={self.s_beta**2:.4g}" if hasattr(self, "s_beta") else f"Qβ={self.Q[self.idx_beta]:.4g}")
         if self.seasonal_mode == "dynamic":
-            parts.append(f"Qγ={self.s_gamma**2:.4g}")
+            if hasattr(self, "s_gamma"):
+                parts.append(f"Qγ={self.s_gamma**2:.4g}")
+            else:
+                parts.append(f"Qγ={self.Q[self.idx_gamma_end]:.4g}")
+
+        def _lam(lam, present, fixed):
+            if not present: return "-"
+            if fixed is not None: return f"{fixed:.3g}(fix)"
+            return "-" if lam is None else f"{lam:.3g}"
 
         parts.append(
             "λ=("
-            + ",".join(
-                [
-                    _lam(self.lambda_alpha, self.idx_alpha is not None, self.priors.pc_alpha.lambda_s),
-                    _lam(self.lambda_beta, self.idx_beta is not None, self.priors.pc_beta.lambda_s),
-                    _lam(self.lambda_gamma, self.seasonal_mode == "dynamic", self.priors.pc_gamma.lambda_s),
-                ]
-            )
+            + ",".join([
+                _lam(getattr(self, "lambda_alpha", None), self.idx_alpha is not None, getattr(self.priors.pc_alpha, "lambda_s", None)),
+                _lam(getattr(self, "lambda_beta",  None), self.idx_beta  is not None, getattr(self.priors.pc_beta,  "lambda_s", None)),
+                _lam(getattr(self, "lambda_gamma", None), self.seasonal_mode == "dynamic", getattr(self.priors.pc_gamma, "lambda_s", None)),
+            ])
             + ")"
         )
 
+        # m0/P0 or slope display
         if self.level_mode != "none":
-            parts.append(
-                f"m0α={self.m0_alpha:.4g} "
-                f"P0α={(self.P0_alpha if self.level_mode=='dynamic' else 0.0):.4g}"
-            )
-        if self.trend_mode != "none":
-            parts.append(
-                f"m0β={self.m0_beta:.4g} "
-                f"P0β={(self.P0_beta if self.trend_mode=='dynamic' else 0.0):.4g}"
-            )
+            if hasattr(self, "m0_alpha"):
+                p0a = (self.P0_alpha if self.level_mode == "dynamic" else 0.0)
+                parts.append(f"m0α={self.m0_alpha:.4g} P0α={p0a:.4g}")
+            else:
+                parts.append("m0α=/ P0α=/")
+
+        if self.trend_mode == "dynamic":
+            # true state prior for β
+            if hasattr(self, "m0_beta"):
+                parts.append(f"m0β={self.m0_beta:.4g} P0β={self.P0_beta:.4g}")
+            else:
+                parts.append("m0β=/ P0β=/")
+        elif self.trend_mode == "deterministic":
+            # your requested behavior: show slope as “m0β”
+            parts.append(f"m0β={self.slope_value:.4g} P0β=0 ({self.accept.get('slope',0)}/{self.proposals.get('slope',0)})")
+
+
         if self.seasonal_mode != "none":
-            g = self._fmt_list((self.m0_gamma if self.seasonal_mode == "dynamic" else self.season_vec[:-1]), 6, ".4g")
-            parts.append(f"m0γ={g} P0γ={(self.P0_gamma if self.seasonal_mode=='dynamic' else 0.0):.4g}")
+            if hasattr(self, "m0_gamma"):
+                p0g = (self.P0_gamma if self.seasonal_mode == "dynamic" else 0.0)
+                head = self.m0_gamma if self.seasonal_mode == "dynamic" else (self.season_vec[:-1] if self.season_vec is not None else [])
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in (head[:6] if len(head) > 6 else head)) + (", …]" if len(head) > 6 else "]")
+                parts.append(f"m0γ={head_str} P0γ={p0g:.4g}")
+            elif self.seasonal_mode == "deterministic" and self.season_vec is not None:
+                head = self.season_vec[:-1]
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in (head[:6] if len(head) > 6 else head)) + (", …]" if len(head) > 6 else "]")
+                parts.append(f"m0γ={head_str} P0γ=0")
+
         return " | ".join(parts)
 
     # --------------------------------- MCMC --------------------------------- #
@@ -1261,13 +1281,16 @@ class DGEVParticleGibbs:
         print(f"[save] Metadata  -> {meta_path}")
 # ------------------------- CLI / Example run & plots ------------------------
 if __name__ == "__main__":
-    import sys, argparse, math
+    import sys, argparse, math, time, os
+    from datetime import datetime
+    import numpy as np
     import matplotlib.pyplot as plt
 
+    # make simulator importable
     sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
     from simulator.extremal_time_series import Extremal_Time_Series
 
-    # --- small helpers (mirror Kalman script style) ---
+    # --- helpers -------------------------------------------------------------
     def _parse_date(s: str | None):
         if not s:
             return datetime.today()
@@ -1283,6 +1306,7 @@ if __name__ == "__main__":
         if s == "": return None
         return [float(z) for z in s.split(",") if z.strip() != ""]
 
+    # --- CLI ----------------------------------------------------------------
     parser = argparse.ArgumentParser(
         description=(
             "DGEV PGAS Sampler (Bootstrap PF with ESS-triggered resampling) "
@@ -1290,50 +1314,66 @@ if __name__ == "__main__":
         )
     )
 
-    # --- Simulation controls ---
+    # Simulation controls
     parser.add_argument("--T", type=int, default=500)
     parser.add_argument("--period", type=int, default=12)
     parser.add_argument("--start-date", type=str, default="2000-01-01")
 
-    parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],       default="dynamic")
-    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"], default="dynamic")
-    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
+    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="deterministic")
+    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
 
     # Truth / simulator params
-    parser.add_argument("--sigma", type=float, default=2.0)
-    parser.add_argument("--xi",    type=float, default=0.1)
-    parser.add_argument("--q-level",  type=float, default=1e-1)
-    parser.add_argument("--q-trend",  type=float, default=1e-3)
-    parser.add_argument("--q-season", type=float, default=1e-5)
+    parser.add_argument("--sigma",     type=float, default=2.0)
+    parser.add_argument("--xi",        type=float, default=0.1)
+    parser.add_argument("--q-level",   type=float, default=1e-1)
+    parser.add_argument("--q-trend",   type=float, default=1e-3)
+    parser.add_argument("--q-season",  type=float, default=1e-5)
 
-    parser.add_argument("--m0-level", type=float, default=5.0)
-    parser.add_argument("--v0-level", type=float, default=0.2)
-    parser.add_argument("--m0-trend", type=float, default=0.02)
-    parser.add_argument("--v0-trend", type=float, default=0.05)
-    parser.add_argument("--m0-season", type=str, default=None, help="comma-separated (length p-1)")
-    parser.add_argument("--v0-season", type=str, default=None, help="comma-separated (length p-1)")
+    parser.add_argument("--m0-level",  type=float, default=5.0)
+    parser.add_argument("--v0-level",  type=float, default=0.2)
+    parser.add_argument("--m0-trend",  type=float, default=0.1)
+    parser.add_argument("--v0-trend",  type=float, default=0.05)
+    parser.add_argument("--m0-season", type=str,   default=None, help="comma-separated (length p-1)")
+    parser.add_argument("--v0-season", type=str,   default=None, help="comma-separated (length p-1)")
 
-    # --- Inference priors (observation + deterministic components) ---
-    parser.add_argument("--prior-m-sigma", type=float, default=1.0)
-    parser.add_argument("--prior-s-sigma", type=float, default=1.0)
-    parser.add_argument("--prior-m-xi",    type=float, default=0.0)
-    parser.add_argument("--prior-s-xi",    type=float, default=0.2)
+    # Sampler x0 prior (DECOUPLED from simulator truth)
+    parser.add_argument("--init-m0-level",  type=float, default=None,
+                        help="Sampler x0 prior mean for level (default: use --m0-level).")
+    parser.add_argument("--init-p0-level",  type=float, default=None,
+                        help="Sampler x0 prior variance for level (default: use --v0-level).")
+    parser.add_argument("--init-m0-trend",  type=float, default=None,
+                        help="Sampler x0 prior mean for trend (default: use --m0-trend).")
+    parser.add_argument("--init-p0-trend",  type=float, default=None,
+                        help="Sampler x0 prior variance for trend (default: use --v0-trend).")
+    parser.add_argument("--init-m0-season", type=str,   default=None,
+                        help="Sampler x0 prior mean for seasonal first p-1 coords (comma-separated). "
+                             "Default: use --m0-season or zeros if None.")
+    parser.add_argument("--init-p0-season", type=float, default=None,
+                        help="Sampler x0 prior VARIANCE for each seasonal coord (scalar). "
+                             "Default: mean of --v0-season or 0.5 if None.")
 
-    parser.add_argument("--prior-m-level", type=float, default=0.0)
-    parser.add_argument("--prior-s-level", type=float, default=10.0)
-    parser.add_argument("--prior-m-slope", type=float, default=0.0)
-    parser.add_argument("--prior-s-slope", type=float, default=10.0)
-    parser.add_argument("--prior-m-season", type=str, default=None, help="comma-separated (length p-1)")
+    # Inference priors (observation + deterministic components)
+    parser.add_argument("--prior-m-sigma",  type=float, default=1.0)
+    parser.add_argument("--prior-s-sigma",  type=float, default=1.0)
+    parser.add_argument("--prior-m-xi",     type=float, default=0.0)
+    parser.add_argument("--prior-s-xi",     type=float, default=0.2)
+
+    parser.add_argument("--prior-m-level",  type=float, default=0.0)
+    parser.add_argument("--prior-s-level",  type=float, default=10.0)
+    parser.add_argument("--prior-m-slope",  type=float, default=0.0)
+    parser.add_argument("--prior-s-slope",  type=float, default=10.0)
+    parser.add_argument("--prior-m-season", type=str,   default=None, help="comma-separated (length p-1)")
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
-    # --- PC priors for process sds (with optional fixed lambdas & hyperpriors) ---
-    parser.add_argument("--pc-frac-alpha",  type=float, default=0.10)
-    parser.add_argument("--pc-frac-beta",   type=float, default=0.10)
-    parser.add_argument("--pc-frac-gamma",  type=float, default=0.10)
-    parser.add_argument("--pc-alpha-prob",  type=float, default=0.05)
-    parser.add_argument("--pc-lambda-alpha", type=float, default=None)
-    parser.add_argument("--pc-lambda-beta",  type=float, default=None)
-    parser.add_argument("--pc-lambda-gamma", type=float, default=None)
+    # PC priors for process sds (with optional fixed lambdas & hyperpriors)
+    parser.add_argument("--pc-frac-alpha",    type=float, default=0.10)
+    parser.add_argument("--pc-frac-beta",     type=float, default=0.10)
+    parser.add_argument("--pc-frac-gamma",    type=float, default=0.10)
+    parser.add_argument("--pc-alpha-prob",    type=float, default=0.05)
+    parser.add_argument("--pc-lambda-alpha",  type=float, default=None)
+    parser.add_argument("--pc-lambda-beta",   type=float, default=None)
+    parser.add_argument("--pc-lambda-gamma",  type=float, default=None)
     parser.add_argument("--pc-a-lambda-alpha", type=float, default=1.0)
     parser.add_argument("--pc-b-lambda-alpha", type=float, default=1.0)
     parser.add_argument("--pc-a-lambda-beta",  type=float, default=1.0)
@@ -1341,10 +1381,10 @@ if __name__ == "__main__":
     parser.add_argument("--pc-a-lambda-gamma", type=float, default=1.0)
     parser.add_argument("--pc-b-lambda-gamma", type=float, default=1.0)
 
-    # --- Sampler config ---
+    # Sampler config
     parser.add_argument("--n-iter", type=int, default=4000)
-    parser.add_argument("--burn", type=int, default=1000)
-    parser.add_argument("--thin", type=int, default=1)
+    parser.add_argument("--burn",   type=int, default=1000)
+    parser.add_argument("--thin",   type=int, default=1)
 
     # RW–MH steps (observation + deterministic params)
     parser.add_argument("--step-logsigma", type=float, default=0.2)
@@ -1352,59 +1392,65 @@ if __name__ == "__main__":
     parser.add_argument("--step-level",    type=float, default=0.02)
     parser.add_argument("--step-slope",    type=float, default=0.001)
     parser.add_argument("--step-season",   type=float, default=0.02)
-    # log-sd steps (for PC prior coordinates)
-    parser.add_argument("--step-log-s-alpha", type=float, default=0.22)
-    parser.add_argument("--step-log-s-beta",  type=float, default=0.10)
-    parser.add_argument("--step-log-s-gamma", type=float, default=0.10)
 
     # PF / PGAS
-    parser.add_argument("--particles", type=int, default=500)
-    parser.add_argument("--trans-eps", type=float, default=1e-8)
-    parser.add_argument("--ess-frac",  type=float, default=0.5, help="Resample when ESS < ess_frac * N")
+    parser.add_argument("--particles",   type=int,   default=500)
+    parser.add_argument("--trans-eps",   type=float, default=1e-8)
+    parser.add_argument("--ess-frac",    type=float, default=0.5, help="Resample when ESS < ess_frac * N")
 
     # Adaptation
-    parser.add_argument("--adapt-steps", default=True)
-    parser.add_argument("--adapt-every", type=int, default=10)
-    parser.add_argument("--adapt-until", choices=["burn","all"], default="burn")
-    parser.add_argument("--adapt-eta0", type=float, default=0.2)
-    parser.add_argument("--adapt-decay", type=float, default=0.75)
-    parser.add_argument("--adapt-target-1d", type=float, default=0.44)
-    parser.add_argument("--step-min", type=float, default=1e-5)
-    parser.add_argument("--step-max", type=float, default=1.0)
+    parser.add_argument("--adapt-steps",        default=True, action="store_true")
+    parser.add_argument("--adapt-every",        type=int,    default=10)
+    parser.add_argument("--adapt-until",        choices=["burn","all"], default="burn")
+    parser.add_argument("--adapt-eta0",         type=float,  default=0.2)
+    parser.add_argument("--adapt-decay",        type=float,  default=0.75)
+    parser.add_argument("--adapt-target-1d",    type=float,  default=0.44)
+    parser.add_argument("--step-min",           type=float,  default=1e-5)
+    parser.add_argument("--step-max",           type=float,  default=1.0)
 
-    # --- I/O & misc ---
+    # I/O & misc
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--progress", default=True)
-    parser.add_argument("--progress-every", type=int, default=10)
+    parser.add_argument("--progress-every", type=int, default=1,  # print every iteration
+                        help="Print compact progress every k iterations (default 1 = every line).")
     parser.add_argument("--out-dir", type=str, default="results/simulations/DGEV")
-    parser.add_argument("--plot", default=True)
-    parser.add_argument("--print-summary", default=True)
+
+    parser.add_argument("--plot",        action="store_true")
+    parser.add_argument("--no-plot",     dest="plot", action="store_false")
+    parser.set_defaults(plot=True)
+
+    parser.add_argument("--print-summary",        action="store_true")
+    parser.add_argument("--no-print-summary",     dest="print_summary", action="store_false")
+    parser.set_defaults(print_summary=True)
+
+    parser.add_argument("--progress",        action="store_true")
+    parser.add_argument("--no-progress",     dest="progress", action="store_false")
+    parser.set_defaults(progress=True)
 
     args = parser.parse_args()
     np.random.seed(args.seed)
 
+    # --- simulate data ------------------------------------------------------
     start_date = _parse_date(args.start_date)
-    m0_season = _csv_floats_or_none(args.m0_season)
-    v0_season = _csv_floats_or_none(args.v0_season)
-    if m0_season is None:
-        m0_season = [0.0] * (args.period - 1)
-    if v0_season is None:
-        v0_season = [0.5] * (args.period - 1)
+    m0_season_sim = _csv_floats_or_none(args.m0_season)
+    v0_season_sim = _csv_floats_or_none(args.v0_season)
+    if m0_season_sim is None:
+        m0_season_sim = [0.0] * (args.period - 1)
+    if v0_season_sim is None:
+        v0_season_sim = [0.5] * (args.period - 1)
 
-    # --- Simulate data (Extremal TS uses last seasonal coord convention) ---
     ts = Extremal_Time_Series(
         parameters=(args.sigma, args.xi),
         level_mode=args.level_mode,
         trend_mode=args.trend_mode,
         seasonal_mode=args.seasonal_mode,
         period=args.period,
-        q_level=(args.q_level if args.level_mode  == "dynamic" else 0.0),
-        q_trend=(args.q_trend if args.trend_mode  == "dynamic" else 0.0),
+        q_level=(args.q_level  if args.level_mode  == "dynamic" else 0.0),
+        q_trend=(args.q_trend  if args.trend_mode  == "dynamic" else 0.0),
         q_season=(args.q_season if args.seasonal_mode == "dynamic" else 0.0),
         m0_level=args.m0_level, v0_level=args.v0_level,
         m0_trend=(args.m0_trend if args.trend_mode != "none" else 0.0), v0_trend=args.v0_trend,
-        m0_season=(m0_season if args.seasonal_mode != "none" else None),
-        v0_season=(v0_season if args.seasonal_mode != "none" else None),
+        m0_season=(m0_season_sim if args.seasonal_mode != "none" else None),
+        v0_season=(v0_season_sim if args.seasonal_mode != "none" else None),
         start_date=start_date,
     )
 
@@ -1417,13 +1463,12 @@ if __name__ == "__main__":
     truths = ts.get_truth_paths(as_numpy=False)
     mu_T    = np.asarray(truths["mu"][1 : 1 + args.T], float)
     alpha_T = (np.asarray(truths["alpha"][1 : 1 + args.T], float) if args.level_mode == "dynamic" else None)
-    beta_T  = (np.asarray(truths["beta"][1 : 1 + args.T], float)  if args.trend_mode == "dynamic" else None)
+    beta_T  = (np.asarray(truths["beta"][1  : 1 + args.T], float) if args.trend_mode == "dynamic" else None)
     gamma_T = (np.asarray(truths["gamma_last"][1 : 1 + args.T], float) if args.seasonal_mode == "dynamic" else None)
     dates_T = truths.get("index", np.arange(args.T))
 
-    # --- Priors & config ---
+    # --- priors & config ----------------------------------------------------
     pri_season_first = _csv_floats_or_none(args.prior_m_season)
-
     priors = Priors(
         m_sigma=float(args.prior_m_sigma), s_sigma=float(args.prior_s_sigma),
         m_xi=float(args.prior_m_xi),       s_xi=float(args.prior_s_xi),
@@ -1453,7 +1498,7 @@ if __name__ == "__main__":
         burn=int(args.burn),
         thin=int(args.thin),
 
-        # RW–MH steps (observation + deterministic params)
+        # RW–MH steps (obs + deterministic)
         step_logsigma=float(args.step_logsigma),
         step_xi=float(args.step_xi),
         step_level=float(args.step_level),
@@ -1479,20 +1524,33 @@ if __name__ == "__main__":
         step_max=float(args.step_max),
     )
 
-
-    # Deterministic-seasonal initializer (first p-1 entries; last implied)
+    # deterministic-seasonal initializer (first p-1; last implied)
     seasonal_init_pminus1 = (
         np.asarray(pri_season_first, float) if (args.seasonal_mode == "deterministic" and pri_season_first is not None)
         else (build_seasonal(args.period) if args.seasonal_mode == "deterministic" else None)
     )
-    
-    # --- Build and run sampler ---
-    # collapse v0_season vector (if provided) to a single scalar P0 for all seasonal coords
-    if isinstance(v0_season, (list, tuple, np.ndarray)):
-        P0_season_scalar = float(np.mean(v0_season))
-    else:
-        P0_season_scalar = float(v0_season if v0_season is not None else 0.5)
 
+    # --- sampler x0 prior (init), decoupled from simulator truth ------------
+    init_m0_level = args.init_m0_level if args.init_m0_level is not None else args.m0_level
+    init_p0_level = args.init_p0_level if args.init_p0_level is not None else args.v0_level
+
+    init_m0_trend = (args.init_m0_trend if args.init_m0_trend is not None
+                     else (args.m0_trend if args.trend_mode != "none" else 0.0))
+    init_p0_trend = args.init_p0_trend if args.init_p0_trend is not None else args.v0_trend
+
+    init_m0_season = _csv_floats_or_none(args.init_m0_season)
+    if init_m0_season is None:
+        init_m0_season = (m0_season_sim if args.seasonal_mode == "dynamic" else None)
+
+    if args.init_p0_season is not None:
+        init_p0_season_scalar = float(args.init_p0_season)
+    else:
+        if isinstance(v0_season_sim, (list, tuple, np.ndarray)) and len(v0_season_sim) > 0:
+            init_p0_season_scalar = float(np.mean(v0_season_sim))
+        else:
+            init_p0_season_scalar = 0.5
+
+    # --- build sampler ------------------------------------------------------
     sampler = DGEVParticleGibbs(
         y=y,
         period=int(args.period),
@@ -1500,13 +1558,13 @@ if __name__ == "__main__":
         trend_mode=args.trend_mode,
         seasonal_mode=args.seasonal_mode,
 
-        # x0 prior means/variances for dynamic components
-        m0_level_init=float(args.m0_level),
-        P0_level_init=float(args.v0_level),
-        m0_trend_init=(float(args.m0_trend) if args.trend_mode != "none" else 0.0),
-        P0_trend_init=float(args.v0_trend),
-        m0_season_init=(m0_season if args.seasonal_mode == "dynamic" else None),
-        P0_season_init=(P0_season_scalar if args.seasonal_mode == "dynamic" else 0.0),
+        # x0 prior for the sampler (independent of simulator truth)
+        m0_level_init=float(init_m0_level),
+        P0_level_init=float(init_p0_level),
+        m0_trend_init=float(init_m0_trend),
+        P0_trend_init=float(init_p0_trend),
+        m0_season_init=(init_m0_season if args.seasonal_mode == "dynamic" else None),
+        P0_season_init=(init_p0_season_scalar if args.seasonal_mode == "dynamic" else 0.0),
 
         # priors & config
         priors=priors,
@@ -1516,20 +1574,19 @@ if __name__ == "__main__":
         seasonal_vector_init=seasonal_init_pminus1,
     )
 
-
-    # (optional) attach truths for saving/diagnostics
+    # truths for diagnostics/saving
     true_Q = []
-    if args.level_mode == "dynamic":   true_Q.append(args.q_level)
-    if args.trend_mode == "dynamic":   true_Q.append(args.q_trend)
+    if args.level_mode   == "dynamic": true_Q.append(args.q_level)
+    if args.trend_mode   == "dynamic": true_Q.append(args.q_trend)
     if args.seasonal_mode == "dynamic": true_Q += [args.q_season] + [0.0] * (args.period - 2)
-
     sampler.set_truth(sigma=args.sigma, xi=args.xi,
                       Q=(np.asarray(true_Q, float) if len(true_Q) else None))
     sampler.set_truth_paths(mu=mu_T, alpha=alpha_T, beta=beta_T, gamma=gamma_T)
 
+    # --- summaries (show sim truth vs sampler init) -------------------------
     if args.print_summary:
         with np.printoptions(suppress=True, precision=4):
-            print("\n--- Summary (simulation) ---")
+            print("\n--- Summary (simulation truth) ---")
             print(f"level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode}")
             print(f"sigma={args.sigma}, xi={args.xi}, "
                   f"q_level={args.q_level if args.level_mode=='dynamic' else 0.0}, "
@@ -1540,18 +1597,24 @@ if __name__ == "__main__":
             if args.seasonal_mode == "none":
                 print(f"m0_season={[0.0]*(args.period-1)} (none), v0_season=0.0 (none)")
             else:
-                m0_season_str = np.array2string(np.array(m0_season), precision=2, suppress_small=True)
-                v0_season_str = (np.array2string(np.array(v0_season), precision=2, suppress_small=True)
-                                 if args.seasonal_mode == "dynamic" else "0.0")
-                print(f"m0_season={m0_season_str}, v0_season={v0_season_str}")
+                print(f"m0_season(sim)={np.array(m0_season_sim)}")
+                print(f"v0_season(sim)={np.array(v0_season_sim)}")
+            print("\n--- Sampler x0 prior (init) ---")
+            print(f"m0_level_init={init_m0_level}, P0_level_init={init_p0_level}")
+            print(f"m0_trend_init={init_m0_trend}, P0_trend_init={init_p0_trend}")
+            if args.seasonal_mode == "dynamic":
+                print(f"m0_season_init={np.array(init_m0_season)}")
+                print(f"P0_season_init={init_p0_season_scalar}")
             print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
             print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
 
+    # --- run sampler --------------------------------------------------------
     t0 = time.time()
     post = sampler.run()
     elapsed = time.time() - t0
     print(f"Run time: {elapsed:.2f}s")
 
+    # --- save ---------------------------------------------------------------
     out_dir = os.path.join(
         args.out_dir,
         f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -1562,34 +1625,33 @@ if __name__ == "__main__":
         extra_meta={"elapsed_seconds": float(elapsed)}
     )
 
-    # ---- Print quick summaries ----
+    # --- posterior summaries ------------------------------------------------
     if args.print_summary:
         with np.printoptions(suppress=True, precision=4):
             print("\n--- Summary (posterior means) ---")
             print(f"σ: {np.mean(post['sigma']):.4g}")
             print(f"ξ: {np.mean(post['xi']):.4g}")
-            if "Q" in post and sampler.dim > 0 and post["Q"].size > 0:
-                # align with DLM-style labels
-                if sampler.idx_alpha is not None:
-                    m = float(np.mean(post["Q"][:, sampler.idx_alpha]))
-                    print(f"Q_alpha: {m:.4g}  (√Q_alpha ≈ {math.sqrt(m):.4g})")
-                else:
-                    print("Q_alpha: n/a (level deterministic)")
-                if sampler.idx_beta is not None:
-                    m = float(np.mean(post["Q"][:, sampler.idx_beta]))
-                    print(f"Q_beta:  {m:.4g}  (√Q_beta  ≈ {math.sqrt(m):.4g})")
-                else:
-                    print("Q_beta: n/a (trend deterministic/none)")
-                if args.seasonal_mode == "dynamic":
-                    m = float(np.mean(post["Q"][:, sampler.idx_gamma_end]))
-                    print(f"Q_gamma: {m:.4g}  (√Q_gamma ≈ {math.sqrt(m):.4g})")
-                else:
-                    print("Q_gamma: n/a (season deterministic/none)")
+            # Q slots match current keep-keys (Q_alpha/beta/gamma)
+            if sampler.idx_alpha is not None and "Q_alpha" in post:
+                m = float(np.mean(post["Q_alpha"]))
+                print(f"Q_alpha: {m:.4g}  (√Q_alpha ≈ {math.sqrt(max(m,0.0)):.4g})")
+            else:
+                print("Q_alpha: n/a (level deterministic)")
+            if sampler.idx_beta is not None and "Q_beta" in post:
+                m = float(np.mean(post["Q_beta"]))
+                print(f"Q_beta:  {m:.4g}  (√Q_beta  ≈ {math.sqrt(max(m,0.0)):.4g})")
+            else:
+                print("Q_beta: n/a (trend deterministic/none)")
+            if args.seasonal_mode == "dynamic" and "Q_gamma" in post:
+                m = float(np.mean(post["Q_gamma"]))
+                print(f"Q_gamma: {m:.4g}  (√Q_gamma ≈ {math.sqrt(max(m,0.0)):.4g})")
+            else:
+                print("Q_gamma: n/a (season deterministic/none)")
             if "log_evidence" in post and post["log_evidence"].size > 0:
                 le = post["log_evidence"]
                 print(f"log p(y|θ): mean={np.nanmean(le):.3f}, median={np.nanmedian(le):.3f}, best={np.nanmax(le):.3f}")
 
-    # ---- Plot (like Kalman script) ----
+    # --- plot ---------------------------------------------------------------
     if args.plot:
         mu_hat = post["mu"].mean(axis=0)
         plt.figure(figsize=(10, 4))
@@ -1602,3 +1664,4 @@ if __name__ == "__main__":
         plt.legend()
         plt.tight_layout()
         plt.show()
+
