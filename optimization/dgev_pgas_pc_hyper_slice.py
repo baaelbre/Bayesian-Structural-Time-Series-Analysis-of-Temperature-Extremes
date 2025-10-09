@@ -935,8 +935,8 @@ class DGEVParticleGibbs:
 
             # choose ancestors (multinomial if resampling; identity otherwise)
             if do_resample:
-                if self.cfg.progress:
-                    print(f"    t={t}: ESS_prev={ess_prev:6.1f} < {thresh:6.1f} -> resampling", file=sys.stderr)
+                #if self.cfg.progress:
+                #    print(f"    t={t}: ESS_prev={ess_prev:6.1f} < {thresh:6.1f} -> resampling", file=sys.stderr)
                 resample_count += 1
                 anc = np.random.choice(N, size=N - 1, p=res_p, replace=True)
             else:
@@ -1253,12 +1253,12 @@ if __name__ == "__main__":
 
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
-    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
 
     # Basics
     parser.add_argument("--period", type=int, default=4)
-    parser.add_argument("--T", type=int, default=100)
+    parser.add_argument("--T", type=int, default=500)
 
     # Initial values (shared)
     parser.add_argument("--level-init", type=float, default=5.0)
@@ -1297,8 +1297,8 @@ if __name__ == "__main__":
     parser.add_argument("--pc-lambda-gamma", type=float, default=None)
 
     # Sampler config
-    parser.add_argument("--n-iter", type=int, default=4000)
-    parser.add_argument("--burn", type=int, default=1000)
+    parser.add_argument("--n-iter", type=int, default=5000)
+    parser.add_argument("--burn", type=int, default=2000)
     parser.add_argument("--thin", type=int, default=1)
     parser.add_argument("--step-logsigma", type=float, default=0.2)
     parser.add_argument("--step-xi", type=float, default=0.2)
@@ -1309,7 +1309,7 @@ if __name__ == "__main__":
     parser.add_argument("--step-log-s-beta",  type=float, default=0.10)
     parser.add_argument("--step-log-s-gamma", type=float, default=0.10)
 
-    parser.add_argument("--particles", type=int, default=250)
+    parser.add_argument("--particles", type=int, default=500)
     parser.add_argument("--trans-eps", type=float, default=1e-8)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--progress", default=True)
@@ -1322,8 +1322,8 @@ if __name__ == "__main__":
 
     # Adaptive RW–MH CLI
     parser.add_argument("--adapt-steps", default=True)
-    parser.add_argument("--adapt-every", type=int, default=25)
-    parser.add_argument("--adapt-until", choices=["burn","all"], default="all")
+    parser.add_argument("--adapt-every", type=int, default=10)
+    parser.add_argument("--adapt-until", choices=["burn","all"], default="burn")
     parser.add_argument("--adapt-eta0", type=float, default=0.2)
     parser.add_argument("--adapt-decay", type=float, default=0.75)
     parser.add_argument("--adapt-target-1d", type=float, default=0.44)
