@@ -1,0 +1,106 @@
+{
+  "T": 100,
+  "dim": 0,
+  "period": 4,
+  "modes": {
+    "level_mode": "deterministic",
+    "trend_mode": "none",
+    "seasonal_mode": "deterministic"
+  },
+  "layout": [],
+  "cfg": {
+    "n_iter": 4000,
+    "burn": 1000,
+    "thin": 1,
+    "random_seed": 7,
+    "progress": true,
+    "progress_every": 1,
+    "n_particles": 500,
+    "trans_eps": 1e-08,
+    "ess_threshold_frac": 0.5,
+    "step_logsigma": 0.18549073472349398,
+    "step_xi": 0.08794598668508528,
+    "step_level": 0.16915774051509616,
+    "step_slope": 0.001,
+    "step_season": 0.18709780859971809,
+    "adapt_steps": true,
+    "adapt_every": 1,
+    "adapt_until": "all",
+    "adapt_target_1d": 0.44,
+    "adapt_eta0": 0.2,
+    "adapt_eta_decay": 0.75,
+    "step_min": 1e-05,
+    "step_max": 1.0,
+    "slice_w": 0.4,
+    "slice_m": 40,
+    "slice_max_shrink": 1000
+  },
+  "priors": {
+    "m_sigma": 1.0,
+    "s_sigma": 1.0,
+    "m_xi": 0.0,
+    "s_xi": 0.2,
+    "m_m0_alpha": 0.0,
+    "s_m0_alpha": 10.0,
+    "m_m0_beta": 0.0,
+    "s_m0_beta": 10.0,
+    "m_m0_gamma": null,
+    "s_m0_gamma": 5.0,
+    "a_P0_alpha": 2.0,
+    "b_P0_alpha": 1.0,
+    "a_P0_beta": 2.0,
+    "b_P0_beta": 1.0,
+    "a_P0_gamma": 2.0,
+    "b_P0_gamma": 1.0,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0,
+    "pc_alpha": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    },
+    "pc_beta": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    },
+    "pc_gamma": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    }
+  },
+  "pc_lambdas": {
+    "alpha": null,
+    "beta": null,
+    "gamma": null
+  },
+  "true_sigma": 2.0,
+  "true_xi": 0.1,
+  "true_Q": null,
+  "accept": {
+    "logsigma": 1676,
+    "xi": 2779,
+    "level": 3240,
+    "slope": 0,
+    "season": 2748
+  },
+  "proposals": {
+    "logsigma": 4000,
+    "xi": 4000,
+    "level": 4000,
+    "slope": 0,
+    "season": 4000
+  },
+  "elapsed_seconds": 34.971638202667236
+}
