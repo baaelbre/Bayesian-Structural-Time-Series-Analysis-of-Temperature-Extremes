@@ -1434,12 +1434,11 @@ if __name__ == "__main__":
 
     # --- simulate data ------------------------------------------------------
     start_date = _parse_date(args.start_date)
-    m0_season_sim = _csv_floats_or_none(args.m0_season)
-    v0_season_sim = _csv_floats_or_none(args.v0_season)
-    if m0_season_sim is None:
-        m0_season_sim = [0.0] * (args.period - 1)
-    if v0_season_sim is None:
-        v0_season_sim = [0.5] * (args.period - 1)
+    args.v0_season = _csv_floats_or_none(args.v0_season)
+    if args.m0_season is None:
+        args.m0_season = [5] * (args.period - 1) # 5, 5, 5, -15 for p=4
+    if args.v0_season is None:
+        args.v0_season = [0.5] * (args.period - 1)
 
     ts = Extremal_Time_Series(
         parameters=(args.sigma, args.xi),
@@ -1452,8 +1451,8 @@ if __name__ == "__main__":
         q_season=(args.q_season if args.seasonal_mode == "dynamic" else 0.0),
         m0_level=args.m0_level, v0_level=args.v0_level,
         m0_trend=(args.m0_trend if args.trend_mode != "none" else 0.0), v0_trend=args.v0_trend,
-        m0_season=(m0_season_sim if args.seasonal_mode != "none" else None),
-        v0_season=(v0_season_sim if args.seasonal_mode != "none" else None),
+        m0_season=(args.m0_season if args.seasonal_mode != "none" else None),
+        v0_season=(args.v0_season if args.seasonal_mode != "none" else None),
         start_date=start_date,
     )
 
@@ -1552,13 +1551,13 @@ if __name__ == "__main__":
 
     init_m0_season = _csv_floats_or_none(args.init_m0_season)
     if init_m0_season is None:
-        init_m0_season = (m0_season_sim if args.seasonal_mode == "dynamic" else None)
+        init_m0_season = (args.m0_season if args.seasonal_mode == "dynamic" else None)
 
     if args.init_p0_season is not None:
         init_p0_season_scalar = float(args.init_p0_season)
     else:
-        if isinstance(v0_season_sim, (list, tuple, np.ndarray)) and len(v0_season_sim) > 0:
-            init_p0_season_scalar = float(np.mean(v0_season_sim))
+        if isinstance(args.v0_season, (list, tuple, np.ndarray)) and len(args.v0_season) > 0:
+            init_p0_season_scalar = float(np.mean(args.v0_season))
         else:
             init_p0_season_scalar = 0.5
     
@@ -1616,8 +1615,8 @@ if __name__ == "__main__":
             if args.seasonal_mode == "none":
                 print(f"m0_season={[0.0]*(args.period-1)} (none), v0_season=0.0 (none)")
             else:
-                print(f"m0_season(sim)={np.array(m0_season_sim)}")
-                print(f"v0_season(sim)={np.array(v0_season_sim)}")
+                print(f"m0_season(sim)={np.array(args.m0_season)}")
+                print(f"v0_season(sim)={np.array(args.v0_season)}")
             print("\n--- Sampler x0 prior (init) ---")
             print(f"m0_level_init={init_m0_level}, P0_level_init={init_p0_level}")
             print(f"m0_trend_init={init_m0_trend}, P0_trend_init={init_p0_trend}")
