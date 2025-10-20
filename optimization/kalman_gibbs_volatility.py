@@ -980,7 +980,7 @@ class DLMUnifiedSampler:
                                      priors=priors, cfg=cfg, **kwargs)
         else:
             # Homoskedastic: rely on your existing sampler (expects sigma2_init and updates σ²)
-            from dlm_gibbs_conjugate import DLMGibbsConjugate  # <-- import your previous class/module
+            from kalman_gibbs_pc_hyper_slice_v4 import DLMGibbsConjugate  # <-- import your previous class/module
             self.engine = DLMGibbsConjugate(y=y, period=period,
                                             level_mode=level_mode, trend_mode=trend_mode, seasonal_mode=seasonal_mode,
                                             priors=priors, cfg=cfg, **kwargs)
@@ -1015,3 +1015,440 @@ class DLMUnifiedSampler:
         extra = extra_meta or {}
         extra.update({"heteroskedastic": bool(self.hetero), "sigma_modes": self.hetero_modes})
         self.engine.save_posterior(out_npz_path, extra_meta=extra)
+
+# ------------------------- CLI / Example run ------------------------------- #
+if __name__ == "__main__":
+    import argparse, os, time, math, sys
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+    from datetime import datetime
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(base_dir)
+
+    # simulator that supports parallel mean/log-sigma blocks (newest-first convention)
+    from simulator.mean_time_series_volatility import Mean_Time_Series
+
+    def _parse_date(s: str | None):
+        if not s:
+            return datetime.today()
+        parts = [int(p) for p in s.split("-")]
+        if   len(parts) == 1: return datetime(parts[0], 1, 1)
+        elif len(parts) == 2: return datetime(parts[0], parts[1], 1)
+        elif len(parts) == 3: return datetime(parts[0], parts[1], parts[2])
+        raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+    def _csv_floats_or_none(s: str | None):
+        if s is None: return None
+        s = s.strip()
+        if s == "": return None
+        return [float(z) for z in s.split(",") if z.strip() != ""]
+
+    p = argparse.ArgumentParser(
+        description=(
+            "Unified DLM sampler: "
+            "• Homoskedastic → Kalman FFBS + Gibbs (conjugate/PC) "
+            "• Heteroskedastic → RBPF (η=ln σ) with embedded Kalman and PC hyperpriors.\n"
+            "Seasonal state uses newest-first; observation loads the first seasonal coord."
+        )
+    )
+
+    # --- Simulation controls ---
+    p.add_argument("--T", type=int, default=500)
+    p.add_argument("--period", type=int, default=12)
+    p.add_argument("--start-date", type=str, default="2000-01-01")
+
+    # μ-block modes
+    p.add_argument("--level-mode",   choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode",choices=["dynamic", "deterministic", "none"], default="dynamic")
+
+    # η-block (log σ) modes — if any is "dynamic" we switch to RBPF
+    p.add_argument("--level-mode-sigma",   choices=["dynamic","deterministic","none"], default="deterministic")
+    p.add_argument("--trend-mode-sigma",   choices=["dynamic","deterministic","none"], default="none")
+    p.add_argument("--seasonal-mode-sigma",choices=["dynamic","deterministic","none"], default="none")
+
+    # Simulation scales (for generator)
+    p.add_argument("--sigma", type=float, default=2.0)  # base scale used only if η-block is deterministic zeros
+    # μ innovations (simulator)
+    p.add_argument("--q-level",  type=float, default=0.05)
+    p.add_argument("--q-trend",  type=float, default=0.002)
+    p.add_argument("--q-season", type=float, default=0.15)
+    # η innovations (simulator) — only used if η modes set to dynamic
+    p.add_argument("--q-level-sigma",  type=float, default=0.00)
+    p.add_argument("--q-trend-sigma",  type=float, default=0.00)
+    p.add_argument("--q-season-sigma", type=float, default=0.00)
+
+    # μ priors / fixed (simulator)
+    p.add_argument("--m0-level",  type=float, default=3.0)
+    p.add_argument("--v0-level",  type=float, default=0.25)
+    p.add_argument("--m0-trend",  type=float, default=0.015)
+    p.add_argument("--v0-trend",  type=float, default=0.05)
+    p.add_argument("--m0-season", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--v0-season", type=str, default=None, help="comma-separated (length p-1)")
+
+    # η priors / fixed (simulator; for ln σ)
+    p.add_argument("--m0-level-sigma",  type=float, default=0.0)
+    p.add_argument("--v0-level-sigma",  type=float, default=0.0)
+    p.add_argument("--m0-trend-sigma",  type=float, default=0.00)
+    p.add_argument("--v0-trend-sigma",  type=float, default=0.50)
+    p.add_argument("--m0-season-sigma", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--v0-season-sigma", type=str, default=None, help="comma-separated (length p-1)")
+
+    # --- Inference priors (Gibbs/PC, mean block) ---
+    p.add_argument("--prior-a-sigma", type=float, default=2.0)  # used when homoskedastic
+    p.add_argument("--prior-b-sigma", type=float, default=1.0)
+
+    p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
+    p.add_argument("--prior-m-m0-beta",  type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta",  type=float, default=10.0)
+    p.add_argument("--prior-m-m0-gamma", type=str,   default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--prior-s-m0-gamma", type=float, default=5.0)
+
+    p.add_argument("--prior-a-P0-alpha", type=float, default=2.0)
+    p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-beta",  type=float, default=2.0)
+    p.add_argument("--prior-b-P0-beta",  type=float, default=1.0)
+    p.add_argument("--prior-a-P0-gamma", type=float, default=2.0)
+    p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
+
+    # --- Inference priors (Gibbs/PC, sigma block for RBPF) ---
+    p.add_argument("--prior-m-m0-alpha-sig", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-alpha-sig", type=float, default=5.0)
+    p.add_argument("--prior-m-m0-beta-sig",  type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta-sig",  type=float, default=5.0)
+    p.add_argument("--prior-m-m0-gamma-sig", type=str,   default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--prior-s-m0-gamma-sig", type=float, default=3.0)
+
+    p.add_argument("--prior-a-P0-alpha-sig", type=float, default=2.0)
+    p.add_argument("--prior-b-P0-alpha-sig", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-beta-sig",  type=float, default=2.0)
+    p.add_argument("--prior-b-P0-beta-sig",  type=float, default=1.0)
+    p.add_argument("--prior-a-P0-gamma-sig", type=float, default=2.0)
+    p.add_argument("--prior-b-P0-gamma-sig", type=float, default=1.0)
+
+    # --- PC priors for process sds (mean block) ---
+    p.add_argument("--pc-frac-alpha",  type=float, default=0.10)
+    p.add_argument("--pc-frac-beta",   type=float, default=0.10)
+    p.add_argument("--pc-frac-gamma",  type=float, default=0.10)
+    p.add_argument("--pc-alpha-prob",  type=float, default=0.05)
+    p.add_argument("--pc-lambda-alpha", type=float, default=None)
+    p.add_argument("--pc-lambda-beta",  type=float, default=None)
+    p.add_argument("--pc-lambda-gamma", type=float, default=None)
+    p.add_argument("--pc-a-lambda-alpha", type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-alpha", type=float, default=1.0)
+    p.add_argument("--pc-a-lambda-beta",  type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-beta",  type=float, default=1.0)
+    p.add_argument("--pc-a-lambda-gamma", type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-gamma", type=float, default=1.0)
+
+    # --- PC priors for process sds (sigma block) ---
+    p.add_argument("--pc-frac-alpha-sig",  type=float, default=0.10)
+    p.add_argument("--pc-frac-beta-sig",   type=float, default=0.10)
+    p.add_argument("--pc-frac-gamma-sig",  type=float, default=0.10)
+    p.add_argument("--pc-lambda-alpha-sig", type=float, default=None)
+    p.add_argument("--pc-lambda-beta-sig",  type=float, default=None)
+    p.add_argument("--pc-lambda-gamma-sig", type=float, default=None)
+    p.add_argument("--pc-a-lambda-alpha-sig", type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-alpha-sig", type=float, default=1.0)
+    p.add_argument("--pc-a-lambda-beta-sig",  type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-beta-sig",  type=float, default=1.0)
+    p.add_argument("--pc-a-lambda-gamma-sig", type=float, default=1.0)
+    p.add_argument("--pc-b-lambda-gamma-sig", type=float, default=1.0)
+
+    # --- Sampler config & slice ---
+    p.add_argument("--n-iter", type=int, default=4000)
+    p.add_argument("--burn", type=int, default=1000)
+    p.add_argument("--thin", type=int, default=1)
+    p.add_argument("--seed", type=int, default=40)
+    p.add_argument("--progress", default=True)
+    p.add_argument("--progress-every", type=int, default=0)
+    p.add_argument("--slice-w", type=float, default=0.4)
+    p.add_argument("--slice-m", type=int, default=40)
+    p.add_argument("--slice-max-shrink", type=int, default=1000)
+
+    # RBPF config
+    p.add_argument("--n-particles", type=int, default=128)
+    p.add_argument("--ess-resample", type=float, default=0.5)
+    p.add_argument("--resample-method", choices=["systematic","multinomial"], default="systematic")
+
+    # --- Initial values for inference (μ) ---
+    p.add_argument("--sigma-init", type=float, default=2.0)  # used only if homoskedastic (sd)
+    p.add_argument("--s-alpha-init", type=float, default=1e-2)
+    p.add_argument("--s-beta-init",  type=float, default=1e-3)
+    p.add_argument("--s-gamma-init", type=float, default=1.0)
+    p.add_argument("--m0-gamma-init", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--P0-alpha-init", type=float, default=0.25)
+    p.add_argument("--P0-beta-init",  type=float, default=0.05)
+    p.add_argument("--P0-gamma-init", type=float, default=0.25)
+
+    # --- Initial values for inference (η) ---
+    p.add_argument("--s-alpha-sig-init", type=float, default=0.05)
+    p.add_argument("--s-beta-sig-init",  type=float, default=0.01)
+    p.add_argument("--s-gamma-sig-init", type=float, default=0.10)
+    p.add_argument("--m0-gamma-sig-init", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--P0-alpha-sig-init", type=float, default=0.25)
+    p.add_argument("--P0-beta-sig-init",  type=float, default=0.05)
+    p.add_argument("--P0-gamma-sig-init", type=float, default=0.25)
+    p.add_argument("--m0-level-sig-init", type=float, default=0.0)  # η level prior mean
+
+    # --- I/O & plotting ---
+    p.add_argument("--out-dir", type=str, default="results/simulations/DLM")
+    p.add_argument("--plot", default=True)
+    p.add_argument("--print-summary", default=True)
+
+    args = p.parse_args()
+    np.random.seed(args.seed)
+
+    start_date = _parse_date(args.start_date)
+
+    # seasonal priors for simulator
+    m0_season = _csv_floats_or_none(args.m0_season) or [0.0]*(args.period-1)
+    v0_season = _csv_floats_or_none(args.v0_season) or [0.25]*(args.period-1)
+    m0_season_sig = _csv_floats_or_none(args.m0_season_sigma) or [0.0]*(args.period-1)
+    v0_season_sig = _csv_floats_or_none(args.v0_season_sigma) or (
+        [0.0]*(args.period-1) if args.seasonal_mode_sigma=="deterministic" else [0.5]*(args.period-1)
+    )
+
+    # --- Simulate data ---
+    # When μ-level is "none", simulator expects deterministic 0 level; keep mean block consistent
+    sim_level_mode_mu = args.level_mode if args.level_mode != "none" else "deterministic"
+    mts = Mean_Time_Series(
+        # μ block
+        level_mode=sim_level_mode_mu,
+        trend_mode=args.trend_mode,
+        seasonal_mode=args.seasonal_mode,
+        # η block
+        level_mode_sigma=args.level_mode_sigma,
+        trend_mode_sigma=args.trend_mode_sigma,
+        seasonal_mode_sigma=args.seasonal_mode_sigma,
+        # period
+        period=args.period,
+        # μ innovations
+        q_level=(args.q_level if sim_level_mode_mu == "dynamic" else 0.0),
+        q_trend=(args.q_trend if args.trend_mode == "dynamic" else 0.0),
+        q_season=(args.q_season if args.seasonal_mode == "dynamic" else 0.0),
+        # η innovations
+        q_level_sigma=(args.q_level_sigma if args.level_mode_sigma == "dynamic" else 0.0),
+        q_trend_sigma=(args.q_trend_sigma if args.trend_mode_sigma == "dynamic" else 0.0),
+        q_season_sigma=(args.q_season_sigma if args.seasonal_mode_sigma == "dynamic" else 0.0),
+        # μ priors/fixed
+        m0_level=(0.0 if args.level_mode == "none" else args.m0_level),
+        v0_level=(args.v0_level if sim_level_mode_mu == "dynamic" else 0.0),
+        m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend),
+        v0_trend=(args.v0_trend if args.trend_mode == "dynamic" else 0.0),
+        m0_season=m0_season, v0_season=v0_season,
+        # η priors/fixed
+        m0_level_sigma=args.m0_level_sigma,
+        v0_level_sigma=args.v0_level_sigma,
+        m0_trend_sigma=(0.0 if args.trend_mode_sigma == "none" else args.m0_trend_sigma),
+        v0_trend_sigma=args.v0_trend_sigma,
+        m0_season_sigma=m0_season_sig, v0_season_sigma=v0_season_sig,
+        # time
+        start_date=start_date,
+    )
+
+    y = []
+    for _ in range(args.T):
+        mts.move()
+        y.append(mts.measure())
+    y = np.asarray(y, float)
+
+    truths = mts.get_truth_paths(as_numpy=True)
+    dates_T   = truths["index"][: args.T]
+    mu_T      = truths["mu_t"][1 : 1 + args.T]
+    sigma_T   = truths["sigma_t"][1 : 1 + args.T]
+
+    # --- Initial seasonal means for μ (newest-first, length p-1) ---
+    if args.m0_gamma_init is not None:
+        m0_gamma_init = [float(z) for z in args.m0_gamma_init.split(",") if z.strip() != ""]
+    else:
+        # crude: de-meaned median-of-season; take first p-1 entries (newest-first)
+        S = np.array([np.median(y[k::args.period]) for k in range(args.period)], float)
+        base = S - S.mean()
+        m0_gamma_init = base[: args.period - 1].tolist()
+
+    # --- Initial seasonal means for η (if used) ---
+    if args.m0_gamma_sig_init is not None:
+        m0_gamma_sig_init = [float(z) for z in args.m0_gamma_sig_init.split(",") if z.strip() != ""]
+    else:
+        m0_gamma_sig_init = [0.0] * (args.period - 1)
+
+    # --- Priors and config ---
+    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
+    pri_gamma_sig_vec = _csv_floats_or_none(args.prior_m_m0_gamma_sig)
+
+    priors = Priors(
+        # obs variance (homoskedastic path)
+        a_sigma=float(args.prior_a_sigma),
+        b_sigma=float(args.prior_b_sigma),
+        # μ
+        m_m0_alpha=float(args.prior_m_m0_alpha), s_m0_alpha=float(args.prior_s_m0_alpha),
+        m_m0_beta=float(args.prior_m_m0_beta),   s_m0_beta=float(args.prior_s_m0_beta),
+        m_m0_gamma=None if pri_gamma_vec is None else pri_gamma_vec, s_m0_gamma=float(args.prior_s_m0_gamma),
+        a_P0_alpha=float(args.prior_a_P0_alpha), b_P0_alpha=float(args.prior_b_P0_alpha),
+        a_P0_beta=float(args.prior_a_P0_beta),   b_P0_beta=float(args.prior_b_P0_beta),
+        a_P0_gamma=float(args.prior_a_P0_gamma), b_P0_gamma=float(args.prior_b_P0_gamma),
+        pc_alpha=PCPrior(lambda_s=(None if args.pc_lambda_alpha is None else float(args.pc_lambda_alpha)),
+                         a_lambda=float(args.pc_a_lambda_alpha), b_lambda=float(args.pc_b_lambda_alpha),
+                         frac=float(args.pc_frac_alpha), alpha_prob=float(args.pc_alpha_prob)),
+        pc_beta=PCPrior(lambda_s=(None if args.pc_lambda_beta is None else float(args.pc_lambda_beta)),
+                        a_lambda=float(args.pc_a_lambda_beta),  b_lambda=float(args.pc_b_lambda_beta),
+                        frac=float(args.pc_frac_beta),  alpha_prob=float(args.pc_alpha_prob)),
+        pc_gamma=PCPrior(lambda_s=(None if args.pc_lambda_gamma is None else float(args.pc_lambda_gamma)),
+                         a_lambda=float(args.pc_a_lambda_gamma), b_lambda=float(args.pc_b_lambda_gamma),
+                         frac=float(args.pc_frac_gamma), alpha_prob=float(args.pc_alpha_prob)),
+        # η (used by RBPF)
+        m_m0_alpha_sig=float(args.prior_m_m0_alpha_sig), s_m0_alpha_sig=float(args.prior_s_m0_alpha_sig),
+        m_m0_beta_sig=float(args.prior_m_m0_beta_sig),   s_m0_beta_sig=float(args.prior_s_m0_beta_sig),
+        m_m0_gamma_sig=None if pri_gamma_sig_vec is None else pri_gamma_sig_vec,
+        s_m0_gamma_sig=float(args.prior_s_m0_gamma_sig),
+        a_P0_alpha_sig=float(args.prior_a_P0_alpha_sig), b_P0_alpha_sig=float(args.prior_b_P0_alpha_sig),
+        a_P0_beta_sig=float(args.prior_a_P0_beta_sig),   b_P0_beta_sig=float(args.prior_b_P0_beta_sig),
+        a_P0_gamma_sig=float(args.prior_a_P0_gamma_sig), b_P0_gamma_sig=float(args.prior_b_P0_gamma_sig),
+        pc_alpha_sig=PCPrior(lambda_s=(None if args.pc_lambda_alpha_sig is None else float(args.pc_lambda_alpha_sig)),
+                             a_lambda=float(args.pc_a_lambda_alpha_sig), b_lambda=float(args.pc_b_lambda_alpha_sig),
+                             frac=float(args.pc_frac_alpha_sig), alpha_prob=float(args.pc_alpha_prob)),
+        pc_beta_sig=PCPrior(lambda_s=(None if args.pc_lambda_beta_sig is None else float(args.pc_lambda_beta_sig)),
+                            a_lambda=float(args.pc_a_lambda_beta_sig),  b_lambda=float(args.pc_b_lambda_beta_sig),
+                            frac=float(args.pc_frac_beta_sig),  alpha_prob=float(args.pc_alpha_prob)),
+        pc_gamma_sig=PCPrior(lambda_s=(None if args.pc_lambda_gamma_sig is None else float(args.pc_lambda_gamma_sig)),
+                             a_lambda=float(args.pc_a_lambda_gamma_sig), b_lambda=float(args.pc_b_lambda_gamma_sig),
+                             frac=float(args.pc_frac_gamma_sig), alpha_prob=float(args.pc_alpha_prob)),
+    )
+
+    cfg = SamplerConfig(
+        n_iter=int(args.n_iter),
+        burn=int(args.burn),
+        thin=int(args.thin),
+        random_seed=int(args.seed),
+        progress=bool(args.progress),
+        progress_every=int(args.progress_every),
+        slice_w=float(args.slice_w),
+        slice_m=int(args.slice_m),
+        slice_max_shrink=int(args.slice_max_shrink),
+        # RBPF
+        n_particles=int(args.n_particles),
+        ess_resample=float(args.ess_resample),
+        resample_method=str(args.resample_method),
+    )
+
+    # --- Build and run unified sampler ---
+    sampler = DLMUnifiedSampler(
+        y=y,
+        period=int(args.period),
+        # μ
+        level_mode=args.level_mode,
+        trend_mode=args.trend_mode,
+        seasonal_mode=args.seasonal_mode,
+        # η
+        level_mode_sigma=args.level_mode_sigma,
+        trend_mode_sigma=args.trend_mode_sigma,
+        seasonal_mode_sigma=args.seasonal_mode_sigma,
+        # μ inits
+        sigma2_init=float(args.sigma_init) ** 2,   # only used if homoskedastic
+        s_alpha_init=float(args.s_alpha_init),
+        s_beta_init=float(args.s_beta_init),
+        s_gamma_init=float(args.s_gamma_init),
+        m0_alpha_init=(0.0 if args.level_mode == "none" else float(args.m0_level)),
+        P0_alpha_init=float(args.P0_alpha_init),
+        m0_beta_init=float(args.m0_trend if args.trend_mode != "none" else 0.0),
+        P0_beta_init=float(args.P0_beta_init),
+        m0_gamma_init=m0_gamma_init,            # μ seasonal newest-first, length p-1
+        P0_gamma_init=float(args.P0_gamma_init),
+        # η inits (RBPF only)
+        m0_alpha_sig_init=float(args.m0_level_sig_init),
+        P0_alpha_sig_init=float(args.P0_alpha_sig_init),
+        m0_beta_sig_init=0.0,
+        P0_beta_sig_init=float(args.P0_beta_sig_init),
+        m0_gamma_sig_init=m0_gamma_sig_init,    # η seasonal newest-first, length p-1
+        P0_gamma_sig_init=float(args.P0_gamma_sig_init),
+        s_alpha_sig_init=float(args.s_alpha_sig_init),
+        s_beta_sig_init=float(args.s_beta_sig_init),
+        s_gamma_sig_init=float(args.s_gamma_sig_init),
+        priors=priors,
+        cfg=cfg,
+    )
+
+    if args.print_summary:
+        with np.printoptions(suppress=True, precision=4):
+            print("\n--- Summary (simulation) ---")
+            print(f"[μ]  level={mts.level_mode_mu}, trend={mts.trend_mode_mu}, season={mts.seasonal_mode_mu}")
+            print(f"[η]  level={mts.level_mode_sigma}, trend={mts.trend_mode_sigma}, season={mts.seasonal_mode_sigma}")
+            print(f"[μ]  q_level={mts.q_level}, q_trend={mts.q_trend}, q_season={mts.q_season}")
+            print(f"[η]  q_level={mts.q_level_sigma}, q_trend={mts.q_trend_sigma}, q_season={mts.q_season_sigma}")
+            print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
+            print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
+            print(f"avg sigma(truth)={sigma_T.mean():.3f}, sd sigma(truth)={sigma_T.std(ddof=1):.3f}")
+
+    t0 = time.time()
+    post = sampler.run()
+    elapsed = time.time() - t0
+    print(f"Run time: {elapsed:.2f}s")
+
+    out_dir = os.path.join(
+        args.out_dir,
+        f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}"
+        f"_sig({args.level_mode_sigma}-{args.trend_mode_sigma}-{args.seasonal_mode_sigma})_"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    # save using engine's saver to include sigma-mode metadata
+    sampler.save_posterior(
+        out_npz_path=os.path.join(out_dir, "posterior.npz"),
+        extra_meta={"elapsed_seconds": float(elapsed)}
+    )
+
+    # ---- Print quick summaries ----
+    if args.print_summary:
+        with np.printoptions(suppress=True, precision=4):
+            print("\n--- Summary (posterior means) ---")
+            mu_hat = post["mu"].mean(axis=0)
+            sig_hat = post["sigma"].mean(axis=0) if "sigma" in post else np.full(args.T, np.nan)
+            print(f"μ̂_t mean (first 3): {mu_hat[:3]}")
+            print(f"σ̂_t mean (first 3): {sig_hat[:3]}")
+            # mean-block process noise
+            if "Q_alpha" in post and post["Q_alpha"].size:
+                m = float(np.mean(post["Q_alpha"])); print(f"Q_alpha: {m:.4g} (√≈{math.sqrt(m):.4g})")
+            else:
+                print("Q_alpha: n/a")
+            if "Q_beta" in post and post["Q_beta"].size:
+                m = float(np.mean(post["Q_beta"]));  print(f"Q_beta:  {m:.4g} (√≈{math.sqrt(m):.4g})")
+            else:
+                print("Q_beta:  n/a")
+            if "Q_gamma" in post and np.size(post["Q_gamma"])>0:
+                m = float(np.mean(post["Q_gamma"])); print(f"Q_gamma: {m:.4g} (√≈{math.sqrt(m):.4g})")
+            else:
+                print("Q_gamma: n/a")
+            # sigma-block process noise (if RBPF)
+            if "Q_alpha_sig" in post and post["Q_alpha_sig"].size:
+                m = float(np.mean(post["Q_alpha_sig"])); print(f"Q_alpha_sig: {m:.4g} (√≈{math.sqrt(m):.4g})")
+            if "Q_beta_sig" in post and post["Q_beta_sig"].size:
+                m = float(np.mean(post["Q_beta_sig"]));  print(f"Q_beta_sig:  {m:.4g} (√≈{math.sqrt(m):.4g})")
+            if "Q_gamma_sig" in post and np.size(post["Q_gamma_sig"])>0:
+                m = float(np.mean(post["Q_gamma_sig"])); print(f"Q_gamma_sig: {m:.4g} (√≈{math.sqrt(m):.4g})")
+
+    # ---- Plots ----
+    if args.plot:
+        mu_hat = post["mu"].mean(axis=0)
+        sigma_hat = post["sigma"].mean(axis=0) if "sigma" in post else np.full(args.T, np.nan)
+
+        # Figure 1: y and μ
+        plt.figure(figsize=(10, 4))
+        plt.plot(dates_T, y, label=r"$y_t$", linewidth=1.0)
+        plt.plot(dates_T, mu_T, "--", label=r"$\mu_t$ (truth)", linewidth=1.0)
+        plt.plot(dates_T, mu_hat, "-.", label=r"$\hat{\mu}_t$ (post mean)", linewidth=1.0)
+        ttl = (f"DLM μ: level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode} | "
+               f"σ modes: {args.level_mode_sigma},{args.trend_mode_sigma},{args.seasonal_mode_sigma}")
+        plt.title(ttl)
+        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+
+        # Figure 2: σ paths (if available)
+        if np.isfinite(sigma_hat).all():
+            plt.figure(figsize=(10, 4))
+            plt.plot(dates_T, sigma_T, "--", label=r"$\sigma_t$ (truth)", linewidth=1.0)
+            plt.plot(dates_T, sigma_hat, "-.", label=r"$\hat{\sigma}_t$ (post mean)", linewidth=1.0)
+            plt.title("Scale (σ) paths")
+            plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
