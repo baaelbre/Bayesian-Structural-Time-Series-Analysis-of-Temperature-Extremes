@@ -1,0 +1,22 @@
+{
+  "T": 400,
+  "period": 12,
+  "elapsed_seconds": 0.08170676231384277,
+  "mu_modes": {
+    "level": "dynamic",
+    "trend": "dynamic",
+    "seasonal": "none"
+  },
+  "sig_modes": {
+    "level": "deterministic",
+    "trend": "none",
+    "seasonal": "none"
+  },
+  "cfg": {
+    "N_particles": 300,
+    "ess_frac": 0.5,
+    "resample_scheme": "systematic",
+    "seed": 7
+  },
+  "start_date": "2000-01-01"
+}

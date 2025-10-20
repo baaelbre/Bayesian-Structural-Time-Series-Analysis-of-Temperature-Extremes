@@ -1325,20 +1325,20 @@ if __name__ == "__main__":
     )
 
     # Simulation controls
-    parser.add_argument("--T", type=int, default=100)
+    parser.add_argument("--T", type=int, default=500)
     parser.add_argument("--period", type=int, default=4)
     parser.add_argument("--start-date", type=str, default="2000-01-01")
 
-    parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="deterministic")
-    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="deterministic")
-    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
+    parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
+    parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="dynamic")
+    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="deterministic")
 
     # Truth / simulator params
-    parser.add_argument("--sigma",     type=float, default=2.0)
-    parser.add_argument("--xi",        type=float, default=0.1)
+    parser.add_argument("--sigma",     type=float, default=4.0)
+    parser.add_argument("--xi",        type=float, default=-0.1)
     parser.add_argument("--q-level",   type=float, default=1e-1)
     parser.add_argument("--q-trend",   type=float, default=1e-3)
-    parser.add_argument("--q-season",  type=float, default=1e-5)
+    parser.add_argument("--q-season",  type=float, default=5e-2)
 
     parser.add_argument("--m0-level",  type=float, default=5.0)
     parser.add_argument("--v0-level",  type=float, default=0.2)
@@ -1410,8 +1410,8 @@ if __name__ == "__main__":
 
     # Adaptation
     parser.add_argument("--adapt-steps",        default=True)
-    parser.add_argument("--adapt-every",        type=int,    default=1)
-    parser.add_argument("--adapt-until",        choices=["burn","all"], default="all")
+    parser.add_argument("--adapt-every",        type=int,    default=20)
+    parser.add_argument("--adapt-until",        choices=["burn","all"], default="burn")
     parser.add_argument("--adapt-eta0",         type=float,  default=0.2)
     parser.add_argument("--adapt-decay",        type=float,  default=0.75)
     parser.add_argument("--adapt-target-1d",    type=float,  default=0.44)
@@ -1436,9 +1436,9 @@ if __name__ == "__main__":
     start_date = _parse_date(args.start_date)
     args.v0_season = _csv_floats_or_none(args.v0_season)
     if args.m0_season is None:
-        args.m0_season = [5] * (args.period - 1) # 5, 5, 5, -15 for p=4
+        args.m0_season = [2] * (args.period - 1) # 2, 2, 2, -6 for p=4
     if args.v0_season is None:
-        args.v0_season = [0.5] * (args.period - 1)
+        args.v0_season = [0.01] * (args.period - 1)
 
     ts = Extremal_Time_Series(
         parameters=(args.sigma, args.xi),
@@ -1468,7 +1468,7 @@ if __name__ == "__main__":
     mu_T    = np.asarray(truths["mu"][1 : 1 + args.T], float)
     alpha_T = (np.asarray(truths["alpha"][1 : 1 + args.T], float) if args.level_mode == "dynamic" else None)
     beta_T  = (np.asarray(truths["beta"][1  : 1 + args.T], float) if args.trend_mode == "dynamic" else None)
-    gamma_T = (np.asarray(truths["gamma_last"][1 : 1 + args.T], float) if args.seasonal_mode == "dynamic" else None)
+    gamma_T = (np.asarray(truths["gamma"][1 : 1 + args.T], float) if args.seasonal_mode == "dynamic" else None)
     dates_T = truths.get("index", np.arange(args.T))
 
     # --- priors & config ----------------------------------------------------
