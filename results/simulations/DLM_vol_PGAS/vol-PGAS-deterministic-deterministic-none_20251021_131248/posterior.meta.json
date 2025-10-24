@@ -1,0 +1,62 @@
+{
+  "T": 500,
+  "dim": 0,
+  "period": 4,
+  "mu_fixed": 0.0,
+  "modes": {
+    "vol_level_mode": "deterministic",
+    "vol_trend_mode": "deterministic",
+    "vol_seasonal_mode": "none"
+  },
+  "layout": [],
+  "cfg": {
+    "n_iter": 4000,
+    "burn": 1000,
+    "thin": 1,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 0.0,
+    "slice_w": 0.4,
+    "slice_m": 40,
+    "slice_max_shrink": 1000,
+    "n_particles": 100,
+    "ess_resample_ratio": 0.9,
+    "resample_method": "systematic"
+  },
+  "priors": {
+    "m_m0_alpha": 0.0,
+    "s_m0_alpha": 10.0,
+    "m_m0_beta": 0.0,
+    "s_m0_beta": 10.0,
+    "m_m0_gamma": null,
+    "s_m0_gamma": 5.0,
+    "a_P0_alpha": 2.0,
+    "b_P0_alpha": 1.0,
+    "a_P0_beta": 2.0,
+    "b_P0_beta": 1.0,
+    "a_P0_gamma": 2.0,
+    "b_P0_gamma": 1.0,
+    "pc_alpha": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    },
+    "pc_beta": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    },
+    "pc_gamma": {
+      "lambda_s": null,
+      "a_lambda": 1.0,
+      "b_lambda": 1.0,
+      "frac": 0.1,
+      "alpha_prob": 0.05
+    }
+  },
+  "elapsed_seconds": 6.081148147583008
+}

@@ -105,12 +105,6 @@ class SamplerConfig:
     resample_method: str = "systematic"  # or "multinomial"
 
 # =============================================================================
-# Existing Kalman Gibbs (homoskedastic) — import or paste your class here
-# =============================================================================
-# from your_previous_module import DLMGibbsConjugate
-# For brevity, assume the existing class is available as DLMGibbsConjugate.
-
-# =============================================================================
 # RBPF building blocks (sigma block dynamic)
 # =============================================================================
 def _season_A(period: int) -> np.ndarray:
@@ -972,18 +966,80 @@ class DLMUnifiedSampler:
         self.y = np.asarray(y, float)
         self.hetero = (level_mode_sigma == "dynamic" or trend_mode_sigma == "dynamic" or seasonal_mode_sigma == "dynamic")
         self.cfg, self.priors = cfg, priors
-        if self.hetero:
-            self.engine = RBPFHetero(y=y, period=period,
-                                     level_mode=level_mode, trend_mode=trend_mode, seasonal_mode=seasonal_mode,
-                                     level_mode_sigma=level_mode_sigma, trend_mode_sigma=trend_mode_sigma,
-                                     seasonal_mode_sigma=seasonal_mode_sigma,
-                                     priors=priors, cfg=cfg, **kwargs)
+
+        if not self.hetero:
+            # ---- HOMOSKEDASTIC path: use DLMGibbsConjugate and filter kwargs ----
+            from optimization.dlm_location import DLMGibbsConjugate  
+
+            gibbs_kwargs = dict(
+                y=y,
+                period=int(period),
+                level_mode=str(level_mode),
+                trend_mode=str(trend_mode),
+                seasonal_mode=str(seasonal_mode),
+
+                # initial values the Gibbs engine actually knows about
+                sigma2_init=float(sigma_init) ** 2,
+                s_alpha_init=float(s_alpha_init),
+                s_beta_init=float(s_beta_init),
+                s_gamma_init=float(s_gamma_init),
+
+                m0_alpha_init=(0.0 if level_mode == "none" else float(m0_level)),
+                P0_alpha_init=float(P0_alpha_init),
+                m0_beta_init=(float(m0_trend) if trend_mode != "none" else 0.0),
+                P0_beta_init=float(P0_beta_init),
+                m0_gamma_init=list(m0_gamma_init) if m0_gamma_init is not None else None,  # newest-first, length p-1
+                P0_gamma_init=float(P0_gamma_init),
+
+                priors=priors,
+                cfg=cfg,
+            )
+
+            # Do NOT include any *_sig_* keys here.
+            self.engine = DLMGibbsConjugate(**gibbs_kwargs)
+
         else:
-            # Homoskedastic: rely on your existing sampler (expects sigma2_init and updates σ²)
-            from kalman_gibbs_pc_hyper_slice_v4 import DLMGibbsConjugate  # <-- import your previous class/module
-            self.engine = DLMGibbsConjugate(y=y, period=period,
-                                            level_mode=level_mode, trend_mode=trend_mode, seasonal_mode=seasonal_mode,
-                                            priors=priors, cfg=cfg, **kwargs)
+            # ---- HETEROSKEDASTIC path: use your RBPF engine and pass *_sig_* args there ----
+            from dlm_rbpf_engine import DLMRBPF  # whatever your RBPF class is
+            rbpf_kwargs = dict(
+                y=y,
+                period=int(period),
+                # mean-block modes
+                level_mode=str(level_mode),
+                trend_mode=str(trend_mode),
+                seasonal_mode=str(seasonal_mode),
+                # sigma-block modes
+                level_mode_sigma=str(level_mode_sigma),
+                trend_mode_sigma=str(trend_mode_sigma),
+                seasonal_mode_sigma=str(seasonal_mode_sigma),
+
+                # μ inits
+                s_alpha_init=float(s_alpha_init),
+                s_beta_init=float(s_beta_init),
+                s_gamma_init=float(s_gamma_init),
+                m0_alpha_init=(0.0 if level_mode == "none" else float(m0_level)),
+                P0_alpha_init=float(P0_alpha_init),
+                m0_beta_init=(float(m0_trend) if trend_mode != "none" else 0.0),
+                P0_beta_init=float(P0_beta_init),
+                m0_gamma_init=list(m0_gamma_init) if m0_gamma_init is not None else None,
+                P0_gamma_init=float(P0_gamma_init),
+
+                # η inits (only RBPF cares)
+                m0_alpha_sig_init=float(m0_level_sig_init),
+                P0_alpha_sig_init=float(P0_alpha_sig_init),
+                m0_beta_sig_init=0.0,
+                P0_beta_sig_init=float(P0_beta_sig_init),
+                m0_gamma_sig_init=list(m0_gamma_sig_init) if m0_gamma_sig_init is not None else None,
+                P0_gamma_sig_init=float(P0_gamma_sig_init),
+                s_alpha_sig_init=float(s_alpha_sig_init),
+                s_beta_sig_init=float(s_beta_sig_init),
+                s_gamma_sig_init=float(s_gamma_sig_init),
+
+                priors=priors,
+                cfg=cfg,
+            )
+            self.engine = DLMRBPF(**rbpf_kwargs)
+
 
         self.hetero_modes = dict(level_mode_sigma=level_mode_sigma,
                                  trend_mode_sigma=trend_mode_sigma,
