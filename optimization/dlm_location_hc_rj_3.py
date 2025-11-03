@@ -255,9 +255,9 @@ class DLMRJGibbs:
         self,
         y: np.ndarray,
         period: int,
-        level_mode: str = "dynamic",
-        trend_mode: str = "dynamic",
-        seasonal_mode: str = "dynamic",
+        level_mode: str = "deterministic",
+        trend_mode: str = "deterministic",
+        seasonal_mode: str = "deterministic",
         sigma2_init: float = 1.0,
         # dynamic initials
         m0_alpha_init: float = 0.0,
@@ -1282,7 +1282,7 @@ if __name__ == "__main__":
     # RJ options
     p.add_argument("--rj-moves-per-iter", type=int, default=2)
     p.add_argument("--allow-none-level", default=False)
-    p.add_argument("--allow-none-trend", default=True)
+    p.add_argument("--allow-none-trend", default=False)
     p.add_argument("--allow-none-season", default=False)
 
     args = p.parse_args()
@@ -1423,7 +1423,7 @@ if __name__ == "__main__":
 
     out_dir = os.path.join(
         args.out_dir,
-        f"RJ-dlp__start_dyn-dyn-dyn__truth_{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}__"
+        f"CC_{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}__"
         f"{time.strftime('%Y%m%d_%H%M%S')}",
     )
     os.makedirs(out_dir, exist_ok=True)
