@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json, math, os, time, warnings
+import json, math, os, warnings
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -48,11 +47,11 @@ class PCScalePrior:
     """
     Collapsed PC prior for s > 0 with λ ~ Gamma(a, b):
       s | a,b  ~ Lomax/Pareto-II(shape=a, scale=b),  p(s) ∝ (b + s)^{-(a+1)}.
-    We keep 'frac' and 'alpha_prob' only to help pick sensible defaults (e.g. for init or b).
+    'frac' and 'alpha_prob' are heuristics for picking sensible defaults.
     """
     a: float = 1.0     # shape
     b: float = 1.0     # scale
-    frac: float = 0.10 # u = frac * scale_proxy (only for heuristics/printing)
+    frac: float = 0.10 # u = frac * scale_proxy (heuristic)
     alpha_prob: float = 0.05  # P(s > u) target (heuristic)
 
 @dataclass
@@ -83,6 +82,35 @@ class Priors:
     pc_gamma: PCScalePrior = field(default_factory=PCScalePrior)
 
 @dataclass
+class MHAdaptConfig:
+    # Whether to adapt the RW step sizes at all
+    adapt: bool = True
+    # Restrict adaptation to burn-in only?
+    burn_only: bool = True
+    # Iteration range (1-indexed) where adaptation is allowed; None means unbounded
+    start_iter: int = 50
+    stop_iter: Optional[int] = None
+    # How often to adapt (in iterations)
+    adapt_every: int = 10
+    # Target acceptance (Robbins–Monro target)
+    target_acc: float = 0.25
+    # Robbins–Monro gain schedule: gamma = c / (it + t0)^pow
+    rm_c: float = 1.0
+    rm_t0: float = 10.0
+    rm_pow: float = 0.5  # 0.5 ≈ 1/sqrt(t) schedule
+    # Bounds on the (log-sd) proposal step size
+    min_step: float = 1e-4
+    max_step: float = 2.5
+    # Optional initial steps (per component)
+    init_step_alpha: Optional[float] = None
+    init_step_beta: Optional[float] = None
+    init_step_gamma: Optional[float] = None
+    # EWMA decay for acceptance rate display (closer to 1 = slower)
+    acc_ewma_decay: float = 0.9
+    # Rolling window size for quick online ESS display
+    ess_window: int = 800
+
+@dataclass
 class SamplerConfig:
     n_iter: int = 4000
     burn: int = 1000
@@ -91,20 +119,18 @@ class SamplerConfig:
     progress: bool = True
     progress_every: int = 0  # 0 => ~2% of n_iter
 
-    # Slice sampler (for log s only)
-    slice_w: float = 0.4
-    slice_m: int = 40
-    slice_max_shrink: int = 1000
+    # MH adaptation settings
+    mh: MHAdaptConfig = field(default_factory=MHAdaptConfig)
 
 # =============================================================================
-# DLM Sampler (conjugate Gibbs except process s via slice with collapsed PC prior)
+# DLM Sampler (conjugate Gibbs except process s via MH with Lomax/Pareto II prior)
 # =============================================================================
 class DLMGibbsConjugate:
     """
     Gaussian structural DLM with:
       • FFBS for latent states
       • Conjugate Gibbs for σ², m0, P0, deterministic params
-      • Collapsed PC prior (Lomax) for process s (sample log s by slice)
+      • Collapsed PC prior (Lomax) for process s (sample log s via RW-MH)
 
     STATE ORDERING & SEASONAL CONVENTION:
       - Dynamic state layout: [alpha] [beta] [g1 ... g_{p-1}]
@@ -237,6 +263,23 @@ class DLMGibbsConjugate:
         self.true_beta_t: Optional[np.ndarray] = None
         self.true_gamma_t: Optional[np.ndarray] = None
 
+        # MH state and traces
+        self._mh_state = {
+            "alpha": {"step": 0.2, "acc": 0.25, "n_prop": 0, "n_acc": 0},
+            "beta":  {"step": 0.2, "acc": 0.25, "n_prop": 0, "n_acc": 0},
+            "gamma": {"step": 0.2, "acc": 0.25, "n_prop": 0, "n_acc": 0},
+            "it": 1,
+        }
+        # apply configured initial step sizes if provided
+        if self.priors and self.cfg and hasattr(self.cfg, "mh"):
+            mhc = self.cfg.mh
+            if mhc.init_step_alpha is not None: self._mh_state["alpha"]["step"] = float(mhc.init_step_alpha)
+            if mhc.init_step_beta  is not None: self._mh_state["beta"]["step"]  = float(mhc.init_step_beta)
+            if mhc.init_step_gamma is not None: self._mh_state["gamma"]["step"] = float(mhc.init_step_gamma)
+
+        # rolling traces for quick ESS display (store Q = s^2)
+        self._mh_trace = {"alpha": [], "beta": [], "gamma": []}
+
         # Print collapsed PC prior heuristics (init-scale only; no lambdas)
         if self.cfg.progress:
             y = self.y
@@ -245,8 +288,8 @@ class DLMGibbsConjugate:
             sdg = sd1
             fmt = lambda x: "n/a" if x is None else f"{x:.4g}"
             print(f"[init] scale proxies: sd1={fmt(sd1)}, sd2={fmt(sd2)}, sdg={fmt(sdg)}")
-            
-        # --------------------- Truth overlays (optional) --------------------- #
+
+    # --------------------- Truth overlays (optional) --------------------- #
     def set_truth(
         self,
         sigma: Optional[float] = None,
@@ -262,7 +305,6 @@ class DLMGibbsConjugate:
         self.true_sigma = None if sigma is None else float(sigma)
         self.true_Q = None if Q is None else np.asarray(Q, float)
 
-        # Store these too (not used elsewhere unless you decide to save them)
         self.true_m0_level = None if m0_level is None else float(m0_level)
         self.true_m0_trend = None if m0_trend is None else float(m0_trend)
         self.true_m0_season = None if m0_season is None else np.asarray(m0_season, float)
@@ -282,7 +324,6 @@ class DLMGibbsConjugate:
         self.true_alpha_t = None if alpha is None else np.asarray(alpha, float)
         self.true_beta_t = None if beta is None else np.asarray(beta, float)
         self.true_gamma_t = None if gamma is None else np.asarray(gamma, float)
-
 
     # ----------------------------- Model matrices ----------------------------- #
     def _H(self) -> np.ndarray:
@@ -400,29 +441,6 @@ class DLMGibbsConjugate:
         for t in range(1, self.T + 1):
             self.x[t] = A @ self.x[t - 1] + u + np.random.normal(0.0, np.sqrt(Q_init), size=self.dim)
 
-    # -------------------- Slice for log s -------------------- #
-    def _slice(self, f: Callable[[float], float], z0: float) -> float:
-        w, m, limit = float(self.cfg.slice_w), int(self.cfg.slice_m), int(self.cfg.slice_max_shrink)
-        y_star = f(z0) - np.random.exponential(1.0)
-        u = np.random.rand()
-        L = z0 - u * w
-        R = L + w
-        j = int(np.floor(m * np.random.rand()))
-        k = (m - 1) - j
-        while j > 0 and f(L) > y_star:
-            L -= w; j -= 1
-        while k > 0 and f(R) > y_star:
-            R += w; k -= 1
-        for _ in range(limit):
-            z_prop = np.random.uniform(L, R)
-            if f(z_prop) >= y_star:
-                return z_prop
-            if z_prop < z0:
-                L = z_prop
-            else:
-                R = z_prop
-        return z0
-
     # ------------------ Helpers: μ and residuals ------------------ #
     def _mu_vec(self) -> np.ndarray:
         H = self._H()
@@ -472,58 +490,133 @@ class DLMGibbsConjugate:
             ss += (self.x[t, gs] - mean_new_first) ** 2
         return float(ss), self.T
 
-    # --- slice for z = log s with collapsed PC prior (Lomax).
-    #     Prior: p(s) ∝ (b + s)^{-(a+1)};  log prior = const - (a+1)*log(b + e^z) + z (Jacobian)
-    def _slice_logsd_lomax(
-        self, z0: float, SS: float, T_eff: int, a: float, b: float
-    ) -> float:
+    # =============================================================================
+    # Adaptive MH for log s under collapsed PC (Lomax) prior
+    # =============================================================================
+    def _logpost_logsd_lomax(self, z: float, SS: float, T_eff: int, a: float, b: float) -> float:
         """
-        Slice sampler for z = log s with collapsed PC prior (Lomax), but standardized:
-        the slice operates on a rescaled variable z_std = (z - z_hat) / scale,
-        so curvature is roughly order 1 regardless of parameter scale.
+        Log posterior (up to constant) for z = log s under Lomax(a, b) prior:
+            p(s) ∝ (b + s)^(-(a+1)),  s = e^z.
         """
+        return (
+            -T_eff * z
+            - 0.5 * SS * math.exp(-2 * z)
+            - (a + 1.0) * math.log(b + math.exp(z))
+            + z
+        )
 
-        # --- local mode (Laplace point) ---
-        # crude mode approximation: balance prior & likelihood curvature
-        z_hat = math.log(max(1e-12, math.sqrt(SS / T_eff)))  # mode proxy for Gaussian case
-        scale = max(0.5, abs(z_hat))                         # adaptive scale factor
+    def _mh_logsd_adapt(
+        self,
+        z_curr: float,
+        SS: float,
+        T_eff: int,
+        a: float,
+        b: float,
+        step_scale: float,
+        acc_ewma: float,
+        it_global: int,
+        *,
+        do_adapt: bool,
+        mhc: MHAdaptConfig,
+    ) -> Tuple[float, float, float, int]:
+        """
+        One RW-MH step for log s with optional adaptation.
+        Returns (z_new, step_new, acc_ewma_new, accepted_int)
+        """
+        z_prop = z_curr + np.random.normal(0.0, step_scale)
+        lp_curr = self._logpost_logsd_lomax(z_curr, SS, T_eff, a, b)
+        lp_prop = self._logpost_logsd_lomax(z_prop, SS, T_eff, a, b)
+        log_acc = lp_prop - lp_curr
 
-        def f_std(z_std: float) -> float:
-            z = z_hat + scale * z_std
-            return (
-                -(T_eff * z)
-                - 0.5 * SS * math.exp(-2 * z)
-                - (a + 1.0) * math.log(b + math.exp(z))
-                + z
-            )
+        if math.log(np.random.rand()) < log_acc:
+            accepted, z_new = 1, z_prop
+        else:
+            accepted, z_new = 0, z_curr
 
-        # sample in standardized space
-        z_std0 = (z0 - z_hat) / scale
-        z_std_new = self._slice(f_std, z_std0)
+        # EWMA acceptance (for display)
+        acc_ewma = mhc.acc_ewma_decay * acc_ewma + (1.0 - mhc.acc_ewma_decay) * accepted
 
-        # back-transform to real space
-        return z_hat + scale * z_std_new
+        # Adapt step size only if allowed by schedule
+        step_new = step_scale
+        if do_adapt:
+            gamma = mhc.rm_c / ((it_global + mhc.rm_t0) ** mhc.rm_pow)
+            delta = accepted - mhc.target_acc
+            step_new = step_scale * math.exp(gamma * delta)
+            step_new = float(np.clip(step_new, mhc.min_step, mhc.max_step))
 
+        return z_new, step_new, acc_ewma, accepted
 
     def update_process_sds(self) -> None:
-        # α
+        """
+        Adaptive MH for s_alpha, s_beta, s_gamma (log-scale proposals).
+        Tunable via self.cfg.mh. Keeps EWMA acceptance and rolling ESS traces.
+        """
+        st = self._mh_state
+        it = st["it"]
+        mhc: MHAdaptConfig = self.cfg.mh
+
+        # Should we adapt on this iteration?
+        def _allow_adapt() -> bool:
+            if not mhc.adapt:
+                return False
+            if mhc.burn_only and it > self.cfg.burn:
+                return False
+            if mhc.start_iter is not None and it < mhc.start_iter:
+                return False
+            if mhc.stop_iter is not None and it > mhc.stop_iter:
+                return False
+            if mhc.adapt_every <= 1:
+                return True
+            return (it % mhc.adapt_every) == 0
+
+        do_adapt = _allow_adapt()
+
+        # α component
         if self.idx_alpha is not None:
             ss, T_eff = self._innovation_ss_alpha()
             pa = self.priors.pc_alpha
-            z = self._slice_logsd_lomax(math.log(max(1e-18, self.s_alpha)), ss, T_eff, pa.a, pa.b)
-            self.s_alpha = float(math.exp(z))
-        # β
+            z0 = math.log(max(1e-18, self.s_alpha))
+            z1, st["alpha"]["step"], st["alpha"]["acc"], acc_a = self._mh_logsd_adapt(
+                z0, ss, T_eff, pa.a, pa.b, st["alpha"]["step"], st["alpha"]["acc"], it,
+                do_adapt=do_adapt, mhc=mhc
+            )
+            self.s_alpha = math.exp(z1)
+            st["alpha"]["n_prop"] += 1
+            st["alpha"]["n_acc"]  += acc_a
+            tr = self._mh_trace["alpha"]; tr.append(self.s_alpha**2)
+            if len(tr) > mhc.ess_window: del tr[:len(tr)-mhc.ess_window]
+
+        # β component
         if self.idx_beta is not None:
             ss, T_eff = self._innovation_ss_beta()
             pb = self.priors.pc_beta
-            z = self._slice_logsd_lomax(math.log(max(1e-18, self.s_beta)), ss, T_eff, pb.a, pb.b)
-            self.s_beta = float(math.exp(z))
-        # γ
+            z0 = math.log(max(1e-18, self.s_beta))
+            z1, st["beta"]["step"], st["beta"]["acc"], acc_b = self._mh_logsd_adapt(
+                z0, ss, T_eff, pb.a, pb.b, st["beta"]["step"], st["beta"]["acc"], it,
+                do_adapt=do_adapt, mhc=mhc
+            )
+            self.s_beta = math.exp(z1)
+            st["beta"]["n_prop"] += 1
+            st["beta"]["n_acc"]  += acc_b
+            tr = self._mh_trace["beta"]; tr.append(self.s_beta**2)
+            if len(tr) > mhc.ess_window: del tr[:len(tr)-mhc.ess_window]
+
+        # γ component
         if self.seasonal_mode == "dynamic":
             ss, T_eff = self._innovation_ss_gamma()
             pg = self.priors.pc_gamma
-            z = self._slice_logsd_lomax(math.log(max(1e-18, self.s_gamma)), ss, T_eff, pg.a, pg.b)
-            self.s_gamma = float(math.exp(z))
+            z0 = math.log(max(1e-18, self.s_gamma))
+            z1, st["gamma"]["step"], st["gamma"]["acc"], acc_g = self._mh_logsd_adapt(
+                z0, ss, T_eff, pg.a, pg.b, st["gamma"]["step"], st["gamma"]["acc"], it,
+                do_adapt=do_adapt, mhc=mhc
+            )
+            self.s_gamma = math.exp(z1)
+            st["gamma"]["n_prop"] += 1
+            st["gamma"]["n_acc"]  += acc_g
+            tr = self._mh_trace["gamma"]; tr.append(self.s_gamma**2)
+            if len(tr) > mhc.ess_window: del tr[:len(tr)-mhc.ess_window]
+
+        st["it"] += 1
 
     # --- m0 | P0, x0  (Normal)  +  P0 | m0, x0  (Inv-Gamma) for dynamic coords --- #
     @staticmethod
@@ -679,6 +772,22 @@ class DLMGibbsConjugate:
         head = ", ".join(f"{x:{fmt}}" for x in v[:max_elems])
         return f"[{head}, …]"
 
+    @staticmethod
+    def _ess_lag1(x: Sequence[float]) -> float:
+        """Very quick ESS via lag-1 autocorrelation; returns len(x) if undefined."""
+        x = np.asarray(x, float)
+        n = x.size
+        if n < 3:
+            return float(n)
+        x0, x1 = x[:-1], x[1:]
+        v0 = np.var(x0)
+        v1 = np.var(x1)
+        if v0 <= 0 or v1 <= 0:
+            return float(n)
+        r = np.corrcoef(x0, x1)[0, 1]
+        r = float(np.clip(r, -0.99, 0.99))
+        return float(n) * (1.0 - r) / (1.0 + r)
+
     def _progress_line(self, it: int) -> str:
         parts = [f"[it {it + 1}/{self.cfg.n_iter}]"]
         parts.append(f"σ={math.sqrt(self.sigma2):.3f}")
@@ -704,6 +813,21 @@ class DLMGibbsConjugate:
             )
             parts.append(f"m0γ={g} P0γ={(self.P0_gamma if self.seasonal_mode=='dynamic' else 0.0):.4g}")
         return " | ".join(parts)
+
+    def _progress_line_mh(self) -> str:
+        """Compact line with MH tuning stats: step, acc(EWMA), ESS(window)."""
+        items = []
+        for nm in ["alpha", "beta", "gamma"]:
+            if nm == "alpha" and (self.idx_alpha is None):  continue
+            if nm == "beta"  and (self.idx_beta is None):   continue
+            if nm == "gamma" and (self.seasonal_mode != "dynamic"): continue
+            st = self._mh_state[nm]
+            step = st["step"]
+            acc  = st["acc"]
+            tr   = self._mh_trace[nm]
+            ess  = int(self._ess_lag1(tr)) if len(tr) >= 5 else len(tr)
+            items.append(f"{nm[0]}: step={step:.3f} acc={acc:.2f} ESS≈{ess}")
+        return "  [MH] " + " | ".join(items) if items else "  [MH] -"
 
     # --------------------------------- MCMC --------------------------------- #
     def run(self) -> Dict[str, np.ndarray]:
@@ -739,7 +863,7 @@ class DLMGibbsConjugate:
             if self.dim > 0:
                 self.x = self._ffbs()
 
-            # 2) process s (slice with collapsed PC prior)
+            # 2) process s (RW-MH with collapsed PC prior)
             if self.dim > 0:
                 self.update_process_sds()
 
@@ -757,6 +881,7 @@ class DLMGibbsConjugate:
             # progress
             if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
                 print(self._progress_line(it))
+                print(self._progress_line_mh())
 
             # save
             if it in save_iters:
@@ -829,259 +954,268 @@ class DLMGibbsConjugate:
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
 
+
 # ------------------------- CLI / Example run ------------------------------- #
 if __name__ == "__main__":
-    import argparse, os, time, math, sys
+    import argparse, os, sys, time, math
+    from datetime import datetime
+    import numpy as np
     import matplotlib.pyplot as plt
     import pandas as pd
-    from datetime import datetime
+
+    # --------------------------------------------------------------------------
+    # Setup and imports
+    # --------------------------------------------------------------------------
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     sys.path.append(base_dir)
+    from simulator.mean_time_series import Mean_Time_Series  # newest-first convention
 
-    # import your simulator rewritten to the same (newest-first) convention
-    from simulator.mean_time_series import Mean_Time_Series
-
+    # --------------------------------------------------------------------------
+    # Helper parsing utilities
+    # --------------------------------------------------------------------------
     def _parse_date(s: str | None):
         if not s:
             return datetime.today()
         parts = [int(p) for p in s.split("-")]
-        if   len(parts) == 1: return datetime(parts[0], 1, 1)
-        elif len(parts) == 2: return datetime(parts[0], parts[1], 1)
-        elif len(parts) == 3: return datetime(parts[0], parts[1], parts[2])
+        if len(parts) == 1:
+            return datetime(parts[0], 1, 1)
+        elif len(parts) == 2:
+            return datetime(parts[0], parts[1], 1)
+        elif len(parts) == 3:
+            return datetime(parts[0], parts[1], parts[2])
         raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
 
     def _csv_floats_or_none(s: str | None):
-        if s is None: return None
+        if s is None:
+            return None
         s = s.strip()
-        if s == "": return None
+        if s == "":
+            return None
         return [float(z) for z in s.split(",") if z.strip() != ""]
 
+    def _window_to_decay(w: int) -> float:
+        """Map an 'EWMA window' intuition to an EWMA decay in (0,1)."""
+        w = max(2, int(w))
+        return 1.0 - 2.0 / (w + 1)
+
+    # --------------------------------------------------------------------------
+    # Command-line arguments
+    # --------------------------------------------------------------------------
     p = argparse.ArgumentParser(
         description=(
             "Kalman FFBS + conjugate/PC Gibbs for Gaussian DLM "
-            "(level/trend/season). Seasonal state is newest-first; "
-            "observation loads the first seasonal coord. "
-            "Uses collapsed PC hyperprior (Lomax) for process s."
+            "(level/trend/season). Uses newest-first seasonal ordering "
+            "and adaptive MH random-walk for process s (collapsed PC prior)."
         )
     )
 
-    # --- Simulation controls ---
+    # Simulation
     p.add_argument("--T", type=int, default=500)
     p.add_argument("--period", type=int, default=4)
     p.add_argument("--start-date", type=str, default="2000-01-01")
-
     p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.001)
     p.add_argument("--q-trend", type=float, default=0.00002)
     p.add_argument("--q-season", type=float, default=0.005)
-
     p.add_argument("--m0-level", type=float, default=3.0)
     p.add_argument("--v0-level", type=float, default=0.25)
     p.add_argument("--m0-trend", type=float, default=0.015)
     p.add_argument("--v0-trend", type=float, default=0.05)
-    p.add_argument("--m0-season", type=str, default=None, help="comma-separated (length p-1, newest-first)")
-    p.add_argument("--v0-season", type=str, default=None, help="comma-separated (length p-1)")
+    p.add_argument("--m0-season", type=str, default=None)
+    p.add_argument("--v0-season", type=str, default=None)
 
-    # --- Inference priors ---
+    # Priors and PC parameters
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
     p.add_argument("--prior-b-sigma", type=float, default=1.0)
-
     p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
-    p.add_argument("--prior-m-m0-beta",  type=float, default=0.0)
-    p.add_argument("--prior-s-m0-beta",  type=float, default=10.0)
-    p.add_argument("--prior-m-m0-gamma", type=str, default=None, help="comma-separated (length p-1, newest-first)")
+    p.add_argument("--prior-m-m0-beta", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta", type=float, default=10.0)
+    p.add_argument("--prior-m-m0-gamma", type=str, default=None)
     p.add_argument("--prior-s-m0-gamma", type=float, default=5.0)
-
-    p.add_argument("--prior-a-P0-alpha", type=float, default=5.0) 
+    p.add_argument("--prior-a-P0-alpha", type=float, default=5.0)
     p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
-    p.add_argument("--prior-a-P0-beta",  type=float, default=5.0) 
-    p.add_argument("--prior-b-P0-beta",  type=float, default=1.0)
-    p.add_argument("--prior-a-P0-gamma", type=float, default=5.0) 
+    p.add_argument("--prior-a-P0-beta", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-beta", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-gamma", type=float, default=5.0)
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
-
-    # --- Collapsed PC hyperpriors/Lomax for process sds ---
-    p.add_argument("--pc-a-alpha",  type=float, default=4.0)
-    p.add_argument("--pc-b-alpha",  type=float, default=0.5)
-    p.add_argument("--pc-a-beta",   type=float, default=4.0)
-    p.add_argument("--pc-b-beta",   type=float, default=0.5)
-    p.add_argument("--pc-a-gamma",  type=float, default=4.0)
-    p.add_argument("--pc-b-gamma",  type=float, default=0.5)
-    p.add_argument("--pc-frac",     type=float, default=0.10)  # single frac used across (heuristics/printing)
+    p.add_argument("--pc-a-alpha", type=float, default=4.0)
+    p.add_argument("--pc-b-alpha", type=float, default=0.5)
+    p.add_argument("--pc-a-beta", type=float, default=4.0)
+    p.add_argument("--pc-b-beta", type=float, default=0.5)
+    p.add_argument("--pc-a-gamma", type=float, default=4.0)
+    p.add_argument("--pc-b-gamma", type=float, default=0.5)
+    p.add_argument("--pc-frac", type=float, default=0.10)
     p.add_argument("--pc-alpha-prob", type=float, default=0.05)
 
-    # --- Sampler config & slice ---
-    p.add_argument("--n-iter", type=int, default=10000)
-    p.add_argument("--burn", type=int, default=5000)
+    # Sampler configuration (general)
+    p.add_argument("--n-iter", type=int, default=8000)
+    p.add_argument("--burn", type=int, default=4000)
     p.add_argument("--thin", type=int, default=2)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=0)
-    p.add_argument("--slice-w", type=float, default=2)
-    p.add_argument("--slice-m", type=int, default=80)
-    p.add_argument("--slice-max-shrink", type=int, default=3000)
-
-    # --- Initial values for inference ---
-    p.add_argument("--sigma-init", type=float, default=2.0)  # sd (will be squared)
-    p.add_argument("--s-alpha-init", type=float, default=1e-2)
-    p.add_argument("--s-beta-init",  type=float, default=1e-3)
-    p.add_argument("--s-gamma-init", type=float, default=1.0)
-    p.add_argument("--m0-gamma-init", type=str, default=None, help="comma-separated (length p-1, newest-first)")
-    p.add_argument("--P0-alpha-init", type=float, default=0.25)
-    p.add_argument("--P0-beta-init",  type=float, default=0.05)
-    p.add_argument("--P0-gamma-init", type=float, default=0.25)
-
-    # --- I/O & plotting ---
     p.add_argument("--out-dir", type=str, default="results/simulations/DLM")
     p.add_argument("--plot", default=True)
     p.add_argument("--print-summary", default=True)
 
+    # Initial inference values
+    p.add_argument("--sigma-init", type=float, default=1.0)
+    p.add_argument("--s-alpha-init", type=float, default=1e-1)
+    p.add_argument("--s-beta-init", type=float, default=1e-1)
+    p.add_argument("--s-gamma-init", type=float, default=1e-1)
+    p.add_argument("--m0-gamma-init", type=str, default=None)
+    p.add_argument("--P0-alpha-init", type=float, default=0.25)
+    p.add_argument("--P0-beta-init", type=float, default=0.05)
+    p.add_argument("--P0-gamma-init", type=float, default=0.25)
+
+    # --------------------- Adaptive MH step-size controls ----------------------
+    p.add_argument("--mh-target", type=float, default=0.44,
+                   help="Target acceptance rate for RW-MH on log s.")
+    p.add_argument("--mh-init-step-alpha", type=float, default=0.15)
+    p.add_argument("--mh-init-step-beta",  type=float, default=0.15)
+    p.add_argument("--mh-init-step-gamma", type=float, default=0.15)
+    p.add_argument("--mh-min-step", type=float, default=1e-4)
+    p.add_argument("--mh-max-step", type=float, default=5.0)
+    p.add_argument("--mh-adapt-every", type=int, default=10,
+                   help="Adaptation cadence in iterations (1=every iter).")
+    p.add_argument("--mh-adapt-window", type=int, default=50,
+                   help="EWMA window (or batch size) for acceptance smoothing.")
+    p.add_argument("--mh-adapt-burn-only", default=True,
+                   help="If set, adapt only during burn-in; freeze afterward.")
+    p.add_argument("--mh-adapt-until", type=int, default=0,
+                   help="Optional hard stop iter for adaptation (0=>auto).")
+
     args = p.parse_args()
     np.random.seed(args.seed)
 
+    # --------------------------------------------------------------------------
+    # Simulate a synthetic time series
+    # --------------------------------------------------------------------------
     start_date = _parse_date(args.start_date)
-    m0_season = _csv_floats_or_none(args.m0_season)
-    v0_season = _csv_floats_or_none(args.v0_season)
-    if m0_season is None:
-        m0_season = [1.0] * (args.period - 1)     # neutral newest-first (length p-1)
-    if v0_season is None:
-        v0_season = [0.25] * (args.period - 1)
+    m0_season = _csv_floats_or_none(args.m0_season) or [1.0] * (args.period - 1)
+    v0_season = _csv_floats_or_none(args.v0_season) or [0.25] * (args.period - 1)
 
-    # --- Simulate data (simulator uses same newest-first convention) ---
-    sim_level_mode = args.level_mode if args.level_mode != "none" else "deterministic"
     mts = Mean_Time_Series(
         sigma=args.sigma,
-        level_mode=sim_level_mode,
-        trend_mode=args.trend_mode,
-        seasonal_mode=args.seasonal_mode,
         period=args.period,
-        q_level=(args.q_level if sim_level_mode == "dynamic" else 0.0),
-        q_trend=(args.q_trend if args.trend_mode == "dynamic" else 0.0),
-        q_season=(args.q_season if args.seasonal_mode == "dynamic" else 0.0),
-        m0_level=(0.0 if args.level_mode == "none" else args.m0_level),
-        v0_level=(args.v0_level if sim_level_mode == "dynamic" else 0.0),
-        m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend),
-        v0_trend=(args.v0_trend if args.trend_mode == "dynamic" else 0.0),
-        m0_season=m0_season,   # length p-1, newest-first
-        v0_season=v0_season,   # length p-1
-        start_date=start_date,
-    )
-
-    y = []
-    for _ in range(args.T):
-        mts.move()
-        y.append(mts.measure())
-    y = np.asarray(y, float)
-
-    truths = mts.get_truth_paths(as_numpy=True)
-    mu_T    = truths["mu_t"][1 : 1 + args.T]
-    alpha_T = truths["alpha_t"][1 : 1 + args.T]
-    beta_T  = truths["beta_t"][1 : 1 + args.T]
-    gamma_T = truths["gamma_t"][1 : 1 + args.T]
-    dates_T = truths["index"][: args.T]
-
-    # --- Initial seasonal mean for sampler (newest-first, length p-1) ---
-    if args.m0_gamma_init is not None:
-        m0_gamma_init = [float(z) for z in args.m0_gamma_init.split(",") if z.strip() != ""]
-    else:
-        S = np.array([np.median(y[k::args.period]) for k in range(args.period)], float)
-        base = S - S.mean()
-        m0_gamma_init = base[: args.period - 1].tolist()
-
-    # --- Priors and config ---
-    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
-
-    priors = Priors(
-        a_sigma=float(args.prior_a_sigma),
-        b_sigma=float(args.prior_b_sigma),
-        m_m0_alpha=float(args.prior_m_m0_alpha),
-        s_m0_alpha=float(args.prior_s_m0_alpha),
-        m_m0_beta=float(args.prior_m_m0_beta),
-        s_m0_beta=float(args.prior_s_m0_beta),
-        m_m0_gamma=None if pri_gamma_vec is None else pri_gamma_vec,
-        s_m0_gamma=float(args.prior_s_m0_gamma),
-        a_P0_alpha=float(args.prior_a_P0_alpha),
-        b_P0_alpha=float(args.prior_b_P0_alpha),
-        a_P0_beta=float(args.prior_a_P0_beta),
-        b_P0_beta=float(args.prior_b_P0_beta),
-        a_P0_gamma=float(args.prior_a_P0_gamma),
-        b_P0_gamma=float(args.prior_b_P0_gamma),
-        pc_alpha=PCScalePrior(a=float(args.pc_a_alpha), b=float(args.pc_b_alpha),
-                              frac=float(args.pc_frac), alpha_prob=float(args.pc_alpha_prob)),
-        pc_beta =PCScalePrior(a=float(args.pc_a_beta),  b=float(args.pc_b_beta),
-                              frac=float(args.pc_frac), alpha_prob=float(args.pc_alpha_prob)),
-        pc_gamma=PCScalePrior(a=float(args.pc_a_gamma), b=float(args.pc_b_gamma),
-                              frac=float(args.pc_frac), alpha_prob=float(args.pc_alpha_prob)),
-    )
-
-    cfg = SamplerConfig(
-        n_iter=int(args.n_iter),
-        burn=int(args.burn),
-        thin=int(args.thin),
-        random_seed=int(args.seed),
-        progress=bool(args.progress),
-        progress_every=int(args.progress_every),
-        slice_w=float(args.slice_w),
-        slice_m=int(args.slice_m),
-        slice_max_shrink=int(args.slice_max_shrink),
-    )
-
-    # --- Build and run sampler ---
-    sampler = DLMGibbsConjugate(
-        y=y,
-        period=int(args.period),
         level_mode=args.level_mode,
         trend_mode=args.trend_mode,
         seasonal_mode=args.seasonal_mode,
-        sigma2_init=float(args.sigma_init) ** 2,
-        s_alpha_init=float(args.s_alpha_init),
-        s_beta_init=float(args.s_beta_init),
-        s_gamma_init=float(args.s_gamma_init),
-        m0_alpha_init=(0.0 if args.level_mode == "none" else float(args.m0_level)),
-        P0_alpha_init=float(args.P0_alpha_init),
-        m0_beta_init=float(args.m0_trend if args.trend_mode != "none" else 0.0),
-        P0_beta_init=float(args.P0_beta_init),
-        m0_gamma_init=m0_gamma_init,  # newest-first, length p-1
-        P0_gamma_init=float(args.P0_gamma_init),
-        priors=priors,
-        cfg=cfg,
+        q_level=args.q_level,
+        q_trend=args.q_trend,
+        q_season=args.q_season,
+        m0_level=args.m0_level,
+        v0_level=args.v0_level,
+        m0_trend=args.m0_trend,
+        v0_trend=args.v0_trend,
+        m0_season=m0_season,
+        v0_season=v0_season,
+        start_date=start_date,
     )
 
-    # (optional) attach truths for saving/diagnostics
+    y = np.array([mts.move() or mts.measure() for _ in range(args.T)], float)
+    truths = mts.get_truth_paths(as_numpy=True)
+    mu_T = truths["mu_t"][1:1 + args.T]
+    dates_T = truths["index"][:args.T]
+
+    # --------------------------------------------------------------------------
+    # Build priors
+    # --------------------------------------------------------------------------
+    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
+    priors = Priors(
+        a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
+        m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
+        m_m0_beta=args.prior_m_m0_beta, s_m0_beta=args.prior_s_m0_beta,
+        m_m0_gamma=None if pri_gamma_vec is None else pri_gamma_vec,
+        s_m0_gamma=args.prior_s_m0_gamma,
+        a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
+        a_P0_beta=args.prior_a_P0_beta, b_P0_beta=args.prior_b_P0_beta,
+        a_P0_gamma=args.prior_a_P0_gamma, b_P0_gamma=args.prior_b_P0_gamma,
+        pc_alpha=PCScalePrior(a=args.pc_a_alpha, b=args.pc_b_alpha,
+                              frac=args.pc_frac, alpha_prob=args.pc_alpha_prob),
+        pc_beta=PCScalePrior(a=args.pc_a_beta, b=args.pc_b_beta,
+                             frac=args.pc_frac, alpha_prob=args.pc_alpha_prob),
+        pc_gamma=PCScalePrior(a=args.pc_a_gamma, b=args.pc_b_gamma,
+                              frac=args.pc_frac, alpha_prob=args.pc_alpha_prob),
+    )
+
+    # --------------------------------------------------------------------------
+    # Sampler config: build MHAdaptConfig, then SamplerConfig(mh=...)
+    # --------------------------------------------------------------------------
+    mh_cfg = MHAdaptConfig(
+        adapt=True,
+        burn_only=bool(args.mh_adapt_burn_only),
+        start_iter=1,
+        stop_iter=(None if args.mh_adapt_until <= 0 else int(args.mh_adapt_until)),
+        adapt_every=max(1, int(args.mh_adapt_every)),
+        target_acc=float(args.mh_target),
+        rm_c=1.0,
+        rm_t0=10.0,
+        rm_pow=0.5,
+        min_step=float(args.mh_min_step),
+        max_step=float(args.mh_max_step),
+        init_step_alpha=float(args.mh_init_step_alpha),
+        init_step_beta=float(args.mh_init_step_beta),
+        init_step_gamma=float(args.mh_init_step_gamma),
+        acc_ewma_decay=_window_to_decay(int(args.mh_adapt_window)),
+        ess_window=800,
+    )
+
+    cfg = SamplerConfig(
+        n_iter=int(args.n_iter), burn=int(args.burn), thin=int(args.thin),
+        random_seed=int(args.seed), progress=bool(args.progress),
+        progress_every=int(args.progress_every),
+        mh=mh_cfg,
+    )
+
+    # --------------------------------------------------------------------------
+    # Instantiate sampler
+    # --------------------------------------------------------------------------
+    m0_gamma_init = (
+        [float(z) for z in args.m0_gamma_init.split(",")] if args.m0_gamma_init else None
+    )
+
+    sampler = DLMGibbsConjugate(
+        y=y, period=args.period,
+        level_mode=args.level_mode, trend_mode=args.trend_mode, seasonal_mode=args.seasonal_mode,
+        sigma2_init=args.sigma_init ** 2,
+        s_alpha_init=args.s_alpha_init, s_beta_init=args.s_beta_init, s_gamma_init=args.s_gamma_init,
+        m0_alpha_init=args.m0_level, m0_beta_init=args.m0_trend,
+        P0_alpha_init=args.P0_alpha_init, P0_beta_init=args.P0_beta_init,
+        m0_gamma_init=m0_gamma_init, P0_gamma_init=args.P0_gamma_init,
+        priors=priors, cfg=cfg,
+    )
+
     sampler.set_truth(
-        sigma=mts.sigma,
-        Q=(mts.q_level, mts.q_trend, mts.q_season),
-        m0_level=mts.m0_level,
-        m0_trend=mts.m0_trend,
-        m0_season=mts.m0_season,
-        P0_level=mts.v0_level,
-        P0_trend=mts.v0_trend,
-        P0_season=mts.v0_season,
+        sigma=mts.sigma, Q=(mts.q_level, mts.q_trend, mts.q_season),
+        m0_level=mts.m0_level, m0_trend=mts.m0_trend, m0_season=mts.m0_season,
+        P0_level=mts.v0_level, P0_trend=mts.v0_trend, P0_season=mts.v0_season,
     )
-    sampler.set_truth_paths(mu=mu_T,
-                            alpha=(alpha_T if args.level_mode == "dynamic" else None),
-                            beta=(beta_T if args.trend_mode == "dynamic" else None),
-                            gamma=(gamma_T if args.seasonal_mode == "dynamic" else None))
+    sampler.set_truth_paths(mu=mu_T)
 
+    # ------------------------------ Run banner --------------------------------
     if args.print_summary:
-        with np.printoptions(suppress=True, precision=4):
-            print("\n--- Summary (simulation) ---")
-            print(f"level={mts.level_mode}, trend={mts.trend_mode}, season={mts.seasonal_mode}")
-            print(f"sigma={mts.sigma}, q_level={mts.q_level}, q_trend={mts.q_trend}, q_season={mts.q_season}")
-            print(f"m0_level={mts.m0_level}, v0_level={mts.v0_level}")
-            print(f"m0_trend={mts.m0_trend}, v0_trend={mts.v0_trend}")
-            print(f"m0_season={mts.m0_season}, v0_season={mts.v0_season}")
-            print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
-            print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
+        print(f"\nSimulated {args.T} observations (σ={mts.sigma}) with modes "
+              f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}.\n")
+        m = cfg.mh
+        print("Adaptive MH settings:")
+        print(f"  target={m.target_acc:.3f}, cadence=every {m.adapt_every} iters, "
+              f"{'burn-in only' if m.burn_only else 'adapt throughout'}, "
+              f"start_iter={m.start_iter}, stop_iter={m.stop_iter or 'auto'}")
+        print(f"  init steps: α={m.init_step_alpha:.3f}, β={m.init_step_beta:.3f}, "
+              f"γ={m.init_step_gamma:.3f} (clamped to [{m.min_step}, {m.max_step}])\n")
 
+    # --------------------------------------------------------------------------
+    # Run sampler
+    # --------------------------------------------------------------------------
     t0 = time.time()
     post = sampler.run()
     elapsed = time.time() - t0
-    print(f"Run time: {elapsed:.2f}s")
+    print(f"\n[Run completed in {elapsed:.1f}s]")
 
     out_dir = os.path.join(
         args.out_dir,
@@ -1090,62 +1224,54 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
     sampler.save_posterior(
         out_npz_path=os.path.join(out_dir, "posterior.npz"),
-        extra_meta={"elapsed_seconds": float(elapsed)}
+        extra_meta={
+            "elapsed_seconds": float(elapsed),
+            "mh_settings": {
+                "target": m.target_acc,
+                "init_step_alpha": m.init_step_alpha,
+                "init_step_beta": m.init_step_beta,
+                "init_step_gamma": m.init_step_gamma,
+                "min_step": m.min_step,
+                "max_step": m.max_step,
+                "adapt_every": m.adapt_every,
+                "acc_ewma_decay": m.acc_ewma_decay,
+                "burn_only": bool(m.burn_only),
+                "start_iter": m.start_iter,
+                "stop_iter": m.stop_iter,
+            },
+        },
     )
 
-    # ---- Print quick summaries ----
+    # --------------------------------------------------------------------------
+    # Summary output and optional plotting
+    # --------------------------------------------------------------------------
     if args.print_summary:
-        with np.printoptions(suppress=True, precision=4):
-            print("\n--- Summary (posterior means) ---")
-            print(f"σ: {np.mean(post['sigma']):.4g}")
-            if "Q_alpha" in post:
-                m = float(np.mean(post["Q_alpha"]))
-                print(f"Q_alpha: {m:.4g}  (√Q_alpha ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_alpha: n/a (level deterministic or none)")
-            if "Q_beta" in post:
-                m = float(np.mean(post["Q_beta"]))
-                print(f"Q_beta:  {m:.4g}  (√Q_beta  ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_beta: n/a (trend deterministic or none)")
-            if "Q_gamma" in post:
-                m = float(np.mean(post["Q_gamma"]))
-                print(f"Q_gamma: {m:.4g}  (√Q_gamma ≈ {math.sqrt(m):.4g})")
-            else:
-                print("Q_gamma: n/a (season deterministic or none)")
-            if "m0_alpha" in post:
-                if args.level_mode == "dynamic":
-                    print(f"m0_alpha: {np.mean(post['m0_alpha']):.4g}, P0_alpha: {np.mean(post['P0_alpha']):.4g}")
-                elif args.level_mode == "deterministic":
-                    print(f"m0_alpha: {np.mean(post['m0_alpha']):.4g} (det), P0_alpha: n/a (det)")
-            else:
-                print("m0_alpha: n/a")
-            if "m0_beta" in post:
-                if args.trend_mode == "dynamic":
-                    print(f"m0_beta:  {np.mean(post['m0_beta']):.4g}, P0_beta:  {np.mean(post['P0_beta']):.4g}")
-                elif args.trend_mode == "deterministic":
-                    print(f"m0_beta:  {np.mean(post['m0_beta']):.4g} (det), P0_beta: n/a (det)")
-            else:
-                print("m0_beta: n/a")
-            if "m0_gamma" in post:
-                means = np.mean(post["m0_gamma"], axis=0)
-                means = np.roll(means, 1)[:-1]  # put the "zero" at the end for printing
-                if args.seasonal_mode == "dynamic":
-                    print(f"m0_gamma: {means}, P0_gamma: {np.mean(post['P0_gamma']):.4g}")
-                elif args.seasonal_mode == "deterministic":
-                    print(
-                        f"m0_gamma: {np.array2string(means, precision=2, suppress_small=True)}, (det), P0_gamma: n/a (det)"
-                    )
+        print("\n--- Posterior means ---")
+        print(f"σ = {np.mean(post['sigma']):.4f}")
+        for k in ["alpha", "beta", "gamma"]:
+            key = f"Q_{k}"
+            if key in post:
+                mQ = np.mean(post[key])
+                print(f"Q_{k} = {mQ:.4g} (√Q ≈ {math.sqrt(mQ):.4g})")
+
+        # MH specifics (final steps + smoothed acc)
+        if hasattr(sampler, "_mh_state"):
+            print("\n--- MH specifics (final) ---")
+            for k in ["alpha", "beta", "gamma"]:
+                if k in sampler._mh_state:
+                    sst = sampler._mh_state[k]
+                    step = sst.get("step", float("nan"))
+                    acc  = sst.get("acc", float("nan"))
+                    nacc = sst.get("n_acc", None)
+                    natt = sst.get("n_prop", None)
+                    ratio = (f"{nacc}/{natt}" if (nacc is not None and natt is not None) else "—")
+                    print(f"  {k}: step={step:.4f}, acc≈{acc:.3f} ({ratio})")
 
     if args.plot:
         mu_hat = post["mu"].mean(axis=0)
         plt.figure(figsize=(10, 4))
-        plt.plot(dates_T, y, label=r"$y_t$", linewidth=1.0)
-        plt.plot(dates_T, mu_T, "--", label=r"$\mu_t$ (truth)", linewidth=1.0)
-        plt.plot(dates_T, mu_hat, "-.", label=r"$\hat{\mu}_t$ (post mean)", linewidth=1.0)
-        ttl = f"DLM: level={args.level_mode}, trend={args.trend_mode}, season={args.seasonal_mode}"
-        plt.title(ttl)
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        plt.plot(dates_T, y, label="y_t", lw=1)
+        plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
+        plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
+        plt.title(f"DLM ({args.level_mode}/{args.trend_mode}/{args.seasonal_mode})")
+        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()

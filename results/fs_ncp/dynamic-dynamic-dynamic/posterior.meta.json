@@ -1,0 +1,30 @@
+{
+  "S": 12,
+  "cfg": {
+    "n_iter": 10000,
+    "burn": 5000,
+    "thin": 2,
+    "seed": 42,
+    "progress": true,
+    "progress_every": 0
+  },
+  "priors": {
+    "c0": 2.0,
+    "g0": 1.0,
+    "kappa_var": 0.75,
+    "P0_alpha": 1.0,
+    "P0_beta": 1.0,
+    "P0_gamma": 1.0,
+    "V_sqrt_q_alpha": 1.0,
+    "V_sqrt_q_beta": 1.0,
+    "V_sqrt_q_gamma": 0.0,
+    "use_uniform_model_prior": true
+  },
+  "hyper": {
+    "c0": 2.0,
+    "g0": 1.0,
+    "G0": 37.59438583433009,
+    "C0": 0.07989099585038509
+  },
+  "elapsed_seconds": 44.79510259628296
+}
