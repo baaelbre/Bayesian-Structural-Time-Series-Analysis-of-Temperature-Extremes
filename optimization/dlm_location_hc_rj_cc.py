@@ -824,3 +824,319 @@ class DLM_CC:
         if extra_meta: meta.update(extra_meta)
         with open(out_npz_path.replace('.npz','.meta.json'),'w',encoding='utf-8') as f:
             json.dump(meta, f, indent=2)
+            
+if __name__ == "__main__":
+    import argparse
+    import json
+    import os
+    import sys
+    import time
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # --- optional simulator import (keeps your old workflow) ---
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(base_dir)
+
+    from simulator.mean_time_series import Mean_Time_Series  # newest-first convention
+
+
+    # ------------------------------- CLI ---------------------------------- #
+    p = argparse.ArgumentParser(
+        description=(
+            "Gaussian structural TS (level/trend/season) with Carlin–Chib model selection "
+            "+ conjugate Gibbs updates. If available, data are simulated via "
+            "simulator.mean_time_series.Mean_Time_Series.\n"
+            "When a block is non-dynamic, its m0_* acts as the deterministic parameter."
+        )
+    )
+
+    # Simulation (data-generating truth)
+    p.add_argument("--T", type=int, default=500)
+    p.add_argument("--period", type=int, default=4)
+    p.add_argument("--start-date", type=str, default="2000-01-01")
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--sigma", type=float, default=2.0)
+    p.add_argument("--q-level", type=float, default=0.001)
+    p.add_argument("--q-trend", type=float, default=0.00002)
+    p.add_argument("--q-season", type=float, default=0.005)
+    p.add_argument("--m0-level", type=float, default=3.0)
+    p.add_argument("--v0-level", type=float, default=0.05)
+    p.add_argument("--m0-trend", type=float, default=0.015)
+    p.add_argument("--v0-trend", type=float, default=0.05)
+    p.add_argument("--m0-season", type=str, default=None)   # CSV length p-1
+    p.add_argument("--v0-season", type=str, default=None)   # CSV length p-1
+
+    # Priors
+    p.add_argument("--prior-a-sigma", type=float, default=2.0)
+    p.add_argument("--prior-b-sigma", type=float, default=1.0)
+    p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
+    p.add_argument("--prior-m-m0-beta", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta", type=float, default=10.0)
+    p.add_argument("--prior-m-m0-gamma", type=str, default=None)  # CSV p-1
+    p.add_argument("--prior-s-m0-gamma", type=float, default=5.0)
+    p.add_argument("--prior-a-P0-alpha", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-beta", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-beta", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-gamma", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
+
+    # Half-Cauchy scales for process SDs
+    p.add_argument("--hc-scale-alpha", type=float, default=0.5)
+    p.add_argument("--hc-scale-beta",  type=float, default=0.5)
+    p.add_argument("--hc-scale-gamma", type=float, default=0.5)
+
+    # Mode prior (Occam tilt)
+    p.add_argument("--prior-model-level",  type=str, default=None,
+                help="CSV 'dynamic:0.5,deterministic:0.5,none:0.0' (normalized)")
+    p.add_argument("--prior-model-trend",  type=str, default=None)
+    p.add_argument("--prior-model-season", type=str, default=None)
+
+    # CC pseudo-prior tuning (σ on inactive-parameter Normal priors; variances for inactive P0/variances)
+    p.add_argument("--pp-m0-alpha-sd", type=float, default=5.0)
+    p.add_argument("--pp-m0-beta-sd",  type=float, default=5.0)
+    p.add_argument("--pp-m0-gamma-sd", type=float, default=3.0)
+    p.add_argument("--pp-P0-alpha-shape", type=float, default=5.0)
+    p.add_argument("--pp-P0-alpha-scale", type=float, default=1.0)
+    p.add_argument("--pp-P0-beta-shape",  type=float, default=5.0)
+    p.add_argument("--pp-P0-beta-scale",  type=float, default=1.0)
+    p.add_argument("--pp-P0-gamma-shape", type=float, default=5.0)
+    p.add_argument("--pp-P0-gamma-scale", type=float, default=1.0)
+    # innovation SD pseudo-priors (Half-Cauchy IG-mixture equivalents use same scales by default)
+    p.add_argument("--pp-hc-alpha", type=float, default=0.7)
+    p.add_argument("--pp-hc-beta",  type=float, default=0.7)
+    p.add_argument("--pp-hc-gamma", type=float, default=0.7)
+
+    # Sampler configuration
+    p.add_argument("--n-iter", type=int, default=30000)
+    p.add_argument("--burn", type=int, default=10000)
+    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--seed", type=int, default=40)
+    p.add_argument("--progress", default=True)
+    p.add_argument("--progress-every", type=int, default=1)
+    p.add_argument("--out-dir", type=str, default="results/simulations/DLM_CC")
+    p.add_argument("--plot", default=True)
+    p.add_argument("--print-summary", default=True)
+
+    # Initial inference values (starting point)
+    p.add_argument("--sigma-init", type=float, default=1.0)
+    p.add_argument("--s-alpha-init", type=float, default=1.0)
+    p.add_argument("--s-beta-init",  type=float, default=1.0)
+    p.add_argument("--s-gamma-init", type=float, default=1.0)
+    p.add_argument("--m0-gamma-init", type=str, default=None)  # CSV p-1
+    p.add_argument("--P0-alpha-init", type=float, default=0.05)
+    p.add_argument("--P0-beta-init",  type=float, default=0.05)
+    p.add_argument("--P0-gamma-init", type=float, default=0.05)
+
+    # “Allow none” flags (if you want to forbid the none model, its prior mass is set ~0)
+    p.add_argument("--allow-none-level", default=False)
+    p.add_argument("--allow-none-trend", default=True)
+    p.add_argument("--allow-none-season", default=False)
+
+    args = p.parse_args()
+    rng = np.random.default_rng(args.seed)
+
+    # ------------------------------ helpers -------------------------------- #
+    def _parse_date(s: str | None):
+        from datetime import datetime
+        if not s:
+            return datetime.today()
+        parts = [int(p) for p in s.split("-")]
+        if len(parts) == 1:
+            return datetime(parts[0], 1, 1)
+        if len(parts) == 2:
+            return datetime(parts[0], parts[1], 1)
+        if len(parts) == 3:
+            return datetime(parts[0], parts[1], parts[2])
+        raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+    def _csv_floats_or_none(s: str | None):
+        if s is None:
+            return None
+        s = s.strip()
+        if s == "":
+            return None
+        return [float(z) for z in s.split(",") if z.strip() != ""]
+
+    def _csv_model_prior_block(s: str | None, allow_none: bool, defaults: dict) -> dict:
+        out = dict(defaults)
+        if s:
+            pieces = [p.strip() for p in s.split(",") if p.strip()]
+            for pz in pieces:
+                k, v = pz.split(":")
+                out[k.strip()] = float(v)
+        if not allow_none:
+            out["none"] = min(out.get("none", 1e-12), 1e-12)
+        ssum = sum(out.values())
+        if ssum <= 0:
+            dsum = sum(defaults.values())
+            out = {k: v / dsum for k, v in defaults.items()}
+        else:
+            out = {k: v / ssum for k, v in out.items()}
+        return out
+
+    # --------------------------- simulate data ----------------------------- #
+
+    start_date = _parse_date(args.start_date)
+    m0_season = _csv_floats_or_none(args.m0_season) or [1.0] * (args.period - 1)
+    v0_season = _csv_floats_or_none(args.v0_season) or [0.05] * (args.period - 1)
+    mts = Mean_Time_Series(
+                sigma=args.sigma,
+                period=args.period,
+                level_mode=args.level_mode,
+                trend_mode=args.trend_mode,
+                seasonal_mode=args.seasonal_mode,
+                q_level=args.q_level,
+                q_trend=args.q_trend,
+                q_season=args.q_season,
+                m0_level=args.m0_level,
+                v0_level=args.v0_level,
+                m0_trend=args.m0_trend,
+                v0_trend=args.v0_trend,
+                m0_season=m0_season,
+                v0_season=v0_season,
+                start_date=start_date,
+            )
+    y = np.array([mts.move() or mts.measure() for _ in range(args.T)], float)
+    truths = mts.get_truth_paths(as_numpy=True)
+    mu_T = truths["mu_t"][1 : 1 + args.T]
+    dates_T = truths["index"][: args.T]
+
+
+    # ------------------------------- priors -------------------------------- #
+    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
+    priors = Priors(
+        a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
+        m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
+        m_m0_beta=args.prior_m_m0_beta,   s_m0_beta=args.prior_s_m0_beta,
+        m_m0_gamma=None if pri_gamma_vec is None else pri_gamma_vec,
+        s_m0_gamma=args.prior_s_m0_gamma,
+        a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
+        a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
+        a_P0_gamma=args.prior_a_P0_gamma, b_P0_gamma=args.prior_b_P0_gamma,
+        hc_scale_alpha=args.hc_scale_alpha,
+        hc_scale_beta=args.hc_scale_beta,
+        hc_scale_gamma=args.hc_scale_gamma,
+    )
+
+    # ---------------------------- mode priors ------------------------------ #
+    default_model_prior = {
+        "level":  {"dynamic": 0.5, "deterministic": 0.5, "none": 1e-12},
+        "trend":  {"dynamic": 0.5, "deterministic": 0.5, "none": 0.4 if args.allow_none_trend else 1e-12},
+        "season": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.2 if args.allow_none_season else 1e-12},
+    }
+    model_prior = {
+        "level":  _csv_model_prior_block(args.prior_model_level,  args.allow_none_level,  default_model_prior["level"]),
+        "trend":  _csv_model_prior_block(args.prior_model_trend,  args.allow_none_trend,  default_model_prior["trend"]),
+        "season": _csv_model_prior_block(args.prior_model_season, args.allow_none_season, default_model_prior["season"]),
+    }
+
+    # -------------------------- pseudo-priors ------------------------------ #
+    pseudo = PseudoPriors(
+        s_m0_alpha=args.pp_m0_alpha_sd,
+        s_m0_beta=args.pp_m0_beta_sd,
+        s_m0_gamma=args.pp_m0_gamma_sd,
+        P0_alpha_shape=args.pp_P0_alpha_shape, P0_alpha_scale=args.pp_P0_alpha_scale,
+        P0_beta_shape =args.pp_P0_beta_shape,  P0_beta_scale =args.pp_P0_beta_scale,
+        P0_gamma_shape=args.pp_P0_gamma_shape, P0_gamma_scale=args.pp_P0_gamma_scale,
+        hc_scale_alpha=args.pp_hc_alpha, hc_scale_beta=args.pp_hc_beta, hc_scale_gamma=args.pp_hc_gamma,
+    )
+
+    # ------------------------- sampler config ------------------------------ #
+    cfg = SamplerConfig(
+        n_iter=int(args.n_iter),
+        burn=int(args.burn),
+        thin=int(args.thin),
+        random_seed=int(args.seed),
+        progress=bool(args.progress),
+        progress_every=int(args.progress_every),
+        # allow_none_* are interpreted by your mode prior construction (kept for parity)
+        allow_none_level=bool(args.allow_none_level),
+        allow_none_trend=bool(args.allow_none_trend),
+        allow_none_season=bool(args.allow_none_season),
+    )
+
+    # ---------------------------- build sampler ---------------------------- #
+    m0_gamma_init = _csv_floats_or_none(args.m0_gamma_init)
+    sampler = DLM_CC(
+        y=y, period=args.period,
+        # you can choose starting modes; deterministic start mirrors your previous entry point
+        level_mode="deterministic", trend_mode="deterministic", seasonal_mode="deterministic",
+        sigma2_init=args.sigma_init**2,
+        s_alpha_init=args.s_alpha_init, s_beta_init=args.s_beta_init, s_gamma_init=args.s_gamma_init,
+        m0_alpha_init=args.m0_level, m0_beta_init=args.m0_trend,
+        m0_gamma_init=m0_gamma_init,
+        P0_alpha_init=args.P0_alpha_init, P0_beta_init=args.P0_beta_init, P0_gamma_init=args.P0_gamma_init,
+        priors=priors, pseudo=pseudo, cfg=cfg, model_prior=model_prior, rng=rng,
+    )
+
+    # ------------------------------ summary -------------------------------- #
+    if args.print_summary:
+        if Mean_Time_Series is not None:
+            print(
+                f"\nSimulated {args.T} observations (σ={args.sigma}) with TRUE modes "
+                f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}."
+            )
+        else:
+            print(f"\nSimulated fallback synthetic series of length {args.T}.")
+        print("Sampler START modes: det/det/det (Carlin–Chib evaluates all modes each sweep)\n")
+        print("Half-Cauchy scales (A_k) for process SDs:")
+        print(f"  A_alpha={priors.hc_scale_alpha:.3f}, A_beta={priors.hc_scale_beta:.3f}, "
+            f"A_gamma={priors.hc_scale_gamma:.3f}")
+        print("\nMode priors (normalized):")
+        for k in ("level", "trend", "season"):
+            mp = model_prior[k]
+            print(f"  {k:6s}: dyn={mp['dynamic']:.3f}, det={mp['deterministic']:.3f}, none={mp['none']:.3f}")
+
+    # ------------------------------- run ----------------------------------- #
+    t0 = time.time()
+    post = sampler.run()
+    elapsed = time.time() - t0
+    print(f"\n[Run completed in {elapsed:.1f}s]")
+
+    # ------------------------------- save ---------------------------------- #
+    out_dir = os.path.join(
+        args.out_dir,
+        f"CC__truth_{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}__{time.strftime('%Y%m%d_%H%M%S')}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+
+    sampler.save_posterior(
+        out_npz_path=os.path.join(out_dir, "posterior.npz"),
+        extra_meta={
+            "elapsed_seconds": float(elapsed),
+            "sim_truth_modes": {
+                "level": args.level_mode, "trend": args.trend_mode, "season": args.seasonal_mode
+            },
+            "start_modes": {"level": "deterministic", "trend": "deterministic", "season": "deterministic"},
+            "hc_scales": {"alpha": priors.hc_scale_alpha, "beta": priors.hc_scale_beta, "gamma": priors.hc_scale_gamma},
+            "model_prior": model_prior,
+        },
+    )
+
+    # ------------------------------- plot ---------------------------------- #
+    if args.plot:
+        mu_hat = post["mu"].mean(axis=0)
+        plt.figure(figsize=(10, 4))
+        plt.plot(dates_T, y, label="y_t", lw=1)
+        plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
+        plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
+        plt.title(
+            "DLM Carlin–Chib — current modes: "
+            f"{sampler.level_mode}/{sampler.trend_mode}/{sampler.seasonal_mode}"
+        )
+        plt.grid(True); plt.legend(); plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "fit.png"), dpi=160)
+        plt.show()
+
+    # Inclusion probabilities from CC tallies
+    inc = sampler.inclusion_probabilities()
+    with open(os.path.join(out_dir, "inclusion_probs.json"), "w", encoding="utf-8") as f:
+        json.dump(inc, f, indent=2)
+
+    print(f"[save] Outputs written to: {out_dir}")
+
