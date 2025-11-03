@@ -1045,6 +1045,46 @@ class DLM_CC:
         with open(out_npz_path.replace(".npz", ".meta.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
+def _parse_date(s: str | None):
+    from datetime import datetime
+    if not s:
+        return datetime.today()
+    parts = [int(p) for p in s.split("-")]
+    if len(parts) == 1:
+        return datetime(parts[0], 1, 1)
+    elif len(parts) == 2:
+        return datetime(parts[0], parts[1], 1)
+    elif len(parts) == 3:
+        return datetime(parts[0], parts[1], parts[2])
+    raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+
+def _csv_floats_or_none(s: str | None):
+    if s is None:
+        return None
+    s = s.strip()
+    if s == "":
+        return None
+    return [float(z) for z in s.split(",") if z.strip() != ""]
+
+
+def _csv_model_prior_block(s: str | None, allow_none: bool, defaults: dict) -> dict:
+    out = dict(defaults)
+    if s:
+        pieces = [p.strip() for p in s.split(",") if p.strip()]
+        for p in pieces:
+            k, v = p.split(":")
+            out[k.strip()] = float(v)
+    if not allow_none:
+        out["none"] = min(out.get("none", 1e-12), 1e-12)
+    ssum = sum(out.values())
+    if ssum <= 0:
+        dsum = sum(defaults.values())
+        out = {k: v / dsum for k, v in defaults.items()}
+    else:
+        out = {k: v / ssum for k, v in out.items()}
+    return out
+
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -1119,7 +1159,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
-    p.add_argument("--out-dir", type=str, default="results/simulations/DLM_CC")
+    p.add_argument("--out-dir", type=str, default="results/simulations/DLM")
     p.add_argument("--plot", default=True)
     p.add_argument("--print-summary", default=True)
 
