@@ -1259,9 +1259,9 @@ if __name__ == "__main__":
     p.add_argument("--prior-model-season", type=str, default=None)
 
     # Sampler configuration
-    p.add_argument("--n-iter", type=int, default=30000)
-    p.add_argument("--burn", type=int, default=10000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
@@ -1347,9 +1347,9 @@ if __name__ == "__main__":
 
     # Model prior (for Δ log posterior)
     default_model_prior = {
-        "level": {"dynamic": 0.5, "deterministic": 0.5, "none": 1e-12},
-        "trend": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.4 if args.allow_none_trend else 1e-12},
-        "season": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.2 if args.allow_none_season else 1e-12},
+        "level": {"dynamic": 0.1, "deterministic": 0.9, "none": 1e-12},
+        "trend": {"dynamic": 0.1, "deterministic": 0.9, "none": 0.4 if args.allow_none_trend else 1e-12},
+        "season": {"dynamic": 0.1, "deterministic": 0.9, "none": 0.2 if args.allow_none_season else 1e-12},
     }
     model_prior = {
         "level": _csv_model_prior_block(args.prior_model_level, args.allow_none_level, default_model_prior["level"]),
