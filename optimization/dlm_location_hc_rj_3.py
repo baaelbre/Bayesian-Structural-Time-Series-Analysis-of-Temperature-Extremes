@@ -939,6 +939,26 @@ class DLMRJGibbs:
             )
             self.m0_gamma = base.astype(float)
         self._m0_gamma_full = np.r_[self.m0_gamma, -float(np.sum(self.m0_gamma))]
+        
+    def _mh_accept(self, dlogpost: float) -> bool:
+        """Log-space Metropolis–Hastings accept/reject to avoid exp overflow/underflow."""
+        if not np.isfinite(dlogpost):
+            return False
+        if dlogpost >= 0.0:
+            return True
+        # accept with prob exp(dlogpost) without computing exp directly
+        return (math.log(self.rng.uniform()) < dlogpost)
+
+    def _safe_logpost(self) -> float:
+        """Compute current log posterior; return -inf on any numerical failure."""
+        try:
+            ll = self._kalman_loglik()
+            lp = self._log_prior_current()
+            s = ll + lp
+            return float(s) if np.isfinite(s) else float("-inf")
+        except Exception:
+            return float("-inf")
+
 
     def _rj_move_one(self) -> None:
         comps = ["level", "trend", "season"]
@@ -965,9 +985,10 @@ class DLMRJGibbs:
             self._rj_record(comp, False)
             return
 
+        # snapshot current state
         cur_snap = self._snapshot()
 
-        # births: draw proposed dynamic block params
+        # births: draw priors for newly-dynamic blocks
         if (level != "dynamic") and (new_level == "dynamic"):
             self._draw_prior_dyn_block("level")
         if (trend != "dynamic") and (new_trend == "dynamic"):
@@ -975,6 +996,7 @@ class DLMRJGibbs:
         if (season != "dynamic") and (new_season == "dynamic"):
             self._draw_prior_dyn_block("season")
 
+        # becoming deterministic season → initialize deterministic vector + zero P0
         if (season != "deterministic") and (new_season == "deterministic"):
             base = (
                 np.zeros(self.period - 1)
@@ -985,7 +1007,7 @@ class DLMRJGibbs:
             self._m0_gamma_full = np.r_[self.m0_gamma, -float(np.sum(self.m0_gamma))]
             self.P0_gamma = 0.0
 
-        # apply proposed modes
+        # apply proposal modes (temporarily) to compute proposed log posterior
         self.level_mode, self.trend_mode, self.seasonal_mode = new_level, new_trend, new_season
         self._layout = _Layout(self.period, self.level_mode, self.trend_mode, self.seasonal_mode)
         if self.level_mode != "dynamic":
@@ -999,23 +1021,29 @@ class DLMRJGibbs:
         else:
             self._m0_gamma_full = None
 
-        # proposed log posterior
-        logpost_prop = self._kalman_loglik() + self._log_prior_current()
+        logpost_prop = self._safe_logpost()  # <- robust
 
-        # current log posterior
+        # restore current modes and compute current log posterior
         self._load_snapshot(cur_snap)
-        logpost_cur = self._kalman_loglik() + self._log_prior_current()
+        logpost_cur = self._safe_logpost()  # <- robust
+
+        # if either side is -inf (non-finite), hard-reject
+        if not np.isfinite(logpost_prop) or not np.isfinite(logpost_cur):
+            self._rj_record(comp, False)
+            return
 
         dlogpost = logpost_prop - logpost_cur
-        acc_prob = min(1.0, math.exp(dlogpost))
-        accept = (self.rng.uniform() < acc_prob)
+        accept = self._mh_accept(dlogpost)  # <- log-space MH
         self._rj_record(comp, bool(accept))
 
-        if accept:
-            # adopt proposal
-            self._load_snapshot(cur_snap)
-            before = (self.level_mode, self.trend_mode, self.seasonal_mode)
+        # for printing only: clip Δlogpost to keep lines readable
+        disp_dlog = float(np.clip(dlogpost, -1e3, 1e3)) if np.isfinite(dlogpost) else float('nan')
 
+        if accept:
+            # re-apply the accepted modes and re-allocate state holder
+            before = (self.level_mode, self.trend_mode, self.seasonal_mode)
+            # load snapshot, then set to proposed
+            self._load_snapshot(cur_snap)
             self.level_mode, self.trend_mode, self.seasonal_mode = new_level, new_trend, new_season
             if self.level_mode != "dynamic":
                 self.s_alpha = 0.0
@@ -1027,7 +1055,6 @@ class DLMRJGibbs:
                 self._ensure_det_season_defaults()
             else:
                 self._m0_gamma_full = None
-
             self._layout = _Layout(self.period, self.level_mode, self.trend_mode, self.seasonal_mode)
             self._alloc_state_holder()
 
@@ -1035,8 +1062,9 @@ class DLMRJGibbs:
             print(
                 f"[switch] block={comp} | "
                 f"L:{before[0][:3]}→{after[0][:3]} T:{before[1][:3]}→{after[1][:3]} S:{before[2][:3]}→{after[2][:3]} | "
-                f"Δlogpost={dlogpost:+.4f} | RJ {self._fmt_rj_all()}"
+                f"Δlogpost={disp_dlog:+.4f} | RJ {self._fmt_rj_all()}"
             )
+
 
     # ------------------------------ bookkeeping ---------------------------- #
 
