@@ -1,10 +1,22 @@
 from __future__ import annotations
 """
-DLM Plotter (skip-empty + truth-on-hists)
------------------------------------------
-- Skips plots with no finite data (axes removed).
-- When a histogram IS plotted, draws all available truth verticals.
-- Same feature set and CLI as before; still NumPy/Matplotlib only.
+DLM Plotter — fully rewritten (robust to RJ and missing meta)
+=============================================================
+- Skips panels with no finite data (axes removed).
+- Truth verticals reuse the histogram color.
+- Covers σ, Q (log10), m0_*, P0_*, deterministic aliases (α_det, β_det, season_det[i]).
+- Includes overview, states, decomposition (α/β/γ), grouped traces/posteriors, m0/P0, correlation heatmap,
+  RJ traces-only, and a quick 3-panel report.
+- CLI compatible with previous script; adds --skip-decomposition and better meta fallbacks.
+
+Key robustness changes
+----------------------
+- Accepts meta["layout"] *or* meta["layout_labels"]. If both missing, infers canonical order
+  ["alpha","beta","g1",...,"g{p-1}"] from x's trailing dimension.
+- If indices still missing but x exists, assumes canonical (alpha=0, beta=1, g1=2).
+- Decomposition no longer silently fails when layout is absent.
+- Works whether you saved Q_* or s_*; and whether sigma or sigma2 is present.
+- Seasonal newest-first: γ_t is first seasonal coord (g1) in x.
 """
 
 import os, re, sys, math, json, argparse
@@ -12,7 +24,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Optional helper import; code runs without it
+# ---------- Optional helper import; code runs without it ----------
 try:
     sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
     from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
@@ -20,11 +32,12 @@ except Exception:  # pragma: no cover
     load_posterior = None
     find_latest_run = None
 
-# --------------------- small utils ---------------------
+# ===================== Small utils =====================
 EPS = 1e-12
 
 def _ensure_dir(p: Optional[str]):
-    if p: os.makedirs(p, exist_ok=True)
+    if p:
+        os.makedirs(p, exist_ok=True)
 
 def _san(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s))
@@ -94,7 +107,22 @@ def _uniq_legend(ax):
         u = dict(zip(l, h))
         ax.legend(u.values(), u.keys(), fontsize=8, loc="best")
 
-# --------------------- truth helpers ---------------------
+def _hist_and_color(ax, data, **kwargs):
+    """
+    Draw a histogram and return the facecolor used for that series.
+    Returns (color_rgba, patches).
+    """
+    n, bins, patches = ax.hist(data, **kwargs)
+    col = None
+    for p in patches:
+        col = p.get_facecolor()
+        if col is not None:
+            break
+    if col is None:
+        col = kwargs.get("color", None)
+    return col, patches
+
+# ===================== Truth helpers =====================
 TRUTH_KEYS = {
     "mu": ("true_mu_t", "mu_t_truth"),
     "alpha": ("true_alpha_t", "alpha_t_truth"),
@@ -109,9 +137,35 @@ def _truth_paths(draws: Dict[str, Any]) -> Dict[str, Optional[np.ndarray]]:
         out[k] = None if v is None else np.asarray(v, float)
     return out
 
-def _layout_idxs(meta: Dict[str, Any], period: int) -> Dict[str, Optional[int]]:
+# --- Layout inference ---
+
+def _canonical_layout_from_x(draws: Dict[str, Any], period: int) -> List[str]:
+    """If x exists, infer canonical labels in order [alpha, beta, g1..gK]."""
+    x = draws.get("x")
+    if x is None or getattr(x, "ndim", 0) != 3 or x.shape[2] == 0:
+        return []
+    K = max(0, period - 1)
+    dim = x.shape[2]
+    want = 2 + K
+    if dim < want:
+        # fallback to dim-based
+        names = ["alpha", "beta"] + [f"g{k}" for k in range(1, max(1, dim - 1))]
+        return names[:dim]
+    return ["alpha", "beta"] + [f"g{k}" for k in range(1, period)]
+
+
+def _layout_list(meta: Dict[str, Any], draws: Dict[str, Any], period: int) -> List[str]:
+    lay = meta.get("layout")
+    if not lay:
+        lay = meta.get("layout_labels")
+    if not lay:
+        lay = _canonical_layout_from_x(draws, period)
+    return list(lay) if lay else []
+
+
+def _layout_idxs(meta: Dict[str, Any], draws: Dict[str, Any], period: int) -> Dict[str, Optional[int]]:
     idx_alpha = idx_beta = idx_g_first = idx_g_last = None
-    lay = meta.get("layout") or []
+    lay = _layout_list(meta, draws, period)
     try:
         if "alpha" in lay: idx_alpha = lay.index("alpha")
         if "beta"  in lay: idx_beta  = lay.index("beta")
@@ -122,7 +176,18 @@ def _layout_idxs(meta: Dict[str, Any], period: int) -> Dict[str, Optional[int]]:
             if last_name in lay: idx_g_last = lay.index(last_name)
     except Exception:
         pass
+
+    # If still missing but x exists, assume canonical order
+    x = draws.get("x")
+    if x is not None and getattr(x, "ndim", 0) == 3 and x.shape[2] >= 1:
+        if idx_alpha is None: idx_alpha = 0 if x.shape[2] >= 1 else None
+        if idx_beta  is None: idx_beta  = 1 if x.shape[2] >= 2 else None
+        if idx_g_first is None:
+            idx_g_first = 2 if x.shape[2] >= 3 else None
+            if idx_g_first is not None:
+                idx_g_last = x.shape[2] - 1
     return {"idx_alpha": idx_alpha, "idx_beta": idx_beta, "idx_g_first": idx_g_first, "idx_g_last": idx_g_last}
+
 
 def _to_Q(draws: Dict[str, Any], w: str) -> Optional[np.ndarray]:
     if f"Q_{w}" in draws: return np.asarray(draws[f"Q_{w}"]).ravel()
@@ -131,9 +196,11 @@ def _to_Q(draws: Dict[str, Any], w: str) -> Optional[np.ndarray]:
         return s * s
     return None
 
+
 def _truth_sigma(draws: Dict[str, Any]) -> Optional[float]:
     v = _maybe(draws, "true_sigma")
     return None if v is None else float(v)
+
 
 def _truth_Q(draws: Dict[str, Any], comp: str, idxs: Dict[str, Optional[int]]) -> Optional[float]:
     QQ = _maybe(draws, "true_Q")
@@ -149,6 +216,7 @@ def _truth_Q(draws: Dict[str, Any], comp: str, idxs: Dict[str, Optional[int]]) -
     except Exception:
         return None
 
+
 def _truth_m0(draws: Dict[str, Any], name: str, period: int) -> Optional[float]:
     if name == "m0_α": return _maybe(draws, "true_m0_alpha")
     if name == "m0_β": return _maybe(draws, "true_m0_beta")
@@ -162,6 +230,7 @@ def _truth_m0(draws: Dict[str, Any], name: str, period: int) -> Optional[float]:
         if j == period - 1 and v.size == period - 1: return float(-np.sum(v))
     return None
 
+
 def _truth_P0(draws: Dict[str, Any], name: str) -> Optional[float]:
     if name == "P0_α": return _maybe(draws, "true_P0_alpha")
     if name == "P0_β": return _maybe(draws, "true_P0_beta")
@@ -171,6 +240,7 @@ def _truth_P0(draws: Dict[str, Any], name: str) -> Optional[float]:
         arr = np.asarray(v, float).ravel()
         return float(arr[0]) if arr.size else None
     return None
+
 
 def _truth_det(draws: Dict[str, Any], name: str, period: int) -> Optional[float]:
     if name == "α_det": return _maybe(draws, "true_m0_alpha")
@@ -185,13 +255,14 @@ def _truth_det(draws: Dict[str, Any], name: str, period: int) -> Optional[float]
         if j == period - 1 and v.size == period - 1: return float(-np.sum(v))
     return None
 
-# --------------------- main plotter ---------------------
+# ===================== Main plotter =====================
 class DLMPlotter:
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90, trace_decimate: int = 1):
         self.d, self.meta, self.level = draws, meta, float(level)
         if not (0 < self.level < 1):
             raise ValueError("level in (0,1)")
-        self.T = int(meta.get("T") or draws["mu"].shape[1])
+        # derive T robustly
+        self.T = int(meta.get("T") or np.asarray(draws.get("mu")).shape[1])
         self.period = int(meta.get("period", 12))
         self.band = f"{int(round(self.level * 100))}% band"
         self.y = _maybe(draws, "y")
@@ -202,12 +273,12 @@ class DLMPlotter:
         self.t_g  = paths["gamma"]
         self.trace_decimate = max(1, int(trace_decimate))
 
-        # sigma and Qs
+        # σ and Qs (accept sigma or sigma2)
         self.sigma = (np.asarray(draws.get("sigma", []), float).ravel() if "sigma" in draws else
                       (np.sqrt(np.clip(np.asarray(draws.get("sigma2", []), float), 0, None)).ravel()
                        if "sigma2" in draws else None))
         self.Qa, self.Qb, self.Qg = _to_Q(draws, "alpha"), _to_Q(draws, "beta"), _to_Q(draws, "gamma")
-        self.idxs = _layout_idxs(meta, self.period)
+        self.idxs = _layout_idxs(meta, draws, self.period)
 
     # ---------- parameter families ----------
     def _families(self) -> Dict[str, List[Tuple[str, np.ndarray]]]:
@@ -215,29 +286,28 @@ class DLMPlotter:
         def add(g, n, a): f.setdefault(g, []).append((n, np.asarray(a).ravel()))
         d = self.d
         if self.sigma is not None and self.sigma.size: add("sigma", "σ", self.sigma)
-        if self.Qa is not None and self.Qa.size:    add("Q", "Q_α", self.Qa)
-        if self.Qb is not None and self.Qb.size:    add("Q", "Q_β", self.Qb)
-        if self.Qg is not None and self.Qg.size:    add("Q", "Q_γ", self.Qg)
+        if self.Qa is not None and self.Qa.size:       add("Q", "Q_α", self.Qa)
+        if self.Qb is not None and self.Qb.size:       add("Q", "Q_β", self.Qb)
+        if self.Qg is not None and self.Qg.size:       add("Q", "Q_γ", self.Qg)
         for k, nm in (("lambda_alpha","λ_α"),("lambda_beta","λ_β"),("lambda_gamma","λ_γ")):
             if k in d and np.size(d[k]): add("lambda", nm, d[k])
         if "m0_alpha" in d and np.size(d["m0_alpha"]): add("m0", "m0_α", d["m0_alpha"])
-        if "m0_beta" in d and np.size(d["m0_beta"]):  add("m0", "m0_β", d["m0_beta"])
+        if "m0_beta"  in d and np.size(d["m0_beta"]):  add("m0", "m0_β", d["m0_beta"])
         if "m0_gamma" in d:
             mg = np.asarray(d["m0_gamma"])
             if mg.ndim == 2 and mg.size:
                 for j in range(mg.shape[1]): add("m0", f"m0_γ[{j}]", mg[:, j])
         if "P0_alpha" in d and np.size(d["P0_alpha"]): add("P0", "P0_α", d["P0_alpha"])
-        if "P0_beta" in d and np.size(d["P0_beta"]):  add("P0", "P0_β", d["P0_beta"])
+        if "P0_beta"  in d and np.size(d["P0_beta"]):  add("P0", "P0_β", d["P0_beta"])
         if "P0_gamma" in d and np.size(d["P0_gamma"]): add("P0", "P0_γ", d["P0_gamma"])
         if "m0_alpha_det" in d and np.size(d["m0_alpha_det"]): add("deterministic", "α_det", d["m0_alpha_det"])
-        if "m0_beta_det" in d and np.size(d["m0_beta_det"]):  add("deterministic", "β_det", d["m0_beta_det"])
+        if "m0_beta_det"  in d and np.size(d["m0_beta_det"]):  add("deterministic", "β_det", d["m0_beta_det"])
         if "season_det" in d:
             S = np.asarray(d["season_det"])
             if S.ndim == 2 and S.size:
                 for j in range(S.shape[1]): add("season_det", f"season_det[{j}]", S[:, j])
         return f
 
-    # ---------- utilities for dynamic grids ----------
     @staticmethod
     def _filter_items_with_finite(items: List[Tuple[str, np.ndarray]]) -> List[Tuple[str, np.ndarray]]:
         out: List[Tuple[str, np.ndarray]] = []
@@ -247,7 +317,7 @@ class DLMPlotter:
                 out.append((name, arrf))
         return out
 
-    # ---------- trace + ACF ----------
+    # ---------- traces + ACF ----------
     def _fig_traces(self, fam, items, outdir, show, L, decimate: int):
         items = self._filter_items_with_finite(items)
         if not items: return None
@@ -273,18 +343,20 @@ class DLMPlotter:
         plt.show() if show else plt.close(fig)
         return path
 
-    # ---------- posteriors (truth lines drawn if histogram exists) ----------
+    # ---------- posteriors (truth lines colored like the bars) ----------
     def _fig_posts(self, fam, items, outdir, show):
         items = self._filter_items_with_finite(items)
         if not items: return None
         C = 2 if len(items) >= 4 else 1
         R = int(np.ceil(len(items) / C))
         fig, axs = plt.subplots(R, C, figsize=(6 * C + 1, 2.8 * R), squeeze=False)
+
         for k, (name, s) in enumerate(items):
             r, c = divmod(k, C); ax = axs[r, c]
-            ax.hist(s, bins=40, density=True, alpha=0.85, label=name)
-            ax.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean")
-            ax.axvline(float(np.median(s)), ls=":", lw=1.0, label="median")
+            col, _ = _hist_and_color(ax, s, bins=40, density=True, alpha=0.85, label=name)
+            ax.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean", color=col)
+            ax.axvline(float(np.median(s)), ls=":", lw=1.0, label="median", color=col)
+
             tv = None
             if   name == "σ": tv = _truth_sigma(self.d)
             elif name == "Q_α": tv = _truth_Q(self.d, "alpha", self.idxs)
@@ -293,11 +365,15 @@ class DLMPlotter:
             elif name.startswith("m0_"): tv = _truth_m0(self.d, name, self.period)
             elif name.startswith("P0_"): tv = _truth_P0(self.d, name)
             elif name in {"α_det","β_det"} or name.startswith("season_det"): tv = _truth_det(self.d, name, self.period)
+
             if tv is not None and np.isfinite(tv):
-                ax.axvline(float(tv), color="k", lw=1.6, ls="-", label="truth")
+                ax.axvline(float(tv), color=col, lw=1.6, ls="-", label="truth")
+
             ax.set_title(name); _uniq_legend(ax)
+
         for k in range(len(items), R*C):
             r, c = divmod(k, C); axs[r, c].axis("off")
+
         fig.suptitle(f"Posteriors — {fam}", y=0.995)
         fig.tight_layout(rect=[0, 0, 1, 0.98])
         path = None
@@ -322,60 +398,61 @@ class DLMPlotter:
         if self.t_mu is not None and len(self.t_mu)==self.T: axs[0].plot(self.t_mu, lw=1.2, ls="--", label="true μ")
         axs[0].set_title("Posterior μ_t"); axs[0].legend(loc="upper left")
 
-        # σ trace/hist (skip if no finite)
+        # σ trace/hist
         if self.sigma is not None and self.sigma.size:
             sfin = _finite(self.sigma)
             if sfin.size:
                 sig = sfin[::self.trace_decimate]
                 axs[1].plot(sig, lw=1); axs[1].set_title("trace: σ")
-                axs[2].hist(sfin, bins=40, density=True)
+                col, _ = _hist_and_color(axs[2], sfin, bins=40, density=True)
                 es = _ess(sfin); gz = _geweke(sfin); ts = _truth_sigma(self.d)
-                if ts is not None and np.isfinite(ts): axs[2].axvline(float(ts), color="k", lw=1.6, label="truth")
+                if ts is not None and np.isfinite(ts): axs[2].axvline(float(ts), color=col, lw=1.6, label="truth")
                 axs[2].set_title(f"posterior: σ (ESS≈{es:.0f}, z≈{gz:.2f})"); _uniq_legend(axs[2])
             else:
                 axs[1].axis("off"); axs[2].axis("off")
         else:
             axs[1].axis("off"); axs[2].axis("off")
 
-        # log10(Q) panel (skip if none finite)
-        ax = axs[3]; plotted = False
-        for Q, label in ((self.Qa,"α"),(self.Qb,"β"),(self.Qg,"γ")):
+        # log10(Q)
+        ax = axs[3]; plotted = False; q_colors: Dict[str, Any] = {}
+        for Q, tag, comp in ((self.Qa,"α","alpha"), (self.Qb,"β","beta"), (self.Qg,"γ","gamma")):
             if Q is None or not np.size(Q): continue
             qlog = _finite_log10(Q)
             if qlog.size:
-                ax.hist(qlog, bins=40, density=True, alpha=0.55, label=f"log10 Q[{label}]")
+                col, _ = _hist_and_color(ax, qlog, bins=40, density=True, alpha=0.55, label=f"log10 Q[{tag}]")
+                q_colors[comp] = col
                 plotted = True
-        # Truth lines on the same axis if any hist was drawn
         if plotted:
             for comp, tag in (("alpha","α"),("beta","β"),("gamma","γ")):
                 q = _truth_Q(self.d, comp, self.idxs)
                 if q is not None and np.isfinite(q) and q > 0:
-                    ax.axvline(np.log10(float(q)), lw=1.6, color="k", ls="--", label=f"truth Q[{tag}]")
+                    col = q_colors.get(comp, None)
+                    ax.axvline(np.log10(float(q)), lw=1.6, ls="--", label=f"truth Q[{tag}]", color=col)
             ax.set_title("Process variances (log10)"); _uniq_legend(ax)
         else:
             ax.axis("off")
 
-        # m0 subset (skip empty)
+        # m0 subset
         fams = self._families()
         ax = axs[4]
         m0_items = self._filter_items_with_finite(fams.get("m0", []))[:2]
         if m0_items:
             for name, s in m0_items:
-                ax.hist(s, bins=40, density=True, alpha=0.55, label=name)
+                col, _ = _hist_and_color(ax, s, bins=40, density=True, alpha=0.55, label=name)
                 tv = _truth_m0(self.d, name, self.period)
-                if tv is not None and np.isfinite(tv): ax.axvline(float(tv), color="k", lw=1.4, label=f"truth {name}")
+                if tv is not None and np.isfinite(tv): ax.axvline(float(tv), color=col, lw=1.4, label=f"truth {name}")
             ax.set_title("m0 (subset)"); _uniq_legend(ax)
         else:
             ax.axis("off")
 
-        # P0 subset (skip empty)
+        # P0 subset
         ax = axs[5]
         P0_items = self._filter_items_with_finite(fams.get("P0", []))[:2]
         if P0_items:
             for name, s in P0_items:
-                ax.hist(s, bins=40, density=True, alpha=0.55, label=name)
+                col, _ = _hist_and_color(ax, s, bins=40, density=True, alpha=0.55, label=name)
                 tv = _truth_P0(self.d, name)
-                if tv is not None and np.isfinite(tv): ax.axvline(float(tv), color="k", lw=1.4, label=f"truth {name}")
+                if tv is not None and np.isfinite(tv): ax.axvline(float(tv), color=col, lw=1.4, label=f"truth {name}")
             ax.set_title("P0 (subset)"); _uniq_legend(ax)
         else:
             ax.axis("off")
@@ -419,6 +496,51 @@ class DLMPlotter:
             fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
         plt.show() if show else plt.close(fig)
 
+    # ---------- decomposition (α, β, γ) ----------
+    def figure_decomposition(self, save_dir: Optional[str] = None, fname_prefix="decomposition", show=True):
+        """
+        3-panel decomposition: level α_t, slope β_t, seasonal γ_t (first coord).
+        Plots per-time medians with credible bands at the configured level.
+        If a component is absent (no index or no array), that panel is skipped.
+        """
+        has_x = ("x" in self.d) and getattr(self.d["x"], "ndim", 0) == 3
+        def get(idx: Optional[int]):
+            return (self.d["x"][:, :, idx] if (has_x and idx is not None and idx < self.d["x"].shape[2]) else None)
+
+        A = get(self.idxs["idx_alpha"])
+        B = get(self.idxs["idx_beta"])
+        G = get(self.idxs["idx_g_first"])
+
+        blocks = []
+        if A is not None: blocks.append(("Level $\\alpha_t$", A, self.t_a))
+        if B is not None: blocks.append(("Trend $\\beta_t$", B, self.t_b))
+        if G is not None: blocks.append(("Seasonal $\\gamma_t$", G, self.t_g))
+
+        if not blocks:
+            print("[info] decomposition: no α/β/γ paths found; skipping.")
+            return None
+
+        R = len(blocks)
+        fig, axes = plt.subplots(R, 1, figsize=(12, 3.0 * R), sharex=True)
+        axes = np.atleast_1d(axes)
+        t = np.arange(self.T)
+
+        for r, (title, arr, truth) in enumerate(blocks):
+            ctr, lo, hi = _qtiles(arr, self.level)
+            ax = axes[r]
+            ax.plot(ctr, lw=1.6, label="median")
+            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band)
+            if truth is not None and len(truth) == self.T:
+                ax.plot(truth, lw=1.2, ls="--", label="truth")
+            ax.set_title(title)
+            ax.legend(loc="best")
+
+        fig.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir); p = os.path.join(save_dir, f"{fname_prefix}.png")
+            fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
+        plt.show() if show else plt.close(fig)
+
     # ---------- m0/P0 panel ----------
     def figure_m0_P0(self, save_dir: Optional[str] = None, fname_prefix="m0_P0", show=True):
         fams = self._families()
@@ -431,26 +553,28 @@ class DLMPlotter:
         fig, axs = plt.subplots(R, C, figsize=(12, max(2.6*R, 3.5)), squeeze=False)
 
         for i in range(R):
+            # Left: m0
             axL = axs[i,0]
             if i < len(m0_items):
                 name, s = m0_items[i]
-                axL.hist(s, bins=40, density=True, alpha=0.85, label=name)
-                axL.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean")
-                axL.axvline(float(np.median(s)), ls=":", lw=1.0, label="median")
+                col, _ = _hist_and_color(axL, s, bins=40, density=True, alpha=0.85, label=name)
+                axL.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean", color=col)
+                axL.axvline(float(np.median(s)), ls=":", lw=1.0, label="median", color=col)
                 tv = _truth_m0(self.d, name, self.period)
-                if tv is not None and np.isfinite(tv): axL.axvline(float(tv), color="k", lw=1.6, label="truth")
+                if tv is not None and np.isfinite(tv): axL.axvline(float(tv), color=col, lw=1.6, label="truth")
                 axL.set_title(name); _uniq_legend(axL)
             else:
                 axL.axis("off")
 
+            # Right: P0
             axR = axs[i,1]
             if i < len(P0_items):
                 name, s = P0_items[i]
-                axR.hist(s, bins=40, density=True, alpha=0.85, label=name)
-                axR.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean")
-                axR.axvline(float(np.median(s)), ls=":", lw=1.0, label="median")
+                col, _ = _hist_and_color(axR, s, bins=40, density=True, alpha=0.85, label=name)
+                axR.axvline(float(np.mean(s)), ls="--", lw=1.0, label="mean", color=col)
+                axR.axvline(float(np.median(s)), ls=":", lw=1.0, label="median", color=col)
                 tv = _truth_P0(self.d, name)
-                if tv is not None and np.isfinite(tv): axR.axvline(float(tv), color="k", lw=1.6, label="truth")
+                if tv is not None and np.isfinite(tv): axR.axvline(float(tv), color=col, lw=1.6, label="truth")
                 axR.set_title(name); _uniq_legend(axR)
             else:
                 axR.axis("off")
@@ -503,21 +627,14 @@ class DLMPlotter:
             fig.savefig(p, dpi=220, bbox_inches="tight"); print(f"[save] {p}")
         plt.show() if show else plt.close(fig)
 
-    # ---------- RJ diagnostics ----------
-    @staticmethod
-    def _mode_tuple_to_str(row: np.ndarray) -> str:
-        m = ["dyn","det","none"]; a,b,c = [m[int(z)] for z in row]
-        return f"L:{a}|T:{b}|S:{c}"
-
-    def figure_rj(self, save_dir: Optional[str]=None, fname_prefix="rj_diagnostics", show=True):
+    # ---------- RJ diagnostics (traces only) ----------
+    def figure_rj(self, save_dir: Optional[str]=None, fname_prefix="rj_traces", show=True):
         modes = self.d.get("modes", None)
         if modes is None:
-            print("[info] no 'modes' array found; skipping RJ plots.")
+            print("[info] no 'modes' array found; skipping RJ traces.")
             return None
         modes = np.asarray(modes, int)
-        N = modes.shape[0]
 
-        # Mode traces
         fig, axs = plt.subplots(3,1, figsize=(12,6), sharex=True)
         labs = ("Level","Trend","Season")
         for j in range(3):
@@ -527,72 +644,9 @@ class DLMPlotter:
         axs[-1].set_xlabel("saved iteration")
         fig.tight_layout()
         if save_dir:
-            _ensure_dir(save_dir); p = os.path.join(save_dir, f"{fname_prefix}__traces.png")
+            _ensure_dir(save_dir); p = os.path.join(save_dir, f"{fname_prefix}.png")
             fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
         plt.show() if show else plt.close(fig)
-
-        # Model probabilities
-        names = np.array([self._mode_tuple_to_str(row) for row in modes])
-        uniq, counts = np.unique(names, return_counts=True)
-        order = np.argsort(-counts)
-        uniq, counts = uniq[order], counts[order]
-        fig, ax = plt.subplots(1,1, figsize=(max(8, 0.3*len(uniq)), 4))
-        ax.bar(np.arange(len(uniq)), counts / counts.sum())
-        ax.set_xticks(np.arange(len(uniq))); ax.set_xticklabels(uniq, rotation=65, ha="right")
-        ax.set_title("Posterior model probabilities (empirical)"); ax.set_ylabel("probability")
-        fig.tight_layout()
-        if save_dir:
-            p = os.path.join(save_dir, f"{fname_prefix}__model_probs.png")
-            fig.savefig(p, dpi=220, bbox_inches="tight"); print(f"[save] {p}")
-        plt.show() if show else plt.close(fig)
-        best = uniq[0]
-        print(f"[RJ] MAP best model: {best}  (p≈{counts[0]/counts.sum():.3f})")
-
-        # Transition matrix
-        idx = {u:i for i,u in enumerate(uniq)}
-        z = np.array([idx[n] for n in names], int)
-        K = len(uniq); Tm = np.zeros((K,K), float)
-        for t in range(1, N): Tm[z[t-1], z[t]] += 1
-        Trow = Tm / np.maximum(Tm.sum(1, keepdims=True), EPS)
-        fig, ax = plt.subplots(1,1, figsize=(max(8, 0.35*K), max(6, 0.35*K)))
-        im = ax.imshow(Trow, vmin=0, vmax=1, cmap="viridis")
-        ax.set_xticks(range(K)); ax.set_xticklabels(uniq, rotation=90)
-        ax.set_yticks(range(K)); ax.set_yticklabels(uniq)
-        ax.set_title("RJ transition matrix (row-normalized)")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
-        if save_dir:
-            p = os.path.join(save_dir, f"{fname_prefix}__transition.png")
-            fig.savefig(p, dpi=220, bbox_inches="tight"); print(f"[save] {p}")
-        plt.show() if show else plt.close(fig)
-
-        # Inclusion probabilities
-        fig, axs = plt.subplots(1,3, figsize=(12,3))
-        for j,(key,ax) in enumerate(zip(("level","trend","season"), axs)):
-            vals = [float(np.mean(modes[:,j]==s)) for s in (0,1,2)]
-            ax.bar([0,1,2], vals)
-            ax.set_xticks([0,1,2]); ax.set_xticklabels(["dyn","det","none"])
-            ax.set_ylim(0,1); ax.set_title(f"Inclusion prob — {key}")
-        fig.tight_layout()
-        if save_dir:
-            p = os.path.join(save_dir, f"{fname_prefix}__inclusion.png")
-            fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
-        plt.show() if show else plt.close(fig)
-
-        # Acceptance rates (optional)
-        meta_rj = self.meta.get("rj_accept", None)
-        if meta_rj:
-            blocks = ("level","trend","season")
-            rates = [float(meta_rj[b]["acc_rate"]) if b in meta_rj else np.nan for b in blocks]
-            fig, ax = plt.subplots(1,1, figsize=(6,3))
-            ax.bar(blocks, rates); ax.set_ylim(0,1); ax.set_title("RJ acceptance rates (overall)")
-            for i,v in enumerate(rates):
-                if np.isfinite(v): ax.text(i, v+0.02, f"{v:.2f}", ha="center", fontsize=9)
-            fig.tight_layout()
-            if save_dir:
-                p = os.path.join(save_dir, f"{fname_prefix}__accept.png")
-                fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
-            plt.show() if show else plt.close(fig)
 
     # ---------- grouped helpers ----------
     def figure_traces_grouped_all(self, save_dir: Optional[str]=None, show=False, max_lag: int=200):
@@ -615,6 +669,7 @@ class DLMPlotter:
     def quick_report(self, save_dir: Optional[str]=None, fname_prefix="quick_report", show=True):
         mu = np.asarray(self.d["mu"], float); c, lo, hi = _qtiles(mu, self.level); t = np.arange(self.T)
         fig, axs = plt.subplots(1,3, figsize=(14,4))
+
         axs[0].plot(c, lw=1.6, label="μ median"); axs[0].fill_between(t, lo, hi, alpha=0.25, label=self.band)
         if self.t_mu is not None and len(self.t_mu)==self.T: axs[0].plot(self.t_mu, lw=1.2, ls="--", label="true μ")
         axs[0].set_title("μ_t"); axs[0].legend()
@@ -623,41 +678,41 @@ class DLMPlotter:
         if self.sigma is not None and self.sigma.size:
             sfin = _finite(self.sigma)
             if sfin.size:
-                axs[1].hist(sfin, bins=40, density=True, label="σ")
+                col, _ = _hist_and_color(axs[1], sfin, bins=40, density=True, label="σ")
                 ts = _truth_sigma(self.d)
-                if ts is not None and np.isfinite(ts): axs[1].axvline(float(ts), color="k", lw=1.6, label="truth")
+                if ts is not None and np.isfinite(ts): axs[1].axvline(float(ts), color=col, lw=1.6, label="truth")
                 axs[1].set_title("σ | y"); _uniq_legend(axs[1])
             else:
                 axs[1].axis("off")
         else:
             axs[1].axis("off")
 
-        # Q panel or fallback (skip empties)
+        # Q or fallback
         fams = self._families(); panel_done=False
         for comp, series, tag in (("alpha",self.Qa,"Q_α"),("beta",self.Qb,"Q_β"),("gamma",self.Qg,"Q_γ")):
             if series is None or not np.size(series): continue
             qlog = _finite_log10(series)
             if qlog.size:
-                axs[2].hist(qlog, bins=40, density=True, label=f"log10 {tag}")
+                col, _ = _hist_and_color(axs[2], qlog, bins=40, density=True, label=f"log10 {tag}")
                 q = _truth_Q(self.d, comp, self.idxs)
-                if q is not None and np.isfinite(q) and q>0: axs[2].axvline(np.log10(float(q)), color="k", lw=1.6, label="truth")
+                if q is not None and np.isfinite(q) and q>0:
+                    axs[2].axvline(np.log10(float(q)), color=col, lw=1.6, label="truth")
                 axs[2].set_title(f"log10 {tag} | y"); _uniq_legend(axs[2]); panel_done=True; break
         if not panel_done:
-            # try m0 or P0 if finite
             m0_items = self._filter_items_with_finite(fams.get("m0", []))
             if m0_items:
                 name,s = m0_items[0]
-                axs[2].hist(s, bins=40, density=True, label=name)
+                col, _ = _hist_and_color(axs[2], s, bins=40, density=True, label=name)
                 tv = _truth_m0(self.d, name, self.period)
-                if tv is not None and np.isfinite(tv): axs[2].axvline(float(tv), color="k", lw=1.6, label="truth")
+                if tv is not None and np.isfinite(tv): axs[2].axvline(float(tv), color=col, lw=1.6, label="truth")
                 axs[2].set_title(f"{name} | y"); _uniq_legend(axs[2]); panel_done=True
             else:
                 P0_items = self._filter_items_with_finite(fams.get("P0", []))
                 if P0_items:
                     name,s = P0_items[0]
-                    axs[2].hist(s, bins=40, density=True, label=name)
+                    col, _ = _hist_and_color(axs[2], s, bins=40, density=True, label=name)
                     tv = _truth_P0(self.d, name)
-                    if tv is not None and np.isfinite(tv): axs[2].axvline(float(tv), color="k", lw=1.6, label="truth")
+                    if tv is not None and np.isfinite(tv): axs[2].axvline(float(tv), color=col, lw=1.6, label="truth")
                     axs[2].set_title(f"{name} | y"); _uniq_legend(axs[2]); panel_done=True
                 else:
                     axs[2].axis("off")
@@ -668,7 +723,8 @@ class DLMPlotter:
             fig.savefig(p, dpi=200, bbox_inches="tight"); print(f"[save] {p}")
         plt.show() if show else plt.close(fig)
 
-# --------------------- CLI ---------------------
+# ===================== CLI =====================
+
 def _load_bundle_from_npz(npz_path: str, meta_path: Optional[str]) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     with np.load(npz_path, allow_pickle=True) as z:
         draws = {k: z[k] for k in z.files}
@@ -680,7 +736,7 @@ def _load_bundle_from_npz(npz_path: str, meta_path: Optional[str]) -> Tuple[Dict
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(
-        description="DLM plotter (trace/posterior/correlations/RJ; newest-first seasonal γ_t = first coord)",
+        description="DLM plotter (traces/posteriors/correlations/RJ-traces; newest-first seasonal γ_t = first coord)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--target", type=str, default=None, help="Run dir or posterior.npz. If omitted, search --root.")
@@ -690,12 +746,13 @@ if __name__ == "__main__":
     p.add_argument("--out", type=str, default=None, help="Save dir (default: <run>/figures)")
     p.add_argument("--skip-overview", default=False, action="store_true")
     p.add_argument("--skip-states", default=False, action="store_true")
+    p.add_argument("--skip-decomposition", default=False, action="store_true", help="Skip α/β/γ decomposition figure")
     p.add_argument("--skip-quick", default=False, action="store_true")
     p.add_argument("--skip-grouped-traces", default=False, action="store_true")
     p.add_argument("--skip-grouped-post", default=False, action="store_true")
     p.add_argument("--skip-m0p0", default=False, action="store_true", help="Skip the dedicated m0/P0 figure")
     p.add_argument("--skip-corr", default=False, action="store_true", help="Skip correlation heatmap")
-    p.add_argument("--skip-rj", default=False, action="store_true", help="Skip RJ diagnostics")
+    p.add_argument("--skip-rj", default=False, action="store_true", help="Skip RJ traces")
     p.add_argument("--max-lag", type=int, default=200, help="ACF/ESS max lag")
     p.add_argument("--trace-decimate", type=int, default=1, help="Plot every k-th point in traces to speed up rendering.")
     # Fallback file-based loading
@@ -717,8 +774,12 @@ if __name__ == "__main__":
         print("[error] Unable to locate posterior bundle. Provide --target/--root or --npz.")
         sys.exit(1)
 
-    # enrich meta with layout-derived indices
-    idxs = _layout_idxs(bundle_meta, int(bundle_meta.get("period", 12)))
+    # enrich meta with layout-derived indices (robust to missing layout)
+    idxs = _layout_idxs(bundle_meta, bundle_draws, int(bundle_meta.get("period", 12)))
+    # also ensure a canonical 'layout' is present in meta for downstream tools
+    if "layout" not in bundle_meta:
+        bundle_meta = dict(bundle_meta)
+        bundle_meta["layout"] = _layout_list(bundle_meta, bundle_draws, int(bundle_meta.get("period", 12)))
     bundle_meta = dict(bundle_meta, **idxs)
 
     out_dir = a.out or os.path.join(os.path.dirname(npz_path), "figures")
@@ -728,10 +789,11 @@ if __name__ == "__main__":
     pl = DLMPlotter(draws=bundle_draws, meta=bundle_meta, level=float(a.level), trace_decimate=int(a.trace_decimate))
     if not a.skip_overview:       pl.figure_overview(out_dir, "overview", a.show)
     if not a.skip_states:         pl.figure_states(out_dir, "states", a.show)
+    if not a.skip_decomposition:  pl.figure_decomposition(out_dir, "decomposition", a.show)
     if not a.skip_quick:          pl.quick_report(out_dir, "quick_report", a.show)
     if not a.skip_m0p0:           pl.figure_m0_P0(out_dir, "m0_P0", a.show)
     if not a.skip_grouped_traces: pl.figure_traces_grouped_all(out_dir, a.show, int(a.max_lag))
     if not a.skip_grouped_post:   pl.figure_posteriors_grouped_all(out_dir, a.show)
     if not a.skip_corr:           pl.figure_corr_heatmaps(out_dir, "correlations", a.show)
-    if not a.skip_rj:             pl.figure_rj(out_dir, "rj_diagnostics", a.show)
+    if not a.skip_rj:             pl.figure_rj(out_dir, "rj_traces", a.show)
     print("[done] plots written.")

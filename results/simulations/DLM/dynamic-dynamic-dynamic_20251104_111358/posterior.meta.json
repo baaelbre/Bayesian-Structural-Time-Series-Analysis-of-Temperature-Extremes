@@ -1,0 +1,120 @@
+{
+  "T": 500,
+  "period": 4,
+  "cfg": {
+    "n_iter": 5000,
+    "burn": 1000,
+    "thin": 1,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 1,
+    "rj_moves_per_iter": 2,
+    "allow_none_level": false,
+    "allow_none_trend": false,
+    "allow_none_season": false,
+    "rj_window": 500
+  },
+  "priors": {
+    "a_sigma": 2.0,
+    "b_sigma": 1.0,
+    "m_m0_alpha": 0.0,
+    "s_m0_alpha": 10.0,
+    "m_m0_beta": 0.0,
+    "s_m0_beta": 10.0,
+    "m_m0_gamma": null,
+    "s_m0_gamma": 5.0,
+    "a_P0_alpha": 5.0,
+    "b_P0_alpha": 1.0,
+    "a_P0_beta": 5.0,
+    "b_P0_beta": 1.0,
+    "a_P0_gamma": 5.0,
+    "b_P0_gamma": 1.0,
+    "hc_scale_alpha": 0.5,
+    "hc_scale_beta": 0.5,
+    "hc_scale_gamma": 0.5
+  },
+  "model_prior": {
+    "level": {
+      "dynamic": 0.49999999999949996,
+      "deterministic": 0.49999999999949996,
+      "none": 9.99999999999e-13
+    },
+    "trend": {
+      "dynamic": 0.49999999999949996,
+      "deterministic": 0.49999999999949996,
+      "none": 9.99999999999e-13
+    },
+    "season": {
+      "dynamic": 0.49999999999949996,
+      "deterministic": 0.49999999999949996,
+      "none": 9.99999999999e-13
+    }
+  },
+  "current_modes": {
+    "level": "dynamic",
+    "trend": "dynamic",
+    "season": "dynamic"
+  },
+  "rj_accept": {
+    "level": {
+      "proposed": 3306,
+      "accepted": 1,
+      "acc_rate": 0.00030248033877797946
+    },
+    "trend": {
+      "proposed": 3325,
+      "accepted": 1,
+      "acc_rate": 0.0003007518796992481
+    },
+    "season": {
+      "proposed": 3369,
+      "accepted": 1,
+      "acc_rate": 0.00029682398337785694
+    }
+  },
+  "inclusion_probs": {
+    "level": {
+      "dynamic": 1.0,
+      "deterministic": 0.0,
+      "none": 0.0
+    },
+    "trend": {
+      "dynamic": 1.0,
+      "deterministic": 0.0,
+      "none": 0.0
+    },
+    "season": {
+      "dynamic": 0.881,
+      "deterministic": 0.119,
+      "none": 0.0
+    }
+  },
+  "modes_encoding": {
+    "dynamic": 0,
+    "deterministic": 1,
+    "none": 2
+  },
+  "layout_labels": [
+    "alpha",
+    "beta",
+    "g1",
+    "g2",
+    "g3"
+  ],
+  "elapsed_seconds": 982.9816920757294,
+  "sim_truth_modes": {
+    "level": "dynamic",
+    "trend": "dynamic",
+    "season": "dynamic"
+  },
+  "start_modes": {
+    "level": "dynamic",
+    "trend": "dynamic",
+    "season": "dynamic"
+  },
+  "hc_scales": {
+    "alpha": 0.5,
+    "beta": 0.5,
+    "gamma": 0.5
+  }
+}

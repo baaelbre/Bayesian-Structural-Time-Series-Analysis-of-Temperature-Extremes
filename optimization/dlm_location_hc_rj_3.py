@@ -3,8 +3,6 @@ from __future__ import annotations
 """
 Gaussian structural time-series model with RJ–MCMC + conjugate Gibbs.
 
-Complete rewrite with robust posterior saving for downstream plotting.
-
 Highlights
 ---------
 • Truth overlays: set_truth(...) and set_truth_paths(...), saved into .npz.
@@ -37,7 +35,6 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # =============================================================================
 
 EPS = 1e-12
-
 
 def _mad(v: np.ndarray) -> float:
     v = np.asarray(v, float)
@@ -1481,9 +1478,9 @@ if __name__ == "__main__":
 
     # Model prior (for Δ log posterior)
     default_model_prior = {
-        "level": {"dynamic": 0.5, "deterministic": 0.5, "none": 1e-12},
-        "trend": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.4 if args.allow_none_trend else 1e-12},
-        "season": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.2 if args.allow_none_season else 1e-12},
+        "level": {"dynamic": 0.9, "deterministic": 0.1, "none": 1e-12},
+        "trend": {"dynamic": 0.9, "deterministic": 0.1, "none": 0.4 if args.allow_none_trend else 1e-12},
+        "season": {"dynamic": 0.9, "deterministic": 0.1, "none": 0.2 if args.allow_none_season else 1e-12},
     }
     model_prior = {
         "level": _csv_model_prior_block(args.prior_model_level, args.allow_none_level, default_model_prior["level"]),
@@ -1592,7 +1589,7 @@ if __name__ == "__main__":
             plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
         plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
         plt.title(
-            "DLM RJ (Δ log posterior) — current modes: "
+            "Structural DLM - current modes: "
             f"{sampler.level_mode}/{sampler.trend_mode}/{sampler.seasonal_mode}"
         )
         plt.grid(True)
@@ -1618,48 +1615,108 @@ if __name__ == "__main__":
 
     print(f"[save] Outputs written to: {out_dir}")
 
-# =============================================================================
-# CLI / Example run
-# =============================================================================
 
-def _parse_date(s: str | None):
-    from datetime import datetime
-    if not s:
-        return datetime.today()
-    parts = [int(p) for p in s.split("-")]
-    if len(parts) == 1:
-        return datetime(parts[0], 1, 1)
-    elif len(parts) == 2:
-        return datetime(parts[0], parts[1], 1)
-    elif len(parts) == 3:
-        return datetime(parts[0], parts[1], parts[2])
-    raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+    # -------------------------------------------------------------------------
+    # Posterior summaries (print to console)
+    # -------------------------------------------------------------------------
+    def _finite_flat(a: np.ndarray) -> np.ndarray:
+        v = np.asarray(a, float).ravel()
+        return v[np.isfinite(v)]
 
+    def _summ_1d(a: np.ndarray) -> Optional[dict]:
+        v = _finite_flat(a)
+        if v.size == 0:
+            return None
+        q = np.quantile(v, [0.05, 0.5, 0.95])
+        return {
+            "mean": float(v.mean()),
+            "sd": float(v.std(ddof=1)) if v.size > 1 else 0.0,
+            "q05": float(q[0]),
+            "q50": float(q[1]),
+            "q95": float(q[2]),
+            "n": int(v.size),
+        }
 
-def _csv_floats_or_none(s: str | None):
-    if s is None:
-        return None
-    s = s.strip()
-    if s == "":
-        return None
-    return [float(z) for z in s.split(",") if z.strip() != ""]
+    def _print_summ(name: str, a: np.ndarray) -> None:
+        s = _summ_1d(a)
+        if s is None:
+            print(f"  {name:18s} : (no finite draws)")
+        else:
+            print(
+                f"  {name:18s} : mean={s['mean']:.4g} | sd={s['sd']:.4g} | "
+                f"[{s['q05']:.4g}, {s['q50']:.4g}, {s['q95']:.4g}]  (n={s['n']})"
+            )
 
+    print("\n================ Posterior summaries ================")
 
-def _csv_model_prior_block(s: str | None, allow_none: bool, defaults: dict) -> dict:
-    out = dict(defaults)
-    if s:
-        pieces = [p.strip() for p in s.split(",") if p.strip()]
-        for p in pieces:
-            k, v = p.split(":")
-            out[k.strip()] = float(v)
-    if not allow_none:
-        out["none"] = min(out.get("none", 1e-12), 1e-12)
-    ssum = sum(out.values())
-    if ssum <= 0:
-        dsum = sum(defaults.values())
-        out = {k: v / dsum for k, v in defaults.items()}
-    else:
-        out = {k: v / ssum for k, v in out.items()}
-    return out
+    # --- Scalars
+    _print_summ("sigma", post.get("sigma", np.array([])))
+    _print_summ("Q_alpha", post.get("Q_alpha", np.array([])))
+    _print_summ("Q_beta",  post.get("Q_beta",  np.array([])))
+    _print_summ("Q_gamma", post.get("Q_gamma", np.array([])))
 
+    # --- m0 / P0 (dynamic) and deterministic aliases
+    _print_summ("m0_alpha", post.get("m0_alpha", np.array([])))
+    _print_summ("P0_alpha", post.get("P0_alpha", np.array([])))
+    _print_summ("m0_beta",  post.get("m0_beta",  np.array([])))
+    _print_summ("P0_beta",  post.get("P0_beta",  np.array([])))
+    _print_summ("P0_gamma", post.get("P0_gamma", np.array([])))
 
+    # deterministic aliases (present only when block is deterministic on kept draw)
+    _print_summ("m0_alpha_det", post.get("m0_alpha_det", np.array([])))
+    _print_summ("m0_beta_det",  post.get("m0_beta_det",  np.array([])))
+
+    # --- Vectors: m0_gamma (dynamic) and season_det (deterministic)
+    if "m0_gamma" in post:
+        arr = np.asarray(post["m0_gamma"])
+        if arr.ndim == 2 and arr.size:
+            K = arr.shape[1]
+            for j in range(K):
+                _print_summ(f"m0_gamma[{j}]", arr[:, j])
+    if "season_det" in post:
+        arr = np.asarray(post["season_det"])
+        if arr.ndim == 2 and arr.size:
+            K = arr.shape[1]
+            for j in range(K):
+                _print_summ(f"season_det[{j}]", arr[:, j])
+
+    # --- μ_t path — report aggregate scale and first few entries of μ̂ (posterior mean)
+    if "mu" in post:
+        mu = np.asarray(post["mu"], float)  # (n_keep, T)
+        if mu.ndim == 2 and mu.size:
+            mu_mean = mu.mean(axis=0)
+            mu_sd   = mu.std(axis=0, ddof=1) if mu.shape[0] > 1 else np.zeros(mu.shape[1])
+            print("\n  μ_t (path) summary:")
+            print(f"    mean(sd) across t : {mu_mean.mean():.4g} ({mu_sd.mean():.4g})")
+            # show a compact head/tail of μ̂_t
+            show = min(5, mu_mean.size)
+            head = ", ".join(f"{v:.4g}" for v in mu_mean[:show])
+            tail = ", ".join(f"{v:.4g}" for v in mu_mean[-show:]) if mu_mean.size > show else ""
+            if tail:
+                print(f"    μ̂_t head         : [{head}, …]")
+                print(f"    μ̂_t tail         : […, {tail}]")
+            else:
+                print(f"    μ̂_t              : [{head}]")
+
+    # --- Model probabilities / MAP from saved mode encodings
+    # modes: (n_keep, 3) with 0=dyn, 1=det, 2=none
+    if "modes" in post:
+        modes = np.asarray(post["modes"], int)
+        if modes.ndim == 2 and modes.size:
+            lab = {0: "dynamic", 1: "deterministic", 2: "none"}
+            comps = ["level", "trend", "season"]
+            print("\n  Posterior inclusion probabilities:")
+            for j, comp in enumerate(comps):
+                vals, cnts = np.unique(modes[:, j], return_counts=True)
+                total = cnts.sum()
+                line = " ".join(f"{lab[int(v)]}={cnt/total:.3f}" for v, cnt in zip(vals, cnts))
+                print(f"    {comp:6s}: {line}")
+            # MAP model
+            tuples = [tuple(row.tolist()) for row in modes]
+            uniq, cnts = np.unique(tuples, return_counts=True, axis=0)
+            idx = int(np.argmax(cnts))
+            best = uniq[idx]
+            best_lab = "-".join(lab[k] for k in best)
+            print(f"\n  MAP model: {best_lab}  (p≈{cnts[idx]/cnts.sum():.3f})")
+
+    print("=====================================================\n")
