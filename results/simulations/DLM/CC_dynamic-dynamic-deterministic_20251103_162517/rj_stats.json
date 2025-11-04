@@ -1,0 +1,17 @@
+{
+  "level": {
+    "proposed": 3275,
+    "accepted": 1,
+    "acc_rate": 0.0003053435114503817
+  },
+  "trend": {
+    "proposed": 3308,
+    "accepted": 1,
+    "acc_rate": 0.0003022974607013301
+  },
+  "season": {
+    "proposed": 3417,
+    "accepted": 0,
+    "acc_rate": 0.0
+  }
+}

@@ -660,7 +660,6 @@ class DLMPlotter:
             print(f"[save] {p}")
         plt.show() if show else plt.close(fig)
 
-
 # --------------------- CLI ---------------------
 if __name__ == "__main__":
     import argparse

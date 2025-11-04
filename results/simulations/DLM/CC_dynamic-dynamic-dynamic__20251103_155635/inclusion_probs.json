@@ -1,0 +1,17 @@
+{
+  "level": {
+    "dynamic": 1.0,
+    "deterministic": 0.0,
+    "none": 0.0
+  },
+  "trend": {
+    "dynamic": 0.7166,
+    "deterministic": 0.2834,
+    "none": 0.0
+  },
+  "season": {
+    "dynamic": 0.987,
+    "deterministic": 0.013,
+    "none": 0.0
+  }
+}
