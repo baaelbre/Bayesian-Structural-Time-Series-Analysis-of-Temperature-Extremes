@@ -942,7 +942,7 @@ if __name__ == "__main__":
 
     # Basics
     p.add_argument("--period", type=int, default=4)
-    p.add_argument("--T", type=int, default=500)
+    p.add_argument("--T", type=int, default=100)
 
     # Initial values (shared)
     p.add_argument("--level-init", type=float, default=5.0)
@@ -970,9 +970,9 @@ if __name__ == "__main__":
     p.add_argument("--prior-s-season", type=float, default=5.0)
 
     # Half-Cauchy scales for process SDs
-    p.add_argument("--hc-scale-alpha", type=float, default=0.5)
-    p.add_argument("--hc-scale-beta",  type=float, default=0.5)
-    p.add_argument("--hc-scale-gamma", type=float, default=0.5)
+    p.add_argument("--hc-scale-alpha", type=float, default=1)
+    p.add_argument("--hc-scale-beta",  type=float, default=1)
+    p.add_argument("--hc-scale-gamma", type=float, default=1)
 
     # Sampler config
     p.add_argument("--n-iter", type=int, default=4000)

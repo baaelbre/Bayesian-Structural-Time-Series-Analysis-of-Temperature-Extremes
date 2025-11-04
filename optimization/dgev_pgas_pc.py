@@ -1127,7 +1127,7 @@ if __name__ == "__main__":
     # Modes
     parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     parser.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    parser.add_argument("--season-mode", choices=["dynamic", "deterministic", "none"], default="none")
 
     # Basics
     parser.add_argument("--period", type=int, default=4)
