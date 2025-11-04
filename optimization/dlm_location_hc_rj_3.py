@@ -1453,9 +1453,9 @@ if __name__ == "__main__":
 
     # Model prior (for Δ log posterior)
     default_model_prior = {
-        "level": {"dynamic": 0.1, "deterministic": 0.9, "none": 1e-12},
-        "trend": {"dynamic": 0.1, "deterministic": 0.9, "none": 0.4 if args.allow_none_trend else 1e-12},
-        "season": {"dynamic": 0.1, "deterministic": 0.9, "none": 0.2 if args.allow_none_season else 1e-12},
+        "level": {"dynamic": 0.5, "deterministic": 0.5, "none": 1e-12},
+        "trend": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.4 if args.allow_none_trend else 1e-12},
+        "season": {"dynamic": 0.5, "deterministic": 0.5, "none": 0.2 if args.allow_none_season else 1e-12},
     }
     model_prior = {
         "level": _csv_model_prior_block(args.prior_model_level, args.allow_none_level, default_model_prior["level"]),
