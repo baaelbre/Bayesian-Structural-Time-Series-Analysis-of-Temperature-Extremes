@@ -3,6 +3,10 @@ from __future__ import annotations
 """
 Gaussian structural time-series model with RJ–MCMC + conjugate Gibbs.
 
+This version uses Half-Student-t priors on the PROCESS standard deviations:
+    s_k ~ Half-t_{ν_k}(scale = A_k)   for k in {level(α), trend(β), season(γ)}.
+This induces: Q_k = s_k^2 ~ Inv-Gamma(ν_k/2, ν_k A_k^2 / 2), which is conjugate.
+
 Highlights
 ---------
 • Truth overlays: set_truth(...) and set_truth_paths(...), saved into .npz.
@@ -43,11 +47,9 @@ def _mad(v: np.ndarray) -> float:
     m = np.median(v)
     return float(np.median(np.abs(v - m)))
 
-
 def _robust_sd(v: np.ndarray) -> float:
     v = np.asarray(v, float)
     return _mad(v) / 1.4826 if v.size else 0.0
-
 
 def _spd_solve(M: np.ndarray, B: np.ndarray, jitter: float = 1e-12) -> np.ndarray:
     """Solve M X = B for SPD-like M with escalating jitter; pseudo-inverse fallback."""
@@ -62,7 +64,6 @@ def _spd_solve(M: np.ndarray, B: np.ndarray, jitter: float = 1e-12) -> np.ndarra
         except np.linalg.LinAlgError:
             pass
     return np.linalg.pinv(M) @ B
-
 
 def _fmt_list(vals, max_elems: int = 6, fmt: str = ".4g", sep: str = ", ", mode: str = "head") -> str:
     if vals is None:
@@ -97,7 +98,6 @@ def _fmt_list(vals, max_elems: int = 6, fmt: str = ".4g", sep: str = ", ", mode:
     head = sep.join(_one(x) for x in v[:max_elems])
     return f"[{head}{sep}{ell}]"
 
-
 # =============================================================================
 # Priors & Config
 # =============================================================================
@@ -126,11 +126,14 @@ class Priors:
     a_P0_gamma: float = 2.0
     b_P0_gamma: float = 1.0
 
-    # Half-Cauchy scales (via IG mixture) for process SDs
-    hc_scale_alpha: float = 0.5
-    hc_scale_beta: float = 0.5
-    hc_scale_gamma: float = 0.5
-
+    # Half-Student-t hyperparameters for process SDs (s_k)
+    # Implemented via Q_k = s_k^2 ~ InvGamma(ν/2, ν A^2 / 2)
+    ht_df_alpha: float = 1.0   # ν_α
+    ht_scale_alpha: float = 0.5  # A_α
+    ht_df_beta: float = 1.0
+    ht_scale_beta: float = 0.5
+    ht_df_gamma: float = 1.0
+    ht_scale_gamma: float = 0.5
 
 @dataclass
 class SamplerConfig:
@@ -149,7 +152,6 @@ class SamplerConfig:
 
     # RJ acceptance reporting
     rj_window: int = 500
-
 
 # =============================================================================
 # Model structure
@@ -189,7 +191,6 @@ class _Layout:
         self._labels = layout
         self.dim = len(layout)
 
-    # ---------- matrices ----------
     def H(self) -> np.ndarray:
         if self.dim == 0:
             return np.zeros((1, 0))
@@ -235,7 +236,6 @@ class _Layout:
             Q[self.idx_g_start, self.idx_g_start] = s_gamma**2
         return Q
 
-
 # =============================================================================
 # Sampler
 # =============================================================================
@@ -243,7 +243,6 @@ class _Layout:
 class DLMRJGibbs:
     """Gaussian structural DLM with level/trend/season blocks and RJ–MCMC."""
 
-    # ------------------------------ init ---------------------------------- #
     def __init__(
         self,
         y: np.ndarray,
@@ -293,13 +292,10 @@ class DLMRJGibbs:
         # observation variance
         self.sigma2 = float(sigma2_init)
 
-        # process SDs + Half-Cauchy auxiliaries for dynamic blocks
+        # process SDs (no auxiliaries needed for Half-Student-t)
         self.s_alpha = float(s_alpha_init) if self._layout.idx_alpha is not None else 0.0
         self.s_beta  = float(s_beta_init)  if self._layout.idx_beta  is not None else 0.0
         self.s_gamma = float(s_gamma_init) if self.seasonal_mode == "dynamic" else 0.0
-        self._a_alpha = 1.0
-        self._a_beta  = 1.0
-        self._a_gamma = 1.0
 
         # initial means/vars for dynamic blocks (or deterministic parameters)
         self.m0_alpha = (
@@ -366,7 +362,6 @@ class DLMRJGibbs:
         self.true_P0_level = self.true_P0_trend = None
         self.true_P0_season = None
 
-        # progress line
         if self.cfg.progress:
             sd1 = _robust_sd(np.diff(self.y)) if self.T >= 2 else 0.0
             sd2 = _robust_sd(np.diff(self.y, n=2)) if self.T >= 3 else 0.0
@@ -411,7 +406,6 @@ class DLMRJGibbs:
     # --------------------------- structure helpers ------------------------- #
 
     def _max_state_dim(self) -> int:
-        # Theoretical max if all three blocks are dynamic: 1 (alpha) + 1 (beta) + (p-1) (season)
         return 2 + max(0, self.period - 1)
 
     def _alloc_state_holder(self) -> None:
@@ -430,7 +424,6 @@ class DLMRJGibbs:
             P0.extend([self.P0_gamma] * (self.period - 1))
         return np.asarray(m0, float), np.asarray(P0, float)
 
-    # deterministic contribution to y_t
     def _mu_det_t(self, t: int) -> float:
         out = 0.0
         if self.level_mode == "deterministic":
@@ -495,24 +488,24 @@ class DLMRJGibbs:
         # dynamic level
         if self._layout.idx_alpha is not None:
             Qa = max(self.s_alpha**2, 1e-300)
-            aa = max(self._a_alpha, 1e-300)
-            lp += lIG(Qa, 0.5, 1.0 / aa) + lIG(aa, 1.0, 1.0 / (self.priors.hc_scale_alpha**2))
+            nu, A = float(self.priors.ht_df_alpha), float(self.priors.ht_scale_alpha)
+            lp += lIG(Qa, 0.5 * nu, 0.5 * nu * A * A)
             lp += -0.5 * ((self.m0_alpha - self.priors.m_m0_alpha) ** 2) / (self.priors.s_m0_alpha**2)
             lp += lIG(self.P0_alpha, self.priors.a_P0_alpha, self.priors.b_P0_alpha)
 
         # dynamic trend
         if self._layout.idx_beta is not None:
             Qb = max(self.s_beta**2, 1e-300)
-            ab = max(self._a_beta, 1e-300)
-            lp += lIG(Qb, 0.5, 1.0 / ab) + lIG(ab, 1.0, 1.0 / (self.priors.hc_scale_beta**2))
+            nu, A = float(self.priors.ht_df_beta), float(self.priors.ht_scale_beta)
+            lp += lIG(Qb, 0.5 * nu, 0.5 * nu * A * A)
             lp += -0.5 * ((self.m0_beta - self.priors.m_m0_beta) ** 2) / (self.priors.s_m0_beta**2)
             lp += lIG(self.P0_beta, self.priors.a_P0_beta, self.priors.b_P0_beta)
 
         # dynamic seasonal
         if self.seasonal_mode == "dynamic":
             Qg = max(self.s_gamma**2, 1e-300)
-            ag = max(self._a_gamma, 1e-300)
-            lp += lIG(Qg, 0.5, 1.0 / ag) + lIG(ag, 1.0, 1.0 / (self.priors.hc_scale_gamma**2))
+            nu, A = float(self.priors.ht_df_gamma), float(self.priors.ht_scale_gamma)
+            lp += lIG(Qg, 0.5 * nu, 0.5 * nu * A * A)
             base = (
                 np.zeros(self.period - 1)
                 if self.priors.m_m0_gamma is None
@@ -619,7 +612,7 @@ class DLMRJGibbs:
         tau = self.rng.gamma(shape=a, scale=1.0 / b)
         self.sigma2 = 1.0 / max(tau, 1e-300)
 
-    # innovation sums of squares (Half-Cauchy mixture)
+    # innovation sums of squares
     def _innovation_ss_alpha(self) -> Tuple[float, int]:
         li = self._layout.idx_alpha
         if li is None:
@@ -654,28 +647,32 @@ class DLMRJGibbs:
             ss += (self.x[t, gs] - mean_new) ** 2
         return float(ss), self.T
 
-    def update_process_Q_halfcauchy(self) -> None:
+    def update_process_Q_halft(self) -> None:
+        """Half-Student-t prior on s_k ⇒ InvGamma prior on Q_k = s_k^2."""
         # alpha
         if self._layout.idx_alpha is not None:
             SS, T_eff = self._innovation_ss_alpha()
-            A = float(self.priors.hc_scale_alpha)
-            Q_alpha = self._rinvgamma(self.rng, 0.5 * T_eff + 0.5, 0.5 * SS + 1.0 / max(self._a_alpha, 1e-300))
+            nu, A = float(self.priors.ht_df_alpha), float(self.priors.ht_scale_alpha)
+            shape = 0.5 * (nu + T_eff)
+            scale = 0.5 * (nu * A * A + SS)
+            Q_alpha = self._rinvgamma(self.rng, shape, scale)
             self.s_alpha = math.sqrt(max(Q_alpha, 0.0))
-            self._a_alpha = self._rinvgamma(self.rng, 1.0, (1.0 / (A * A)) + 1.0 / max(Q_alpha, 1e-300))
         # beta
         if self._layout.idx_beta is not None:
             SS, T_eff = self._innovation_ss_beta()
-            A = float(self.priors.hc_scale_beta)
-            Q_beta = self._rinvgamma(self.rng, 0.5 * T_eff + 0.5, 0.5 * SS + 1.0 / max(self._a_beta, 1e-300))
+            nu, A = float(self.priors.ht_df_beta), float(self.priors.ht_scale_beta)
+            shape = 0.5 * (nu + T_eff)
+            scale = 0.5 * (nu * A * A + SS)
+            Q_beta = self._rinvgamma(self.rng, shape, scale)
             self.s_beta = math.sqrt(max(Q_beta, 0.0))
-            self._a_beta = self._rinvgamma(self.rng, 1.0, (1.0 / (A * A)) + 1.0 / max(Q_beta, 1e-300))
         # gamma
         if self.seasonal_mode == "dynamic":
             SS, T_eff = self._innovation_ss_gamma()
-            A = float(self.priors.hc_scale_gamma)
-            Q_gamma = self._rinvgamma(self.rng, 0.5 * T_eff + 0.5, 0.5 * SS + 1.0 / max(self._a_gamma, 1e-300))
+            nu, A = float(self.priors.ht_df_gamma), float(self.priors.ht_scale_gamma)
+            shape = 0.5 * (nu + T_eff)
+            scale = 0.5 * (nu * A * A + SS)
+            Q_gamma = self._rinvgamma(self.rng, shape, scale)
             self.s_gamma = math.sqrt(max(Q_gamma, 0.0))
-            self._a_gamma = self._rinvgamma(self.rng, 1.0, (1.0 / (A * A)) + 1.0 / max(Q_gamma, 1e-300))
 
     @staticmethod
     def _gibbs_m0_scalar(rng: np.random.Generator, x0: float, m_prior: float, s_prior: float, P0: float) -> float:
@@ -782,7 +779,7 @@ class DLMRJGibbs:
                 mean = ((tvec @ r) / sig2 + m0 / (s0 * s0)) / prec
                 self.m0_beta = float(self.rng.normal(mean, math.sqrt(1.0 / prec)))
 
-        # SEASON (deterministic): m0_gamma (K = p-1 with sum-to-zero)
+        # SEASON (deterministic): m0_gamma
         if self.seasonal_mode == "deterministic":
             K = self.period - 1
             midx = np.arange(self.T) % self.period
@@ -823,9 +820,6 @@ class DLMRJGibbs:
             "s_alpha": self.s_alpha,
             "s_beta": self.s_beta,
             "s_gamma": self.s_gamma,
-            "a_alpha": self._a_alpha,
-            "a_beta": self._a_beta,
-            "a_gamma": self._a_gamma,
             "m0_alpha": self.m0_alpha,
             "P0_alpha": self.P0_alpha,
             "m0_beta": self.m0_beta,
@@ -842,9 +836,6 @@ class DLMRJGibbs:
         self.s_alpha = float(S["s_alpha"])
         self.s_beta  = float(S["s_beta"])
         self.s_gamma = float(S["s_gamma"])
-        self._a_alpha = float(S["a_alpha"])
-        self._a_beta  = float(S["a_beta"])
-        self._a_gamma = float(S["a_gamma"])
         self.m0_alpha = float(S["m0_alpha"])
         self.P0_alpha = float(S["P0_alpha"])
         self.m0_beta  = float(S["m0_beta"])
@@ -892,28 +883,22 @@ class DLMRJGibbs:
         return True
 
     def _draw_prior_dyn_block(self, which: str) -> None:
-        # Half-Cauchy via IG mixture: a ~ InvGamma(1, 1/A^2), Q ~ InvGamma(1/2, 1/a)
+        # Half-Student-t prior ⇒ Q ~ InvGamma(ν/2, ν A^2 / 2)
         if which == "level":
-            A = float(self.priors.hc_scale_alpha)
-            a_aux = self._rinvgamma(self.rng, 1.0, 1.0 / (A * A))
-            Q = self._rinvgamma(self.rng, 0.5, 1.0 / max(a_aux, 1e-300))
-            self._a_alpha = a_aux
+            nu, A = float(self.priors.ht_df_alpha), float(self.priors.ht_scale_alpha)
+            Q = self._rinvgamma(self.rng, 0.5 * nu, 0.5 * nu * A * A)
             self.s_alpha = math.sqrt(max(Q, 1e-18))
             self.m0_alpha = float(self.rng.normal(self.priors.m_m0_alpha, self.priors.s_m0_alpha))
             self.P0_alpha = 1.0 / self.rng.gamma(self.priors.a_P0_alpha, 1.0 / self.priors.b_P0_alpha)
         elif which == "trend":
-            A = float(self.priors.hc_scale_beta)
-            a_aux = self._rinvgamma(self.rng, 1.0, 1.0 / (A * A))
-            Q = self._rinvgamma(self.rng, 0.5, 1.0 / max(a_aux, 1e-300))
-            self._a_beta = a_aux
+            nu, A = float(self.priors.ht_df_beta), float(self.priors.ht_scale_beta)
+            Q = self._rinvgamma(self.rng, 0.5 * nu, 0.5 * nu * A * A)
             self.s_beta = math.sqrt(max(Q, 1e-18))
             self.m0_beta = float(self.rng.normal(self.priors.m_m0_beta, self.priors.s_m0_beta))
             self.P0_beta = 1.0 / self.rng.gamma(self.priors.a_P0_beta, 1.0 / self.priors.b_P0_beta)
         elif which == "season":
-            A = float(self.priors.hc_scale_gamma)
-            a_aux = self._rinvgamma(self.rng, 1.0, 1.0 / (A * A))
-            Q = self._rinvgamma(self.rng, 0.5, 1.0 / max(a_aux, 1e-300))
-            self._a_gamma = a_aux
+            nu, A = float(self.priors.ht_df_gamma), float(self.priors.ht_scale_gamma)
+            Q = self._rinvgamma(self.rng, 0.5 * nu, 0.5 * nu * A * A)
             self.s_gamma = math.sqrt(max(Q, 1e-18))
             base = (
                 np.zeros(self.period - 1)
@@ -936,18 +921,15 @@ class DLMRJGibbs:
             )
             self.m0_gamma = base.astype(float)
         self._m0_gamma_full = np.r_[self.m0_gamma, -float(np.sum(self.m0_gamma))]
-        
+
     def _mh_accept(self, dlogpost: float) -> bool:
-        """Log-space Metropolis–Hastings accept/reject to avoid exp overflow/underflow."""
         if not np.isfinite(dlogpost):
             return False
         if dlogpost >= 0.0:
             return True
-        # accept with prob exp(dlogpost) without computing exp directly
         return (math.log(self.rng.uniform()) < dlogpost)
 
     def _safe_logpost(self) -> float:
-        """Compute current log posterior; return -inf on any numerical failure."""
         try:
             ll = self._kalman_loglik()
             lp = self._log_prior_current()
@@ -955,7 +937,6 @@ class DLMRJGibbs:
             return float(s) if np.isfinite(s) else float("-inf")
         except Exception:
             return float("-inf")
-
 
     def _rj_move_one(self) -> None:
         comps = ["level", "trend", "season"]
@@ -972,7 +953,6 @@ class DLMRJGibbs:
                 new_trend = "deterministic"
         elif comp == "trend":
             new_trend = prop
-            # ESCAPE MOVE: if proposing trend=dynamic while level!=dynamic, jointly flip level→dynamic
             if new_trend == "dynamic" and new_level != "dynamic":
                 new_level = "dynamic"
         else:
@@ -982,7 +962,6 @@ class DLMRJGibbs:
             self._rj_record(comp, False)
             return
 
-        # snapshot current state
         cur_snap = self._snapshot()
 
         # births: draw priors for newly-dynamic blocks
@@ -993,7 +972,7 @@ class DLMRJGibbs:
         if (season != "dynamic") and (new_season == "dynamic"):
             self._draw_prior_dyn_block("season")
 
-        # becoming deterministic season → initialize deterministic vector + zero P0
+        # becoming deterministic season
         if (season != "deterministic") and (new_season == "deterministic"):
             base = (
                 np.zeros(self.period - 1)
@@ -1004,7 +983,7 @@ class DLMRJGibbs:
             self._m0_gamma_full = np.r_[self.m0_gamma, -float(np.sum(self.m0_gamma))]
             self.P0_gamma = 0.0
 
-        # apply proposal modes (temporarily) to compute proposed log posterior
+        # apply proposal modes temporarily
         self.level_mode, self.trend_mode, self.seasonal_mode = new_level, new_trend, new_season
         self._layout = _Layout(self.period, self.level_mode, self.trend_mode, self.seasonal_mode)
         if self.level_mode != "dynamic":
@@ -1018,28 +997,23 @@ class DLMRJGibbs:
         else:
             self._m0_gamma_full = None
 
-        logpost_prop = self._safe_logpost()  # <- robust
+        logpost_prop = self._safe_logpost()
 
-        # restore current modes and compute current log posterior
+        # restore current
         self._load_snapshot(cur_snap)
-        logpost_cur = self._safe_logpost()  # <- robust
+        logpost_cur = self._safe_logpost()
 
-        # if either side is -inf (non-finite), hard-reject
         if not np.isfinite(logpost_prop) or not np.isfinite(logpost_cur):
             self._rj_record(comp, False)
             return
 
         dlogpost = logpost_prop - logpost_cur
-        accept = self._mh_accept(dlogpost)  # <- log-space MH
+        accept = self._mh_accept(dlogpost)
         self._rj_record(comp, bool(accept))
-
-        # for printing only: clip Δlogpost to keep lines readable
         disp_dlog = float(np.clip(dlogpost, -1e3, 1e3)) if np.isfinite(dlogpost) else float('nan')
 
         if accept:
-            # re-apply the accepted modes and re-allocate state holder
             before = (self.level_mode, self.trend_mode, self.seasonal_mode)
-            # load snapshot, then set to proposed
             self._load_snapshot(cur_snap)
             self.level_mode, self.trend_mode, self.seasonal_mode = new_level, new_trend, new_season
             if self.level_mode != "dynamic":
@@ -1054,14 +1028,12 @@ class DLMRJGibbs:
                 self._m0_gamma_full = None
             self._layout = _Layout(self.period, self.level_mode, self.trend_mode, self.seasonal_mode)
             self._alloc_state_holder()
-
             after = (self.level_mode, self.trend_mode, self.seasonal_mode)
             print(
                 f"[switch] block={comp} | "
                 f"L:{before[0][:3]}→{after[0][:3]} T:{before[1][:3]}→{after[1][:3]} S:{before[2][:3]}→{after[2][:3]} | "
                 f"Δlogpost={disp_dlog:+.4f} | RJ {self._fmt_rj_all()}"
             )
-
 
     # ------------------------------ bookkeeping ---------------------------- #
 
@@ -1115,10 +1087,8 @@ class DLMRJGibbs:
         save_iters = list(range(cfg.burn, cfg.n_iter, cfg.thin))
         n_kept, keep_idx = len(save_iters), 0
 
-        # pre-allocate with max possible dim (safe for RJ growth)
         max_dim = self._max_state_dim()
 
-        # Always allocate full set; fill with NaN where N/A. Plotter-friendly.
         self.keep = {
             "sigma": np.full(n_kept, np.nan, float),
             "mu":    np.full((n_kept, self.T), np.nan, float),
@@ -1147,7 +1117,7 @@ class DLMRJGibbs:
         for it in range(cfg.n_iter):
             if self._layout.dim > 0:
                 self.x = self._ffbs()
-                self.update_process_Q_halfcauchy()
+                self.update_process_Q_halft()
                 self.update_m0()
                 self.update_P0()
             self.update_deterministic_params()
@@ -1164,23 +1134,19 @@ class DLMRJGibbs:
             if it in save_iters:
                 k = keep_idx
 
-                # common
                 mu = self._mu_vec()
                 self.keep["mu"][k, :] = mu
                 self.keep["sigma"][k] = math.sqrt(self.sigma2)
 
-                # encode modes
                 enc = lambda s: 0 if s == "dynamic" else (1 if s == "deterministic" else 2)
                 self.keep["modes"][k, :] = np.array(
                     [enc(self.level_mode), enc(self.trend_mode), enc(self.seasonal_mode)], int
                 )
 
-                # process variances (Q = s^2); NaN where not applicable
                 self.keep["Q_alpha"][k] = (self.s_alpha**2) if (self.level_mode == "dynamic") else np.nan
                 self.keep["Q_beta"][k]  = (self.s_beta**2)  if (self.trend_mode == "dynamic") else np.nan
                 self.keep["Q_gamma"][k] = (self.s_gamma**2) if (self.seasonal_mode == "dynamic") else np.nan
 
-                # m0/P0 for dynamic; deterministic aliases when not dynamic
                 if self.level_mode == "dynamic":
                     self.keep["m0_alpha"][k] = self.m0_alpha
                     self.keep["P0_alpha"][k] = self.P0_alpha
@@ -1199,7 +1165,6 @@ class DLMRJGibbs:
                 elif self.seasonal_mode == "deterministic":
                     self.keep["season_det"][k, :] = np.asarray(self.m0_gamma, float)
 
-                # latent states (cap width in case of mode changes)
                 if self._layout.dim > 0:
                     w = min(self.x.shape[1], self.keep["x"].shape[2])
                     self.keep["x"][k, :, :w] = self.x[1: self.T + 1, :w]
@@ -1267,7 +1232,6 @@ class DLMRJGibbs:
             },
             "inclusion_probs": self.inclusion_probabilities(),
             "modes_encoding": {"dynamic": 0, "deterministic": 1, "none": 2},
-            # optional helper so the plotter can infer state layout for a given draw
             "layout_labels": (
                 (["alpha"] if self.level_mode == "dynamic" else [])
                 + (["beta"] if self.trend_mode == "dynamic" else [])
@@ -1281,7 +1245,6 @@ class DLMRJGibbs:
             json.dump(meta, f, indent=2)
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
-
 
 # =============================================================================
 # CLI / Example run
@@ -1300,7 +1263,6 @@ def _parse_date(s: str | None):
         return datetime(parts[0], parts[1], parts[2])
     raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
 
-
 def _csv_floats_or_none(s: str | None):
     if s is None:
         return None
@@ -1308,7 +1270,6 @@ def _csv_floats_or_none(s: str | None):
     if s == "":
         return None
     return [float(z) for z in s.split(",") if z.strip() != ""]
-
 
 def _csv_model_prior_block(s: str | None, allow_none: bool, defaults: dict) -> dict:
     out = dict(defaults)
@@ -1326,7 +1287,6 @@ def _csv_model_prior_block(s: str | None, allow_none: bool, defaults: dict) -> d
     else:
         out = {k: v / ssum for k, v in out.items()}
     return out
-
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
@@ -1353,9 +1313,9 @@ if __name__ == "__main__":
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
     p.add_argument("--sigma", type=float, default=3.0)
-    p.add_argument("--q-level", type=float, default=0.01)
-    p.add_argument("--q-trend", type=float, default=0.000002)
-    p.add_argument("--q-season", type=float, default=0.0001)
+    p.add_argument("--q-level", type=float, default=0.001)
+    p.add_argument("--q-trend", type=float, default=0.00002)
+    p.add_argument("--q-season", type=float, default=0.00008)
     p.add_argument("--m0-level", type=float, default=3.0)
     p.add_argument("--v0-level", type=float, default=0.05)
     p.add_argument("--m0-trend", type=float, default=0.015)
@@ -1379,10 +1339,13 @@ if __name__ == "__main__":
     p.add_argument("--prior-a-P0-gamma", type=float, default=5.0)
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
 
-    # Half-Cauchy scales
-    p.add_argument("--hc-scale-alpha", type=float, default=1)
-    p.add_argument("--hc-scale-beta", type=float, default=1)
-    p.add_argument("--hc-scale-gamma", type=float, default=1)
+    # Half-Student-t hyperparameters for process SDs
+    p.add_argument("--ht-df-alpha", type=float, default=1.0)     # ν_α
+    p.add_argument("--ht-scale-alpha", type=float, default=10)  # A_α
+    p.add_argument("--ht-df-beta", type=float, default=1)
+    p.add_argument("--ht-scale-beta", type=float, default=10)
+    p.add_argument("--ht-df-gamma", type=float, default=1.0)
+    p.add_argument("--ht-scale-gamma", type=float, default=10)
 
     # Model priors (Occam tilt for RJ)
     p.add_argument("--prior-model-level", type=str, default=None)
@@ -1447,7 +1410,7 @@ if __name__ == "__main__":
         mu_T = truths["mu_t"][1: 1 + args.T]
         dates_T = truths["index"][: args.T]
     else:
-        # Fallback: AR(1)-ish synthetic series with seasonality
+        # Fallback synthetic series
         t = np.arange(args.T)
         seas = np.sin(2 * np.pi * t / max(2, args.period))
         y = 0.1 * t + 2 * seas + rng.normal(0, args.sigma, size=args.T)
@@ -1471,9 +1434,12 @@ if __name__ == "__main__":
         b_P0_beta=args.prior_b_P0_beta,
         a_P0_gamma=args.prior_a_P0_gamma,
         b_P0_gamma=args.prior_b_P0_gamma,
-        hc_scale_alpha=args.hc_scale_alpha,
-        hc_scale_beta=args.hc_scale_beta,
-        hc_scale_gamma=args.hc_scale_gamma,
+        ht_df_alpha=args.ht_df_alpha,
+        ht_scale_alpha=args.ht_scale_alpha,
+        ht_df_beta=args.ht_df_beta,
+        ht_scale_beta=args.ht_scale_beta,
+        ht_df_gamma=args.ht_df_gamma,
+        ht_scale_gamma=args.ht_scale_gamma,
     )
 
     # Model prior (for Δ log posterior)
@@ -1548,10 +1514,11 @@ if __name__ == "__main__":
         else:
             print(f"\nSimulated fallback synthetic series of length {args.T}.")
         print("Sampler START modes: dynamic/dynamic/dynamic\n")
-        print("Half-Cauchy scales (A_k) for process SDs:")
+        print("Half-Student-t hyperparameters (ν, A) for process SDs:")
         print(
-            f"  A_alpha={priors.hc_scale_alpha:.3f}, A_beta={priors.hc_scale_beta:.3f}, "
-            f"A_gamma={priors.hc_scale_gamma:.3f}"
+            f"  level: (ν={priors.ht_df_alpha:.3g}, A={priors.ht_scale_alpha:.3g}); "
+            f"trend: (ν={priors.ht_df_beta:.3g}, A={priors.ht_scale_beta:.3g}); "
+            f"season: (ν={priors.ht_df_gamma:.3g}, A={priors.ht_scale_gamma:.3g})"
         )
         print("\nModel priors (normalized):")
         for k in ("level", "trend", "season"):
@@ -1576,7 +1543,11 @@ if __name__ == "__main__":
             "elapsed_seconds": float(elapsed),
             "sim_truth_modes": {"level": args.level_mode, "trend": args.trend_mode, "season": args.seasonal_mode},
             "start_modes": {"level": "dynamic", "trend": "dynamic", "season": "dynamic"},
-            "hc_scales": {"alpha": priors.hc_scale_alpha, "beta": priors.hc_scale_beta, "gamma": priors.hc_scale_gamma},
+            "ht": {
+                "alpha": {"df": priors.ht_df_alpha, "scale": priors.ht_scale_alpha},
+                "beta":  {"df": priors.ht_df_beta,  "scale": priors.ht_scale_beta},
+                "gamma": {"df": priors.ht_df_gamma, "scale": priors.ht_scale_gamma},
+            },
             "model_prior": model_prior,
         },
     )
@@ -1615,7 +1586,6 @@ if __name__ == "__main__":
 
     print(f"[save] Outputs written to: {out_dir}")
 
-
     # -------------------------------------------------------------------------
     # Posterior summaries (print to console)
     # -------------------------------------------------------------------------
@@ -1648,25 +1618,19 @@ if __name__ == "__main__":
             )
 
     print("\n================ Posterior summaries ================")
-
-    # --- Scalars
     _print_summ("sigma", post.get("sigma", np.array([])))
     _print_summ("Q_alpha", post.get("Q_alpha", np.array([])))
     _print_summ("Q_beta",  post.get("Q_beta",  np.array([])))
     _print_summ("Q_gamma", post.get("Q_gamma", np.array([])))
-
-    # --- m0 / P0 (dynamic) and deterministic aliases
     _print_summ("m0_alpha", post.get("m0_alpha", np.array([])))
     _print_summ("P0_alpha", post.get("P0_alpha", np.array([])))
     _print_summ("m0_beta",  post.get("m0_beta",  np.array([])))
     _print_summ("P0_beta",  post.get("P0_beta",  np.array([])))
     _print_summ("P0_gamma", post.get("P0_gamma", np.array([])))
 
-    # deterministic aliases (present only when block is deterministic on kept draw)
     _print_summ("m0_alpha_det", post.get("m0_alpha_det", np.array([])))
     _print_summ("m0_beta_det",  post.get("m0_beta_det",  np.array([])))
 
-    # --- Vectors: m0_gamma (dynamic) and season_det (deterministic)
     if "m0_gamma" in post:
         arr = np.asarray(post["m0_gamma"])
         if arr.ndim == 2 and arr.size:
@@ -1680,15 +1644,13 @@ if __name__ == "__main__":
             for j in range(K):
                 _print_summ(f"season_det[{j}]", arr[:, j])
 
-    # --- μ_t path — report aggregate scale and first few entries of μ̂ (posterior mean)
     if "mu" in post:
-        mu = np.asarray(post["mu"], float)  # (n_keep, T)
+        mu = np.asarray(post["mu"], float)
         if mu.ndim == 2 and mu.size:
             mu_mean = mu.mean(axis=0)
             mu_sd   = mu.std(axis=0, ddof=1) if mu.shape[0] > 1 else np.zeros(mu.shape[1])
             print("\n  μ_t (path) summary:")
             print(f"    mean(sd) across t : {mu_mean.mean():.4g} ({mu_sd.mean():.4g})")
-            # show a compact head/tail of μ̂_t
             show = min(5, mu_mean.size)
             head = ", ".join(f"{v:.4g}" for v in mu_mean[:show])
             tail = ", ".join(f"{v:.4g}" for v in mu_mean[-show:]) if mu_mean.size > show else ""
@@ -1698,8 +1660,6 @@ if __name__ == "__main__":
             else:
                 print(f"    μ̂_t              : [{head}]")
 
-    # --- Model probabilities / MAP from saved mode encodings
-    # modes: (n_keep, 3) with 0=dyn, 1=det, 2=none
     if "modes" in post:
         modes = np.asarray(post["modes"], int)
         if modes.ndim == 2 and modes.size:
@@ -1711,7 +1671,6 @@ if __name__ == "__main__":
                 total = cnts.sum()
                 line = " ".join(f"{lab[int(v)]}={cnt/total:.3f}" for v, cnt in zip(vals, cnts))
                 print(f"    {comp:6s}: {line}")
-            # MAP model
             tuples = [tuple(row.tolist()) for row in modes]
             uniq, cnts = np.unique(tuples, return_counts=True, axis=0)
             idx = int(np.argmax(cnts))

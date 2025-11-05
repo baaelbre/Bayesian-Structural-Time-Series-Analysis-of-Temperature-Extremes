@@ -871,7 +871,7 @@ if __name__ == "__main__":
     p.add_argument("--thin", type=int, default=2)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
-    p.add_argument("--progress-every", type=int, default=0)
+    p.add_argument("--progress-every", type=int, default=1)
     p.add_argument("--out-dir", type=str, default="results/simulations/DLM")
     p.add_argument("--plot", default=True)
     p.add_argument("--print-summary", default=True)

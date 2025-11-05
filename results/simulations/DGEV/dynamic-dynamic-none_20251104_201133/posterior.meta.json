@@ -1,0 +1,91 @@
+{
+  "T": 100,
+  "dim": 2,
+  "period": 4,
+  "modes": {
+    "level_mode": "dynamic",
+    "trend_mode": "dynamic",
+    "seasonal_mode": "none"
+  },
+  "layout": [
+    "alpha",
+    "beta"
+  ],
+  "cfg": {
+    "n_iter": 4000,
+    "burn": 1000,
+    "thin": 1,
+    "random_seed": 7,
+    "progress": true,
+    "progress_every": 1,
+    "n_particles": 500,
+    "trans_eps": 1e-08,
+    "ess_threshold_frac": 0.5,
+    "step_logsigma": 0.18941016835771698,
+    "step_xi": 0.0353327885618097,
+    "step_level": 0.2,
+    "step_slope": 0.001,
+    "step_season": 0.02,
+    "adapt_steps": true,
+    "adapt_every": 20,
+    "adapt_until": "burn",
+    "adapt_target_1d": 0.44,
+    "adapt_eta0": 0.2,
+    "adapt_eta_decay": 0.75,
+    "step_min": 1e-05,
+    "step_max": 1.0
+  },
+  "priors": {
+    "m_sigma": 1.0,
+    "s_sigma": 1.0,
+    "m_xi": 0.0,
+    "s_xi": 0.2,
+    "m_m0_alpha": 0.0,
+    "s_m0_alpha": 10.0,
+    "m_m0_beta": 0.0,
+    "s_m0_beta": 10.0,
+    "m_m0_gamma": null,
+    "s_m0_gamma": 5.0,
+    "a_P0_alpha": 2.0,
+    "b_P0_alpha": 1.0,
+    "a_P0_beta": 2.0,
+    "b_P0_beta": 1.0,
+    "a_P0_gamma": 2.0,
+    "b_P0_gamma": 1.0,
+    "m_level": 0.0,
+    "s_level": 10.0,
+    "m_slope": 0.0,
+    "s_slope": 10.0,
+    "m_season": null,
+    "s_season": 5.0,
+    "A_alpha": 1.0,
+    "A_beta": 1.0,
+    "A_gamma": 1.0
+  },
+  "hc_scales": {
+    "A_alpha": 1.0,
+    "A_beta": 1.0,
+    "A_gamma": 1.0
+  },
+  "true_sigma": 4.0,
+  "true_xi": -0.1,
+  "true_Q": [
+    0.1,
+    0.001
+  ],
+  "accept": {
+    "logsigma": 1439,
+    "xi": 3191,
+    "level": 0,
+    "slope": 0,
+    "season": 0
+  },
+  "proposals": {
+    "logsigma": 4000,
+    "xi": 4000,
+    "level": 0,
+    "slope": 0,
+    "season": 0
+  },
+  "elapsed_seconds": 5557.587322473526
+}

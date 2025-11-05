@@ -1331,7 +1331,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
     parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="dynamic")
-    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="deterministic")
+    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
 
     # Truth / simulator params
     parser.add_argument("--sigma",     type=float, default=4.0)

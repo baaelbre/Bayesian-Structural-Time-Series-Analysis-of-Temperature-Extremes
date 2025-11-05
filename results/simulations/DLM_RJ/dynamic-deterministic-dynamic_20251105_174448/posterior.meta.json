@@ -1,0 +1,88 @@
+{
+  "T": 500,
+  "period": 4,
+  "cfg": {
+    "n_iter": 20000,
+    "burn": 5000,
+    "thin": 2,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 1,
+    "rj_moves_per_iter": 3
+  },
+  "priors": {
+    "a_sigma": 2.0,
+    "b_sigma": 1.0,
+    "m_m0_alpha": 0.0,
+    "s_m0_alpha": 10.0,
+    "m_m0_beta": 0.0,
+    "s_m0_beta": 10.0,
+    "m_m0_gamma": null,
+    "s_m0_gamma": 5.0,
+    "a_P0_alpha": 5.0,
+    "b_P0_alpha": 1.0,
+    "a_P0_beta": 5.0,
+    "b_P0_beta": 1.0,
+    "a_P0_gamma": 5.0,
+    "b_P0_gamma": 1.0,
+    "hc_scale_alpha": 0.5,
+    "hc_scale_beta": 0.5,
+    "hc_scale_gamma": 0.5
+  },
+  "model_prior": {
+    "level": [
+      0.9,
+      0.10000000000000002,
+      1.0000000000000237e-300
+    ],
+    "trend": [
+      0.9,
+      0.10000000000000002,
+      1.0000000000000237e-300
+    ],
+    "season": [
+      0.9,
+      0.10000000000000002,
+      1.0000000000000237e-300
+    ]
+  },
+  "current_modes": {
+    "level": "dynamic",
+    "trend": "deterministic",
+    "season": "dynamic"
+  },
+  "rj_accept": {
+    "level": {
+      "proposed": 20109,
+      "accepted": 2413,
+      "acc_rate": 0.119996021681834
+    },
+    "trend": {
+      "proposed": 19848,
+      "accepted": 5,
+      "acc_rate": 0.00025191455058444175
+    },
+    "season": {
+      "proposed": 20043,
+      "accepted": 6,
+      "acc_rate": 0.000299356383774884
+    }
+  },
+  "modes_encoding": {
+    "dynamic": 0,
+    "deterministic": 1,
+    "none": 2
+  },
+  "layout_labels": [
+    "alpha",
+    "g1",
+    "g2",
+    "g3"
+  ],
+  "elapsed_seconds": 4521.363210439682,
+  "hc_scales": {
+    "alpha": 0.5,
+    "beta": 0.5,
+    "gamma": 0.5
+  }
+}
