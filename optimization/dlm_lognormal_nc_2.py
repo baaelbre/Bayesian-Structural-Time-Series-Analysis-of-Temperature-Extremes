@@ -1,8 +1,8 @@
 from __future__ import annotations
 """
 Gaussian structural time–series model with **dummy-rotation seasonality** (no harmonics)
-— **Non‑Centered** parameterization via **Durbin–Koopman Simulation Smoother**
-— Gibbs for Gaussian parts — and **log‑normal priors on process SDs** (slice on log‑SD).
+— **Non-Centered** parameterization via **Durbin–Koopman Simulation Smoother**
+— Gibbs for Gaussian parts — and **log-normal priors on process SDs** (slice on log-SD).
 
 Key differences vs centered FFBS version
 ----------------------------------------
@@ -23,7 +23,6 @@ Notes
 import json, math, os, sys, time, warnings
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
-
 import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -137,7 +136,7 @@ class SamplerConfig:
     sigma_update: str = "resid"
 
 # =============================================================================
-# DLM Sampler — Disturbance‑NCP + Dummy Rotation Seasonality
+# DLM Sampler — Disturbance-NCP + Dummy Rotation Seasonality
 # =============================================================================
 
 class DLMDisturbanceNCP:
@@ -149,7 +148,7 @@ class DLMDisturbanceNCP:
       y_t = H x_t + μ_det(t) + ε_t
 
     We sample (x_0, w_1:T, ε_1:T) with the **Durbin–Koopman simulation smoother** and reconstruct x.
-    Variance learning uses w_t sums of squares (per block) with log‑normal priors on s.
+    Variance learning uses w_t sums of squares (per block) with log-normal priors on s.
     """
 
     # --------------------------- Construction --------------------------- #
@@ -231,7 +230,7 @@ class DLMDisturbanceNCP:
             self.m0_gamma = None
             self.P0_gamma = 0.0
 
-        # Deterministic contributions
+        # Deterministic contributions (observation-side)
         if self.level_mode == "deterministic":
             self.m0_alpha = float(self.priors.m_m0_alpha)
         if self.trend_mode == "deterministic":
@@ -245,6 +244,13 @@ class DLMDisturbanceNCP:
             if base.size != self.period - 1:
                 raise ValueError("priors.m_m0_gamma must have length p-1")
             self.m0_gamma = np.r_[base, -float(np.sum(base))].astype(float)
+
+        # --- FIX: det-α in obs only ---
+        if self.level_mode == "deterministic":
+            # α must NOT be in the state; no process noise / initial variance for α
+            assert self.idx_alpha is None, "Deterministic level must NOT be in the state."
+            self.s_alpha = 0.0
+            self.P0_alpha = 0.0
 
         # Latent containers (x for convenience; w, eps for NCP energy)
         self.x   = np.zeros((self.T + 1, self.dim), float)
@@ -272,23 +278,27 @@ class DLMDisturbanceNCP:
             sd2 = _robust_sd(np.diff(y, n=2)) if y.size >= 3 else 0.0
             print(f"[init] scale proxies: sd1={sd1:.4g}, sd2={sd2:.4g}")
 
-        # slice handles for z = log s (built lazily inside update in case params change)
-
     # ----------------------------- Model matrices ----------------------------- #
     def _H(self) -> np.ndarray:
         if self.dim == 0:
             return np.zeros((1, 0))
         h = np.zeros(self.dim, float)
-        if self.idx_alpha is not None: h[self.idx_alpha] = 1.0
-        if self.seasonal_mode == "dynamic": h[self.idx_g_start] = 1.0
+        # α contributes to H ONLY if α is dynamic (idx_alpha not None)
+        if self.idx_alpha is not None:
+            h[self.idx_alpha] = 1.0
+        # dynamic seasonal contribution is g1
+        if self.seasonal_mode == "dynamic":
+            h[self.idx_g_start] = 1.0
         return h.reshape(1, -1)
 
     def _A(self) -> np.ndarray:
         if self.dim == 0:
             return np.zeros((0, 0))
         A = np.eye(self.dim)
+        # Only link β→α when α is dynamic
         if self.idx_alpha is not None and self.idx_beta is not None:
             A[self.idx_alpha, self.idx_beta] = 1.0
+        # dummy-rotation season dynamics
         if self.seasonal_mode == "dynamic":
             gs, ge = self.idx_g_start, self.idx_g_end
             K = ge - gs + 1  # p-1
@@ -301,6 +311,8 @@ class DLMDisturbanceNCP:
     def _u(self) -> np.ndarray:
         if self.dim == 0: return np.zeros(0, float)
         u = np.zeros(self.dim, float)
+        # --- FIX: det-α in obs only ---
+        # Only inject deterministic β drift into α if α is a state coordinate (dynamic).
         if (self.idx_alpha is not None) and (self.trend_mode == "deterministic"):
             u[self.idx_alpha] = float(self.m0_beta)
         return u
@@ -319,6 +331,7 @@ class DLMDisturbanceNCP:
     def _mu_det(self, t: int) -> float:
         out = 0.0
         if self.level_mode == "deterministic": out += self.m0_alpha
+        # when α is not in the state, a det trend is pure obs-side drift
         if (self.trend_mode == "deterministic") and (self.idx_alpha is None):
             out += self.m0_beta * t
         if self.seasonal_mode == "deterministic":
@@ -337,7 +350,6 @@ class DLMDisturbanceNCP:
         return np.asarray(m0, float), np.asarray(P0, float)
 
     # ====================== Durbin–Koopman simulation smoother ======================
-
     def _filter(self, y_series: Optional[np.ndarray] = None):
         yv = self.y if y_series is None else np.asarray(y_series, float)
         if self.dim == 0:
@@ -346,6 +358,13 @@ class DLMDisturbanceNCP:
             K = np.zeros((self.T + 1, 0)); m = np.zeros_like(a); C = np.zeros_like(Rm)
             return a, Rm, v, F, K, m, C
         H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
+        # --- FIX: det-α in obs only ---
+        if self.level_mode == "deterministic":
+            # H must not carry an α column
+            if self.idx_alpha is None:
+                pass
+            else:
+                raise RuntimeError("Deterministic α leaked into H.")
         m0_vec, P0_diag = self._current_m0_P0()
         m = np.zeros((self.T + 1, self.dim))
         C = np.zeros((self.T + 1, self.dim, self.dim))
@@ -387,7 +406,6 @@ class DLMDisturbanceNCP:
     def _simulate_smoother_draw(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (x[0..T], w[1..T], eps[1..T]). w[0]=x0−m0 is stored in w[:,] padding."""
         if self.dim == 0:
-            # No dynamic state; disturbances are pure obs noise draws
             eps = self._rng.normal(0.0, math.sqrt(self.sigma2), size=self.T)
             return np.zeros((self.T + 1, 0)), np.zeros((self.T + 1, 0)), eps
 
@@ -420,8 +438,8 @@ class DLMDisturbanceNCP:
         w[0] = x[0] - m0_vec
         for t in range(1, self.T + 1):
             w[t] = x[t] - (A @ x[t-1] + u)
-        # 5) Recover ε_t from pseudo trick too
-        #    ε = (y - μ_det - H x) + (e_plus - (y_plus - μ_det - H x_plus))
+
+        # 5) Recover ε_t
         resid_real = self.y - y_det - (H @ x[1:].T).ravel()
         resid_plus = y_plus - y_det - (H @ x_plus[1:].T).ravel()
         eps = resid_real + (e_plus - resid_plus)
@@ -470,7 +488,6 @@ class DLMDisturbanceNCP:
     # =============================================================================
     # Process SDs with log-normal priors: ln s ~ N(mu, sd^2) via slice on z=ln s
     # =============================================================================
-
     def _logpost_z(self, z: float, SS: float, T_eff: int, mu: float, sd: float) -> float:
         # For w_t ~ N(0, s^2): in z = ln s,  ll(z) = -T_eff z - 0.5 SS e^{-2z}
         ll = -T_eff * z - 0.5 * SS * math.exp(-2.0 * z)
@@ -564,7 +581,7 @@ class DLMDisturbanceNCP:
 
     # --- Deterministic parameter updates (conjugate) --- #
     def update_deterministic_params(self) -> None:
-        # deterministic level
+        # deterministic level (α lives in observation only)
         if self.level_mode == "deterministic":
             r = self.y.copy()
             if self.dim > 0:
@@ -705,7 +722,6 @@ class DLMDisturbanceNCP:
             if self.dim > 0:
                 self.x, self.w, self.eps = self._simulate_smoother_draw()
             else:
-                # no dynamic state: draw eps for sigma update only
                 self.eps = self._rng.normal(0.0, math.sqrt(self.sigma2), size=self.T)
 
             # 2) Update process SDs from disturbance energy (log-normal via slice)
@@ -810,7 +826,6 @@ if __name__ == "__main__":
     from datetime import datetime
     import matplotlib.pyplot as plt
 
-
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     sys.path.append(base_dir)
     from simulator.mean_time_series import Mean_Time_Series  # newest-first
@@ -832,7 +847,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description=(
             "DLM (dummy-rotation) in **disturbance NCP** with DK simulation smoother.\n"
-            "Log‑normal priors on process SDs updated via slice on log‑SD.\n"
+            "Log-normal priors on process SDs updated via slice on log-SD.\n"
             "Deterministic pieces by conjugate normals; σ² from residuals or ε-draws."
         )
     )
@@ -843,7 +858,7 @@ if __name__ == "__main__":
     p.add_argument("--start-date", type=str, default="2000-01-01")
     p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
     p.add_argument("--sigma", type=float, default=1.5)
     p.add_argument("--q-level", type=float, default=1e-3)
     p.add_argument("--q-trend", type=float, default=2e-4)
