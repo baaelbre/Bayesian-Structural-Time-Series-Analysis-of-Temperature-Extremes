@@ -1,24 +1,23 @@
 from __future__ import annotations
 """
 Gaussian structural time–series model with harmonic seasonality (cos/sin pairs + optional Nyquist)
-— **Non‑Centered** parameterization via **Disturbance Simulation Smoother** (Durbin–Koopman)
-— Gibbs for Gaussian parts — and **log‑normal priors on process standard deviations** (slice on log‑SD).
+— Non‑Centered parameterization via Durbin–Koopman simulation smoother (disturbance NCP)
+— Gibbs for Gaussian parts — and log‑normal priors on process standard deviations (slice on log‑SD).
 
-Key points vs centered FFBS version
------------------------------------
-• Primary latents are **state disturbances** w_t (and x_0), not the states x_t themselves.
-  We draw (x_0, w_1:T) using the Durbin–Koopman **simulation smoother** and then reconstruct x.
-• Process SD updates use the **true innovation energy** SS = \sum_t w_{k,t}^2 for each block k∈{α,β,γ}.
-• Seasonal block uses 2×2 rotations for (cos_k, sin_k) and optional Nyquist (−1 flip), all with shared SD s_γ.
-• Deterministic pieces (level/trend/season) are updated by conjugate normals.
-• Observation variance σ² updated by Gamma on precision.
+Key upgrades in this rewrite
+----------------------------
+• Robust **NaN‑tolerant** Kalman filter/smoother (prediction step only when y_t is missing).
+• **Explicit SPD solves** for RTS gain: J_t = C_t A' R_{t+1}^{-1} via a stable linear solve.
+• Optional **ε‑based σ² update** (from DK observation disturbances) or classic residual‑based update.
+• Clear guards for tiny variances (F_t, Q, P0) and consistent symmetrization of covariances.
+• Seasonal helpers unchanged at import, with orthonormal projections recommended in optimization.harmonic_helpers.
 
 Notes
 -----
-- This file expects helper FFT mappers in `harmonic_helpers.py` providing:
+- Expects `optimization.harmonic_helpers` with:
     center_and_report_dummies_full, dummies_full_to_harmonics_fft, harmonics_to_dummies_full_fft
-- The non‑centered flavour here is the **disturbance** parameterization: we work with w_t and x_0.
-  It is the standard NCP for linear Gaussian SSMs and is numerically stable for variance learning.
+  Fallbacks are provided if the module is unavailable.
+- Disturbance NCP: we work with (x_0, w_1:T) as primary latents; x is reconstructed each iteration.
 """
 
 import json, math, os, sys, time, warnings
@@ -28,18 +27,46 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-
-base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(base_dir)
-from optimization.harmonic_helpers import (
+# -----------------------------------------------------------------------------
+# Optional helpers import with safe fallbacks
+# -----------------------------------------------------------------------------
+try:
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(base_dir)
+    from optimization.harmonic_helpers import (
         center_and_report_dummies_full,
         dummies_full_to_harmonics_fft,
         harmonics_to_dummies_full_fft,
     )
+except Exception:
+    def center_and_report_dummies_full(dummies, tol=1e-12):
+        x = np.asarray(dummies, float)
+        return x - x.mean()
+    def dummies_full_to_harmonics_fft(dummies_full_centered, K, use_nyquist):
+        s = len(dummies_full_centered); t = np.arange(s)
+        cos = []; sin = []
+        for k in range(1, K+1):
+            w = 2*np.pi*k/s
+            c = 2.0/s * np.sum(dummies_full_centered * np.cos(w*t))
+            s_ = 2.0/s * np.sum(dummies_full_centered * np.sin(w*t))
+            cos.append(c); sin.append(s_)
+        nyq = None
+        if use_nyquist and (s % 2 == 0):
+            nyq = (1.0/s) * np.sum(dummies_full_centered * ((-1.0)**t))
+        return np.asarray(cos), np.asarray(sin), nyq
+    def harmonics_to_dummies_full_fft(s, cos_coefs, sin_coefs, use_nyquist, nyq_coef=None):
+        t = np.arange(s, dtype=float)
+        out = np.zeros(s, float)
+        for k,(ck,sk) in enumerate(zip(cos_coefs, sin_coefs), start=1):
+            w = 2*np.pi*k/s
+            out += ck*np.cos(w*t) + sk*np.sin(w*t)
+        if use_nyquist and (nyq_coef is not None):
+            out += float(nyq_coef) * ((-1.0)**t)
+        return out - out.mean()
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Small utils
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _mad(v: np.ndarray) -> float:
     v = np.asarray(v, float)
@@ -52,9 +79,9 @@ def _robust_sd(v: np.ndarray) -> float:
     v = np.asarray(v, float)
     return _mad(v) / 1.4826 if v.size else 0.0
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Slice sampler (univariate)
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 def _slice_sample(logpdf, z0: float, rng: np.random.Generator,
                   w: float = 1.0, m: int = 10, max_shrink: int = 1000,
@@ -84,9 +111,9 @@ def _slice_sample(logpdf, z0: float, rng: np.random.Generator,
         it += 1
     return float(z0)
 
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Priors & Config
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 @dataclass
 class Priors:
@@ -130,26 +157,28 @@ class SamplerConfig:
     random_seed: Optional[int] = 7
     progress: bool = True
     progress_every: int = 0  # 0 => ~2% of n_iter
-    # print reconstructed (sized s) dummies each N iterations (0=off)
-    print_dummies_every: int = 0
+    print_dummies_every: int = 0  # print reconstructed full-length dummies each N iterations (0=off)
 
     # Slice parameters for log SD updates
-    slice_w: float = 1.0  # initial bracket width in z-space
-    slice_m: int = 10     # max stepping-out steps per side
+    slice_w: float = 1.0
+    slice_m: int = 10
 
-# =============================================================================
+    # σ² update choice: "resid" uses y - μ(x); "eps" uses DK observation disturbances
+    sigma_update: str = "resid"  # or "eps"
+
+# -----------------------------------------------------------------------------
 # Disturbance‑NCP Sampler – harmonic seasonality (cos/sin pairs + optional Nyquist)
-# =============================================================================
+# -----------------------------------------------------------------------------
 
 class DLMNCPHarmonic:
     """
-    Linear Gaussian SSM in **disturbance** NCP.
+    Linear Gaussian SSM in disturbance NCP.
 
     States (if dynamic):
       x_t = A x_{t-1} + u + w_t,  w_t ~ N(0, Q),  ε_t ~ N(0, σ²)
       y_t = H x_t + μ_det(t) + ε_t
 
-    We sample (x_0, w_1:T) with the **simulation smoother** and reconstruct x.
+    We sample (x_0, w_1:T) with the simulation smoother and reconstruct x.
     Variance learning uses w_t sums of squares (per block) with log‑normal priors on s.
     """
 
@@ -270,6 +299,7 @@ class DLMNCPHarmonic:
         # latent containers
         self.x = np.zeros((self.T + 1, self.dim), float)   # states (reconstructed each iter)
         self.w = np.zeros((self.T + 1, self.dim), float)   # disturbances, with w[0]=x0−m0 draw proxy
+        self.eps = np.zeros(self.T, float)                 # DK observation disturbances (optional)
 
         # progress tag
         if self.cfg.progress:
@@ -367,36 +397,36 @@ class DLMNCPHarmonic:
     def _current_m0_P0(self) -> Tuple[np.ndarray, np.ndarray]:
         m0, P0 = [], []
         if self.idx_alpha is not None:
-            m0.append(self.m0_alpha); P0.append(self.P0_alpha)
+            m0.append(self.m0_alpha); P0.append(max(self.P0_alpha, 1e-12))
         if self.idx_beta is not None:
-            m0.append(self.m0_beta);  P0.append(self.P0_beta)
+            m0.append(self.m0_beta);  P0.append(max(self.P0_beta, 1e-12))
         if self.seasonal_mode == "dynamic":
             for k in range(self.K):
                 m0 += [self.m0_cos[k], self.m0_sin[k]]
-                P0 += [self.P0_harm,   self.P0_harm]
+                P0 += [max(self.P0_harm, 1e-12), max(self.P0_harm, 1e-12)]
             if self.use_nyq:
                 m0.append(float(0.0 if self.m0_nyq is None else self.m0_nyq))
-                P0.append(self.P0_harm)
+                P0.append(max(self.P0_harm, 1e-12))
         return np.asarray(m0, float), np.asarray(P0, float)
 
-    # ====================== Durbin–Koopman simulation smoother ======================
+    # ====================== Kalman filter (NaN‑robust) ======================
 
     def _filter(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Kalman filter sufficient stats for the smoother.
-        Returns (a, P, v, F, K, m, C) for t=1..T where a[t]=a_t, etc.
+        Returns (a, Rm, v, F, K, m, C) for t=1..T where a[t]=a_t, etc.
+        Missing y_t (NaN) triggers prediction‑only updates.
         """
         if self.dim == 0:
-            # purely deterministic regression on μ_det + noise
             a = np.zeros((self.T + 1, 0))
             P = np.zeros((self.T + 1, 0, 0))
             v = np.zeros(self.T)
-            F = np.ones(self.T) * self.sigma2
+            F = np.ones(self.T) * max(self.sigma2, 1e-12)
             K = np.zeros((self.T + 1, 0))
             m = np.zeros_like(a)
             C = np.zeros_like(P)
             return a, P, v, F, K, m, C
 
-        H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
+        H, A, Q, R = self._H(), self._A(), self._Q(), float(max(self.sigma2, 1e-12))
         m0_vec, P0_diag = self._current_m0_P0()
         m = np.zeros((self.T + 1, self.dim))
         C = np.zeros((self.T + 1, self.dim, self.dim))
@@ -408,15 +438,29 @@ class DLMNCPHarmonic:
         m[0] = m0_vec
         C[0] = np.diag(P0_diag) + 1e-12 * np.eye(self.dim)
         u = self._u()
+
+        mu_det_cache = np.array([self._mu_det(t) for t in range(self.T)], float)
+
         for t in range(1, self.T + 1):
             a[t]  = A @ m[t - 1] + u
             Rm[t] = A @ C[t - 1] @ A.T + Q
             Rm[t] = 0.5*(Rm[t] + Rm[t].T) + 1e-12*np.eye(self.dim)
-            y_det = self._mu_det(t - 1)
-            v[t-1] = float(self.y[t - 1] - y_det - H @ a[t])
+
+            yt = self.y[t - 1]
+            if not np.isfinite(yt):
+                # missing observation: prediction only
+                v[t-1] = 0.0
+                F[t-1] = float(H @ Rm[t] @ H.T + R)
+                F[t-1] = max(F[t-1], R*1e-12)
+                m[t] = a[t]
+                C[t] = Rm[t]
+                K[t] = 0.0
+                continue
+
+            y_det = mu_det_cache[t - 1]
+            v[t-1] = float(yt - y_det - H @ a[t])
             F[t-1] = float(H @ Rm[t] @ H.T + R)
-            if F[t-1] <= 0:
-                F[t-1] = float(H @ (Rm[t] + 1e-10*np.eye(self.dim)) @ H.T + R)
+            F[t-1] = max(F[t-1], R*1e-12)
             Kt = (Rm[t] @ H.T) / F[t-1]
             K[t] = Kt.flatten()
             m[t] = a[t] + Kt.flatten()*v[t-1]
@@ -424,14 +468,16 @@ class DLMNCPHarmonic:
             C[t] = 0.5*(C[t] + C[t].T) + 1e-12*np.eye(self.dim)
         return a, Rm, v, F, K, m, C
 
-    def _simulate_smoother_draw(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Durbin–Koopman simulation smoother draw of states x and state disturbances w.
-        Returns (x[0..T], w[1..T] padded with w[0]=x0−m0)."""
-        if self.dim == 0:
-            # No dynamic state; x is empty, w empty
-            return np.zeros((self.T + 1, 0)), np.zeros((self.T + 1, 0))
+    # ====================== DK simulation smoother ======================
 
-        H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
+    def _simulate_smoother_draw(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Durbin–Koopman simulation smoother draw of states x, state disturbances w, and ε (obs disturbances).
+        Returns (x[0..T], w[0..T] with w[0]=x0−m0, eps[1..T]).
+        """
+        if self.dim == 0:
+            return np.zeros((self.T + 1, 0)), np.zeros((self.T + 1, 0)), np.zeros(self.T)
+
+        H, A, Q, R = self._H(), self._A(), self._Q(), float(max(self.sigma2, 1e-12))
         m0_vec, P0_diag = self._current_m0_P0()
         a, Rm, v, F, K, m_filt, C_filt = self._filter()
 
@@ -460,18 +506,23 @@ class DLMNCPHarmonic:
         # 4) Recover disturbances
         w = np.zeros_like(x)
         w[0] = x[0] - m0_vec
+        eps = np.zeros(self.T)
         for t in range(1, self.T + 1):
-            w[t] = x[t] - (A @ x[t-1] + u)
-        return x, w
+            x_pred = A @ x[t-1] + u
+            w[t] = x[t] - x_pred
+            # observation disturbance consistent with current draw
+            mu_det_t1 = y_det[t-1]
+            eps[t-1] = float(self.y[t-1] - mu_det_t1 - (H @ x[t])) if np.isfinite(self.y[t-1]) else 0.0
+        return x, w, eps
 
     def _filter_on_series(self, y_series: np.ndarray):
-        # identical to _filter but with externally supplied series
+        # identical to _filter but with externally supplied series (assumed fully observed)
         if self.dim == 0:
             a = np.zeros((self.T + 1, 0)); P = np.zeros((self.T + 1, 0, 0))
-            v = np.zeros(self.T); F = np.ones(self.T) * self.sigma2
+            v = np.zeros(self.T); F = np.ones(self.T) * max(self.sigma2, 1e-12)
             K = np.zeros((self.T + 1, 0)); m = np.zeros_like(a); C = np.zeros_like(P)
             return a, P, v, F, K, m, C
-        H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
+        H, A, Q, R = self._H(), self._A(), self._Q(), float(max(self.sigma2, 1e-12))
         m0_vec, P0_diag = self._current_m0_P0()
         m = np.zeros((self.T + 1, self.dim))
         C = np.zeros((self.T + 1, self.dim, self.dim))
@@ -483,15 +534,15 @@ class DLMNCPHarmonic:
         m[0] = m0_vec
         C[0] = np.diag(P0_diag) + 1e-12 * np.eye(self.dim)
         u = self._u()
+        mu_det_cache = np.array([self._mu_det(t) for t in range(self.T)], float)
         for t in range(1, self.T + 1):
             a[t]  = A @ m[t - 1] + u
             Rm[t] = A @ C[t - 1] @ A.T + Q
             Rm[t] = 0.5*(Rm[t] + Rm[t].T) + 1e-12*np.eye(self.dim)
-            y_det = self._mu_det(t - 1)
+            y_det = mu_det_cache[t - 1]
             v[t-1] = float(y_series[t - 1] - y_det - H @ a[t])
             F[t-1] = float(H @ Rm[t] @ H.T + R)
-            if F[t-1] <= 0:
-                F[t-1] = float(H @ (Rm[t] + 1e-10*np.eye(self.dim)) @ H.T + R)
+            F[t-1] = max(F[t-1], R*1e-12)
             Kt = (Rm[t] @ H.T) / F[t-1]
             K[t] = Kt.flatten()
             m[t] = a[t] + Kt.flatten()*v[t-1]
@@ -506,12 +557,9 @@ class DLMNCPHarmonic:
         x_sm = np.zeros_like(m_filt)
         x_sm[self.T] = m_filt[self.T]
         for t in range(self.T - 1, -1, -1):
-            J = C_filt[t] @ A.T
-            # SPD solve for Rm[t+1]
-            Rmt1 = Rm[t+1]
-            # regularize
-            Rmt1 = 0.5*(Rmt1 + Rmt1.T) + 1e-12*np.eye(self.dim)
-            J = np.linalg.solve(Rmt1.T, J.T).T  # J = C_t A' R_{t+1}^{-1}
+            # J = C_t A' R_{t+1}^{-1} via stable solve
+            Rmt1 = 0.5*(Rm[t+1] + Rm[t+1].T) + 1e-12*np.eye(self.dim)
+            J = np.linalg.solve(Rmt1, (C_filt[t] @ A.T).T).T
             x_pred = A @ m_filt[t] + u
             x_sm[t] = m_filt[t] + J @ (x_sm[t+1] - x_pred)
         return x_sm
@@ -529,10 +577,23 @@ class DLMNCPHarmonic:
     # ------------------ σ² | rest  (Gamma on precision) ------------------ #
 
     def update_sigma2(self) -> None:
-        e = self.y - self._mu_vec()
+        if self.cfg.sigma_update == "eps" and self.dim > 0:
+            # use DK observation disturbances (ignoring NaN y_t which set eps_t=0)
+            e2 = float(self.eps @ self.eps)
+        else:
+            e = self.y - self._mu_vec()
+            # treat NaNs as zero contribution (drop them):
+            mask = np.isfinite(e)
+            e2 = float(e[mask] @ e[mask])
+            Teff = int(mask.sum())
+            a = self.priors.a_sigma + 0.5 * Teff
+            b = self.priors.b_sigma + 0.5 * e2
+            tau = np.random.gamma(shape=a, scale=1.0 / b)
+            self.sigma2 = 1.0 / max(tau, 1e-300)
+            return
         a = self.priors.a_sigma + 0.5 * self.T
-        b = self.priors.b_sigma + 0.5 * float(e @ e)
-        tau = np.random.gamma(shape=a, scale=1.0 / b)  # precision
+        b = self.priors.b_sigma + 0.5 * e2
+        tau = np.random.gamma(shape=a, scale=1.0 / b)
         self.sigma2 = 1.0 / max(tau, 1e-300)
 
     # ------------- Innovation sums of squares (from disturbances) ------------- #
@@ -563,13 +624,10 @@ class DLMNCPHarmonic:
             ss += float(v @ v); count += v.size
         return float(ss), int(count)
 
-    # =============================================================================
-    # Process SDs with log-normal priors: ln s ~ N(mu, sd^2) via slice on z=ln s
-    # =============================================================================
+    # ----------------- Process SDs with log-normal priors ----------------- #
 
     def _logpost_z(self, z: float, SS: float, T_eff: int, mu: float, sd: float) -> float:
-        # For w_t ~ N(0, s^2): likelihood contribution in z = ln s is
-        #   ll(z) = -T_eff * z - 0.5 * SS * exp(-2z)
+        # For w_t ~ N(0, s^2): ll(z) = -T_eff * z - 0.5 * SS * exp(-2z)
         ll = -T_eff * z - 0.5 * SS * math.exp(-2.0 * z)
         lp = -0.5 * ((z - mu) ** 2) / (sd ** 2)
         return ll + lp
@@ -609,7 +667,6 @@ class DLMNCPHarmonic:
         prec = 1.0/(s_prior**2) + 1.0/max(1e-18, P0)
         var = 1.0/prec
         mean = var*(m_prior/(s_prior**2) + x0/max(1e-18, P0))
-        # guard
         var = float(np.clip(var, 1e-6, 1e6))
         mean = float(np.clip(mean, -1e6, 1e6))
         return float(np.random.normal(mean, math.sqrt(var)))
@@ -675,10 +732,13 @@ class DLMNCPHarmonic:
             r -= np.array([self._season_det(t) for t in range(self.T)], float)
             if (self.idx_alpha is None) and (self.trend_mode == "deterministic"):
                 r -= self.m0_beta * np.arange(self.T, dtype=float)
-            s2 = float(self.sigma2)
+            s2 = float(max(self.sigma2, 1e-12))
             m0, s0 = float(self.priors.m_m0_alpha), float(self.priors.s_m0_alpha)
-            prec = self.T / s2 + 1.0 / (s0**2)
-            mean = ((r.sum() / s2) + m0 / (s0**2)) / prec
+            mask = np.isfinite(r)
+            T_eff = int(mask.sum())
+            rs = float(r[mask].sum())
+            prec = T_eff / s2 + 1.0 / (s0**2)
+            mean = (rs / s2 + m0 / (s0**2)) / prec
             var = 1.0 / prec
             self.m0_alpha = float(np.random.normal(mean, math.sqrt(var)))
 
@@ -686,7 +746,7 @@ class DLMNCPHarmonic:
         if self.trend_mode == "deterministic":
             if self.idx_alpha is not None:
                 d = self.x[1:, self.idx_alpha] - self.x[:-1, self.idx_alpha]
-                s2 = float(self.s_alpha**2) if self.s_alpha > 0 else 1e-12
+                s2 = max(self.s_alpha**2, 1e-12)
                 m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
                 prec = (self.T / s2) + 1.0 / (s0**2)
                 mean = ((float(np.sum(d)) / s2) + m0 / (s0**2)) / prec
@@ -703,9 +763,12 @@ class DLMNCPHarmonic:
                     r -= self.m0_alpha
                 r -= np.array([self._season_det(tt) for tt in range(self.T)], float)
                 m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
-                sig2 = float(self.sigma2)
-                prec = (t @ t) / sig2 + 1.0 / (s0**2)
-                mean = ((t @ r) / sig2 + m0 / (s0**2)) / prec
+                sig2 = float(max(self.sigma2, 1e-12))
+                mask = np.isfinite(r)
+                t_eff = t[mask]
+                r_eff = r[mask]
+                prec = (t_eff @ t_eff) / sig2 + 1.0 / (s0**2)
+                mean = ((t_eff @ r_eff) / sig2 + m0 / (s0**2)) / prec
                 var = 1.0 / prec
                 self.m0_beta = float(np.random.normal(mean, math.sqrt(var)))
 
@@ -738,9 +801,12 @@ class DLMNCPHarmonic:
                     m_prior[1:2*self.K:2] = np.asarray(self.priors.m_m0_sin, float)
             if self.use_nyq and (p > 2*self.K):
                 m_prior[-1] = float(self.priors.m_m0_nyq)
-            sig2 = float(self.sigma2)
-            Prec = (Z.T @ Z) / sig2 + np.eye(p) / s2
-            b = (Z.T @ r) / sig2 + m_prior / s2
+            sig2 = float(max(self.sigma2, 1e-12))
+            mask = np.isfinite(r)
+            Z_eff = Z[mask, :]
+            r_eff = r[mask]
+            Prec = (Z_eff.T @ Z_eff) / sig2 + np.eye(p) / s2
+            b = (Z_eff.T @ r_eff) / sig2 + m_prior / s2
             mu = np.linalg.solve(Prec, b)
             L = np.linalg.cholesky(Prec)
             theta = mu + np.linalg.solve(L.T, np.random.randn(p))
@@ -830,9 +896,9 @@ class DLMNCPHarmonic:
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50) or 1
 
         for it in range(cfg.n_iter):
-            # 1) Draw (x, w) via disturbance simulation smoother
+            # 1) Draw (x, w, eps) via disturbance simulation smoother
             if self.dim > 0:
-                self.x, self.w = self._simulate_smoother_draw()
+                self.x, self.w, self.eps = self._simulate_smoother_draw()
 
             # 2) Update process SDs from disturbance energy (log-normal via slice)
             if self.dim > 0:
@@ -954,12 +1020,11 @@ if __name__ == "__main__":
         return [float(z) for z in s.split(",")]
 
     p = argparse.ArgumentParser(
-        description=("Gaussian DLM (harmonic seasonality) with a **non-centered parameterization**: "
-            "we sample **disturbances** w₁:ₜ and reconstruct states via the Durbin–Koopman simulation smoother."
-            "Observation variance σ² has Gamma prior on precision. Process SDs have **log-normal priors**; "
-            "we update z = ln s with univariate slice sampling using innovation SS from the drawn disturbances."
-            "The CLI can project full-length seasonal dummies to (cos,sin,nyq) if initial harmonic coefficients are not supplied."
-        )
+        description=("Gaussian DLM (harmonic seasonality) with a non-centered parameterization: "
+            "we sample disturbances w₁:ₜ and reconstruct states via the Durbin–Koopman simulation smoother. "
+            "Observation variance σ² has Gamma prior on precision. Process SDs have log-normal priors; "
+            "we update z = ln s with univariate slice sampling using innovation SS from the drawn disturbances. "
+            "The CLI can project full-length seasonal dummies to (cos,sin,nyq) if initial harmonic coefficients are not supplied.")
     )
 
     # ----------------- Simulation controls -----------------
@@ -973,8 +1038,8 @@ if __name__ == "__main__":
     p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
     p.add_argument("--q-level", type=float, default=0.05)
-    p.add_argument("--q-trend", type=float, default=0.002)
-    p.add_argument("--q-season", type=float, default=0.1, help="One scalar seasonal process variance (simulator)")
+    p.add_argument("--q-trend", type=float, default=0.000002)
+    p.add_argument("--q-season", type=float, default=0.0001, help="One scalar seasonal process variance (simulator)")
 
     # Simulator priors (truth generation)
     p.add_argument("--m0-level", type=float, default=5.0)
@@ -1002,6 +1067,7 @@ if __name__ == "__main__":
     p.add_argument("--progress", type=int, default=1)
     p.add_argument("--progress-every", type=int, default=1)
     p.add_argument("--print-dummies-every", type=int, default=1, help="Print reconstructed full-length dummies every N iters (0=off)")
+    p.add_argument("--sigma-update", type=str, choices=["resid","eps"], default="resid", help="σ² update source")
 
     # Log-normal prior hyperparameters (process SDs)
     p.add_argument("--ln-s-alpha-mu", type=float, default=-1.0)
@@ -1120,6 +1186,7 @@ if __name__ == "__main__":
         progress_every=int(args.progress_every),
         print_dummies_every=int(args.print_dummies_every),
         slice_w=float(args.slice_w), slice_m=int(args.slice_m),
+        sigma_update=str(args.sigma_update),
     )
 
     # ---------- derive sampler seasonal inits from full-length dummies if needed ----------
@@ -1160,10 +1227,11 @@ if __name__ == "__main__":
     if args.print_summary:
         print(f"Simulated {args.T} observations (σ={mts.sigma:.3g}) with modes "
               f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}.")
-        print(f"Harmonics: K={sampler.K}, Nyquist={sampler.use_nyq}"
+        print(f"Harmonics: K={sampler.K}, Nyquist={sampler.use_nyq} "
               f"LN priors (ln s): α~N({priors.ln_s_alpha_mu:.2f},{priors.ln_s_alpha_sd:.2f}²), "
               f"β~N({priors.ln_s_beta_mu:.2f},{priors.ln_s_beta_sd:.2f}²), "
               f"γ~N({priors.ln_s_gamma_mu:.2f},{priors.ln_s_gamma_sd:.2f}²)")
+        print(f"σ² update: {cfg.sigma_update}")
 
     # ---------- run ----------
     t0 = time.time()
@@ -1189,6 +1257,7 @@ if __name__ == "__main__":
             },
             "ncp": True,
             "dk_sim_smoother": True,
+            "sigma_update": cfg.sigma_update,
         },
     )
 
