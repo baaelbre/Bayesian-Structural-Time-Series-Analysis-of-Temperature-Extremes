@@ -564,7 +564,52 @@ class DLMDisturbanceNCP:
 
     # --- Deterministic parameter updates (conjugate) --- #
     def update_deterministic_params(self) -> None:
-        # deterministic level
+    """
+    Conjugate updates for deterministic pieces.
+    Fix: when level is deterministic and alpha is NOT dynamic, we must subtract the
+    deterministic trend before updating the intercept, otherwise the intercept absorbs slope.
+    Also: when both level & trend are deterministic (and no dynamic alpha), do a joint
+    2-parameter Gaussian regression update for [m0_alpha, m0_beta].
+    """
+    # -----------------------------
+    # Case A: joint (m0_alpha, m0_beta)
+    # -----------------------------
+    if (self.level_mode == "deterministic") and (self.trend_mode == "deterministic") and (self.idx_alpha is None):
+        # r_t = y_t - dyn_t - season_det(t)
+        r = self.y.copy()
+        if self.dim > 0:
+            H = self._H()
+            for t in range(1, self.T + 1):
+                r[t - 1] -= float(H @ self.x[t])
+        if self.seasonal_mode == "deterministic":
+            r -= self.m0_gamma[np.arange(self.T) % self.period]
+
+        # design for intercept + slope (optionally center time later if you want)
+        t = np.arange(self.T, dtype=float)
+        X = np.c_[np.ones(self.T), t]
+
+        # priors (independent normals)
+        m_prior = np.array([self.priors.m_m0_alpha, self.priors.m_m0_beta], float)
+        S_prior = np.diag([self.priors.s_m0_alpha**2, self.priors.s_m0_beta**2])
+        S0_inv  = np.linalg.inv(S_prior)
+
+        sig2 = float(self.sigma2)
+        Prec = (X.T @ X) / sig2 + S0_inv
+        b    = (X.T @ r) / sig2 + S0_inv @ m_prior
+
+        mu   = np.linalg.solve(Prec, b)
+        L    = np.linalg.cholesky(Prec)
+        z    = np.random.randn(2)
+        draw = mu + np.linalg.solve(L.T, z)
+
+        self.m0_alpha, self.m0_beta = float(draw[0]), float(draw[1])
+
+    else:
+        # -----------------------------
+        # Case B: separate scalars
+        # -----------------------------
+
+        # deterministic level (intercept)
         if self.level_mode == "deterministic":
             r = self.y.copy()
             if self.dim > 0:
@@ -573,6 +618,10 @@ class DLMDisturbanceNCP:
                     r[t - 1] -= float(H @ self.x[t])
             if self.seasonal_mode == "deterministic":
                 r -= self.m0_gamma[np.arange(self.T) % self.period]
+            # >>> FIX: if trend is deterministic and there is NO dynamic alpha, remove the slope <<<
+            if (self.trend_mode == "deterministic") and (self.idx_alpha is None):
+                r -= self.m0_beta * np.arange(self.T, dtype=float)
+
             s2 = float(self.sigma2)
             m0, s0 = float(self.priors.m_m0_alpha), float(self.priors.s_m0_alpha)
             prec = self.T / s2 + 1.0 / (s0**2)
@@ -580,9 +629,10 @@ class DLMDisturbanceNCP:
             var = 1.0 / prec
             self.m0_alpha = float(np.random.normal(mean, math.sqrt(var)))
 
-        # deterministic trend
+        # deterministic trend (slope)
         if self.trend_mode == "deterministic":
             if self.idx_alpha is not None:
+                # slope from dynamic-level increments (α_t − α_{t−1} ≈ m0_beta + noise)
                 d = self.x[1:, self.idx_alpha] - self.x[:-1, self.idx_alpha]
                 s2 = float(self.s_alpha**2) if self.s_alpha > 0 else 1e-12
                 m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
@@ -591,6 +641,7 @@ class DLMDisturbanceNCP:
                 var = 1.0 / prec
                 self.m0_beta = float(np.random.normal(mean, math.sqrt(var)))
             else:
+                # no dynamic alpha: regress residuals on time for slope
                 t = np.arange(self.T, dtype=float)
                 r = self.y.copy()
                 if self.dim > 0:
@@ -601,6 +652,7 @@ class DLMDisturbanceNCP:
                     r -= self.m0_alpha
                 if self.seasonal_mode == "deterministic":
                     r -= self.m0_gamma[np.arange(self.T) % self.period]
+
                 m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
                 sig2 = float(self.sigma2)
                 prec = (t @ t) / sig2 + 1.0 / (s0**2)
@@ -608,42 +660,43 @@ class DLMDisturbanceNCP:
                 var = 1.0 / prec
                 self.m0_beta = float(np.random.normal(mean, math.sqrt(var)))
 
-        # deterministic season: regress on (p-1) deviation-coded dummies
-        if self.seasonal_mode == "deterministic":
-            if not hasattr(self, "_Z_season"):
-                midx = np.arange(self.T) % self.period
-                K = self.period - 1
-                Z = np.zeros((self.T, K))
-                for k in range(K):
-                    Z[:, k] = (midx == k).astype(float) - (midx == K).astype(float)
-                self._Z_season = Z
-
-            r = self.y.copy()
-            if self.dim > 0:
-                H = self._H()
-                for t in range(1, self.T + 1):
-                    r[t - 1] -= float(H @ self.x[t])
-            if self.level_mode == "deterministic":
-                r -= self.m0_alpha
-            if (self.idx_alpha is None) and (self.trend_mode == "deterministic"):
-                r -= self.m0_beta * np.arange(self.T, dtype=float)
-
+    # deterministic season: same as before (deviation-coded (p−1) dummies)
+    if self.seasonal_mode == "deterministic":
+        if not hasattr(self, "_Z_season"):
+            midx = np.arange(self.T) % self.period
             K = self.period - 1
-            m_prior = (
-                np.zeros(K)
-                if self.priors.m_m0_gamma is None
-                else np.asarray(self.priors.m_m0_gamma, float).reshape(-1)
-            )
-            s2 = float(self.priors.s_m0_gamma) ** 2
-            Z = self._Z_season
-            sig2 = float(self.sigma2)
-            Prec = (Z.T @ Z) / sig2 + np.eye(K) / s2
-            b = (Z.T @ r) / sig2 + m_prior / s2
-            mu = np.linalg.solve(Prec, b)
-            L = np.linalg.cholesky(Prec)
-            z = np.random.randn(K)
-            theta = mu + np.linalg.solve(L.T, z)
-            self.m0_gamma = np.r_[theta, -theta.sum()]
+            Z = np.zeros((self.T, K))
+            for k in range(K):
+                Z[:, k] = (midx == k).astype(float) - (midx == K).astype(float)
+            self._Z_season = Z
+
+        r = self.y.copy()
+        if self.dim > 0:
+            H = self._H()
+            for t in range(1, self.T + 1):
+                r[t - 1] -= float(H @ self.x[t])
+        if self.level_mode == "deterministic":
+            r -= self.m0_alpha
+        if (self.idx_alpha is None) and (self.trend_mode == "deterministic"):
+            r -= self.m0_beta * np.arange(self.T, dtype=float)
+
+        K = self.period - 1
+        m_prior = (
+            np.zeros(K)
+            if self.priors.m_m0_gamma is None
+            else np.asarray(self.priors.m_m0_gamma, float).reshape(-1)
+        )
+        s2_prior = float(self.priors.s_m0_gamma) ** 2
+        Z = self._Z_season
+        sig2 = float(self.sigma2)
+        Prec = (Z.T @ Z) / sig2 + np.eye(K) / s2_prior
+        b = (Z.T @ r) / sig2 + m_prior / s2_prior
+        mu = np.linalg.solve(Prec, b)
+        L = np.linalg.cholesky(Prec)
+        z = np.random.randn(K)
+        theta = mu + np.linalg.solve(L.T, z)
+        self.m0_gamma = np.r_[theta, -theta.sum()]
+
 
     # ------------------- Progress formatting ------------------- #
     @staticmethod
@@ -841,9 +894,9 @@ if __name__ == "__main__":
     p.add_argument("--T", type=int, default=600)
     p.add_argument("--period", type=int, default=12)
     p.add_argument("--start-date", type=str, default="2000-01-01")
-    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
-    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="deterministic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="none")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="none")
     p.add_argument("--sigma", type=float, default=1.5)
     p.add_argument("--q-level", type=float, default=1e-3)
     p.add_argument("--q-trend", type=float, default=2e-4)
