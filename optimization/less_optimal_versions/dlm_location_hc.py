@@ -891,7 +891,7 @@ if __name__ == "__main__":
 
     # Simulate
     start_date = _parse_date(args.start_date)
-    m0_season = _csv_floats_or_none(args.m0_season) or [1.0] * (args.period - 1)
+    m0_season = _csv_floats_or_none(args.m0_season) or [5.0] * (args.period - 1)
     v0_season = _csv_floats_or_none(args.v0_season) or [0.25] * (args.period - 1)
 
     mts = Mean_Time_Series(

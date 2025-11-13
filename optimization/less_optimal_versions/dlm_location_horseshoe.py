@@ -1,0 +1,1139 @@
+from __future__ import annotations
+
+import json, math, os, warnings, time
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# =============================================================================
+# Small utils
+# =============================================================================
+
+def _mad(v: np.ndarray) -> float:
+    v = np.asarray(v, float)
+    if v.size == 0: return 0.0
+    med = np.median(v)
+    return float(np.median(np.abs(v - med)))
+
+def _robust_sd(v: np.ndarray) -> float:
+    return _mad(np.asarray(v, float)) / 1.4826 if v.size else 0.0
+
+def _spd_solve(M: np.ndarray, B: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    n = M.shape[0]
+    I = np.eye(n)
+    for k in range(3):
+        try:
+            L = np.linalg.cholesky(M + (eps * (10**k)) * I)
+            Y = np.linalg.solve(L, B)
+            return np.linalg.solve(L.T, Y)
+        except np.linalg.LinAlgError:
+            continue
+    return np.linalg.pinv(M) @ B
+
+
+# =============================================================================
+# Univariate slice sampler (stepping-out + shrinkage) on R
+# =============================================================================
+class Slice1D:
+    """
+    Univariate slice sampler for log-densities h(z) (up to a constant).
+    - Stepping-out width w and max steps m
+    - Classic shrinkage until acceptance
+    """
+    def __init__(self, h, w: float = 1.0, m: int = 20, rng: Optional[np.random.Generator] = None):
+        self.h = h
+        self.w = float(w)
+        self.m = int(m)
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+    def sample(self, z0: float, n: int = 1) -> np.ndarray:
+        out = np.empty(n, float)
+        z = float(z0)
+        for i in range(n):
+            hz = self.h(z)
+            # vertical slice level
+            u = self.rng.random()
+            y = hz + math.log(u)
+
+            # stepping out
+            w = self.w
+            L = z - w * self.rng.random()
+            R = L + w
+            J = int(self.rng.integers(0, self.m))
+            K = self.m - 1 - J
+            while J > 0 and self.h(L) > y:
+                L -= w; J -= 1
+            while K > 0 and self.h(R) > y:
+                R += w; K -= 1
+
+            # shrinkage
+            while True:
+                z_new = self.rng.uniform(L, R)
+                if self.h(z_new) >= y:
+                    z = z_new
+                    break
+                elif z_new < z:
+                    L = z_new
+                else:
+                    R = z_new
+            out[i] = z
+        return out
+
+
+# =============================================================================
+# Priors & Config (Horseshoe for process SDs)
+# =============================================================================
+
+@dataclass
+class Priors:
+    # Observation variance σ²: precision τσ = 1/σ² ~ Gamma(a_sigma, b_sigma) (shape–rate)
+    a_sigma: float = 2.0
+    b_sigma: float = 1.0
+
+    # m0 priors (used both for dynamic x0 means and deterministic params)
+    m_m0_alpha: float = 0.0
+    s_m0_alpha: float = 10.0
+    m_m0_beta:  float = 0.0
+    s_m0_beta:  float = 10.0
+    m_m0_gamma: Optional[Sequence[float]] = None  # len p-1 (newest-first)
+    s_m0_gamma: float = 5.0
+
+    # Initial-state variances P0 ~ InvGamma(a, b)
+    a_P0_alpha: float = 2.0
+    b_P0_alpha: float = 1.0
+    a_P0_beta:  float = 2.0
+    b_P0_beta:  float = 1.0
+    a_P0_gamma: float = 2.0
+    b_P0_gamma: float = 1.0  # shared across p-1 seasonal coords
+
+    # Horseshoe hyperparameters:
+    # s_k ~ C^+(0, c0 * tau * lambda_k); lambda_k ~ C^+(0,1); tau ~ C^+(0, A_tau)
+    hs_c0: float = 1.0
+    hs_A_tau: float = 1.0  # global prior scale for tau
+
+
+@dataclass
+class SamplerConfig:
+    n_iter: int = 5000
+    burn: int = 1000
+    thin: int = 2
+    random_seed: Optional[int] = 40
+    progress: bool = True
+    progress_every: int = 0  # 0 => ~2% of n_iter
+    # slice sampler knobs (shared)
+    slice_w: float = 1.0
+    slice_m: int = 20
+
+
+# =============================================================================
+# DLM Sampler (conjugate Gibbs + SLICE for HORSESHOE SDs)
+# =============================================================================
+
+class DLMGibbsConjugate:
+    """
+    Gaussian structural DLM with:
+      • FFBS for latent states
+      • Conjugate Gibbs for σ², m0, P0, deterministic params
+      • Horseshoe priors for process SDs s_k:
+            s_k ~ Half-Cauchy(0, c0 * tau * lambda_k),
+            lambda_k ~ Half-Cauchy(0, 1),
+            tau ~ Half-Cauchy(0, A_tau).
+        All {log s_k, log lambda_k, log tau} updated by univariate slice.
+    State layout (NEWEST-FIRST season):
+      [alpha] [beta] [g1 ... g_{p-1}], and H loads g1 when seasonal is dynamic.
+    """
+
+    # --------------------------- Construction --------------------------- #
+    def __init__(
+        self,
+        y: np.ndarray,
+        period: int,
+        level_mode: str = "dynamic",
+        trend_mode: str = "dynamic",
+        seasonal_mode: str = "dynamic",
+        # initial values
+        m0_alpha_init: float = 0.0,
+        P0_alpha_init: float = 1.0,
+        m0_beta_init: float = 0.0,
+        P0_beta_init: float = 1.0,
+        m0_gamma_init: Optional[Sequence[float]] = None,  # len p-1 (NEWEST-FIRST)
+        P0_gamma_init: float = 1.0,
+        sigma2_init: float = 1.0,
+        s_alpha_init: float = 1e-2,
+        s_beta_init: float = 1e-3,
+        s_gamma_init: float = 1e-3,
+        # horseshoe locals + global (log-space inits are fine too)
+        lambda_alpha_init: float = 1.0,
+        lambda_beta_init: float  = 1.0,
+        lambda_gamma_init: float = 1.0,
+        tau_init: float = 1.0,
+        priors: Priors = Priors(),
+        cfg: SamplerConfig = SamplerConfig(),
+    ):
+        self.y = np.asarray(y, float)
+        self.T = int(self.y.size)
+        self.period = int(period)
+        if self.period < 2:
+            raise ValueError("period must be >= 2")
+
+        ok = {"dynamic", "deterministic", "none"}
+        if level_mode not in ok or trend_mode not in ok or seasonal_mode not in ok:
+            raise ValueError("invalid mode")
+        if trend_mode == "dynamic" and level_mode != "dynamic":
+            raise ValueError("dynamic trend requires dynamic level")
+        self.level_mode, self.trend_mode, self.seasonal_mode = level_mode, trend_mode, seasonal_mode
+
+        self.priors, self.cfg = priors, cfg
+        if cfg.random_seed is not None:
+            np.random.seed(cfg.random_seed)
+            self._rng = np.random.default_rng(cfg.random_seed)
+        else:
+            self._rng = np.random.default_rng()
+
+        # Dynamic layout
+        layout: List[str] = []
+        if self.level_mode == "dynamic":  layout.append("alpha")
+        if self.trend_mode == "dynamic":  layout.append("beta")
+        if self.seasonal_mode == "dynamic":
+            layout.extend([f"g{k}" for k in range(1, self.period)])
+        self._layout = layout
+        self.dim = len(layout)
+
+        self.idx_alpha = layout.index("alpha") if "alpha" in layout else None
+        self.idx_beta  = layout.index("beta")  if "beta"  in layout else None
+        if self.seasonal_mode == "dynamic":
+            self.idx_g_start = layout.index("g1")
+            self.idx_g_end   = self.idx_g_start + (self.period - 2)
+        else:
+            self.idx_g_start = self.idx_g_end = None
+
+        # Parameters: observation variance, process SDs
+        self.sigma2  = float(sigma2_init)
+        self.s_alpha = float(s_alpha_init) if self.idx_alpha is not None else 0.0
+        self.s_beta  = float(s_beta_init)  if self.idx_beta  is not None else 0.0
+        self.s_gamma = float(s_gamma_init) if self.seasonal_mode == "dynamic" else 0.0
+
+        # Horseshoe local and global scales
+        self.lambda_alpha = float(lambda_alpha_init) if self.idx_alpha is not None else 1.0
+        self.lambda_beta  = float(lambda_beta_init)  if self.idx_beta  is not None else 1.0
+        self.lambda_gamma = float(lambda_gamma_init) if self.seasonal_mode == "dynamic" else 1.0
+        self.tau = float(tau_init)
+
+        # Initial m0/P0 for dynamic coords
+        self.m0_alpha = float(m0_alpha_init) if self.idx_alpha is not None else 0.0
+        self.P0_alpha = float(P0_alpha_init) if self.idx_alpha is not None else 0.0
+        self.m0_beta  = float(m0_beta_init)  if self.idx_beta  is not None else 0.0
+        self.P0_beta  = float(P0_beta_init)  if self.idx_beta  is not None else 0.0
+        if self.seasonal_mode == "dynamic":
+            if m0_gamma_init is None:
+                self.m0_gamma = np.zeros(self.period - 1, float)
+            else:
+                g = np.asarray(m0_gamma_init, float)
+                if g.size != self.period - 1:
+                    raise ValueError("m0_gamma_init must have length p-1 (NEWEST-FIRST)")
+                self.m0_gamma = g
+            self.P0_gamma = float(P0_gamma_init)
+        else:
+            self.m0_gamma = None
+            self.P0_gamma = 0.0
+
+        # Deterministic contributions
+        if self.level_mode == "deterministic":
+            self.m0_alpha = float(self.priors.m_m0_alpha)
+        if self.trend_mode == "deterministic":
+            self.m0_beta  = float(self.priors.m_m0_beta)
+        if self.seasonal_mode == "deterministic":
+            base = (
+                np.zeros(self.period - 1, float)
+                if self.priors.m_m0_gamma is None
+                else np.asarray(self.priors.m_m0_gamma, float)
+            )
+            if base.size != self.period - 1:
+                raise ValueError("priors.m_m0_gamma must have length p-1")
+            self.m0_gamma = np.r_[base, -float(np.sum(base))].astype(float)
+
+        # Latent path
+        self.x = np.zeros((self.T + 1, self.dim), float)
+        if self.dim > 0:
+            m0_vec, P0_diag = self._current_m0_P0()
+            self.x[0] = np.random.multivariate_normal(
+                m0_vec, np.diag(P0_diag) + 1e-10 * np.eye(self.dim)
+            )
+            self._propagate_initial_path(Q_init=np.full(self.dim, 1e-6, float))
+
+        # Storage
+        self.keep: Dict[str, np.ndarray] = {}
+
+        # Truth overlays
+        self.true_sigma: Optional[float] = None
+        self.true_Q: Optional[np.ndarray] = None
+        self.true_mu_t: Optional[np.ndarray] = None
+        self.true_alpha_t: Optional[np.ndarray] = None
+        self.true_beta_t: Optional[np.ndarray] = None
+        self.true_gamma_t: Optional[np.ndarray] = None
+
+        # Print scale proxies
+        if self.cfg.progress:
+            y = self.y
+            sd1 = _robust_sd(np.diff(y)) if y.size >= 2 else 0.0
+            sd2 = _robust_sd(np.diff(y, n=2)) if y.size >= 3 else 0.0
+            fmt = lambda x: "n/a" if x is None else f"{x:.4g}"
+            print(f"[init] scale proxies: sd1={fmt(sd1)}, sd2={fmt(sd2)}")
+
+        # Build slice samplers lazily (closures depend on current params)
+        self._build_slice_objects()
+
+    # --------------------- Truth overlays (optional) --------------------- #
+    def set_truth(
+        self,
+        sigma: Optional[float] = None,
+        Q: Optional[Tuple[float, float, float]] = None,
+        m0_level: Optional[float] = None,
+        m0_trend: Optional[float] = None,
+        m0_season: Optional[Sequence[float]] = None,
+        P0_level: Optional[float] = None,
+        P0_trend: Optional[float] = None,
+        P0_season: Optional[Sequence[float]] = None,
+    ) -> None:
+        self.true_sigma = None if sigma is None else float(sigma)
+        self.true_Q = None if Q is None else np.asarray(Q, float)
+        self.true_m0_level = None if m0_level is None else float(m0_level)
+        self.true_m0_trend = None if m0_trend is None else float(m0_trend)
+        self.true_m0_season = None if m0_season is None else np.asarray(m0_season, float)
+        self.true_P0_level = None if P0_level is None else float(P0_level)
+        self.true_P0_trend = None if P0_trend is None else float(P0_trend)
+        self.true_P0_season = None if P0_season is None else np.asarray(P0_season, float)
+
+    def set_truth_paths(
+        self,
+        mu: Optional[np.ndarray] = None,
+        alpha: Optional[np.ndarray] = None,
+        beta: Optional[np.ndarray] = None,
+        gamma: Optional[np.ndarray] = None,
+    ) -> None:
+        self.true_mu_t = None if mu is None else np.asarray(mu, float)
+        self.true_alpha_t = None if alpha is None else np.asarray(alpha, float)
+        self.true_beta_t = None if beta is None else np.asarray(beta, float)
+        self.true_gamma_t = None if gamma is None else np.asarray(gamma, float)
+
+    # ----------------------------- Model matrices ----------------------------- #
+    def _H(self) -> np.ndarray:
+        if self.dim == 0:
+            return np.zeros((1, 0))
+        h = np.zeros(self.dim, float)
+        if self.idx_alpha is not None: h[self.idx_alpha] = 1.0
+        if self.seasonal_mode == "dynamic": h[self.idx_g_start] = 1.0
+        return h.reshape(1, -1)
+
+    def _A(self) -> np.ndarray:
+        if self.dim == 0:
+            return np.zeros((0, 0))
+        A = np.eye(self.dim)
+        if self.idx_alpha is not None and self.idx_beta is not None:
+            A[self.idx_alpha, self.idx_beta] = 1.0
+        if self.seasonal_mode == "dynamic":
+            gs, ge = self.idx_g_start, self.idx_g_end
+            K = ge - gs + 1  # p-1
+            A[gs, gs:ge+1] = -1.0
+            A[gs+1:ge+1, gs:ge] = np.eye(K-1)
+            A[gs+1:ge+1, ge] = 0.0
+        return A
+
+    def _u(self) -> np.ndarray:
+        if self.dim == 0: return np.zeros(0, float)
+        u = np.zeros(self.dim, float)
+        if (self.idx_alpha is not None) and (self.trend_mode == "deterministic"):
+            u[self.idx_alpha] = float(self.m0_beta)
+        return u
+
+    def _Q(self) -> np.ndarray:
+        if self.dim == 0: return np.zeros((0, 0))
+        Q = np.zeros((self.dim, self.dim))
+        if self.idx_alpha is not None and self.s_alpha > 0:
+            Q[self.idx_alpha, self.idx_alpha] = self.s_alpha**2
+        if self.idx_beta is not None and self.s_beta > 0:
+            Q[self.idx_beta, self.idx_beta] = self.s_beta**2
+        if self.seasonal_mode == "dynamic" and self.s_gamma > 0:
+            Q[self.idx_g_start, self.idx_g_start] = self.s_gamma**2
+        return Q
+
+    def _mu_det(self, t: int) -> float:
+        out = 0.0
+        if self.level_mode == "deterministic": out += self.m0_alpha
+        if (self.trend_mode == "deterministic") and (self.idx_alpha is None):
+            out += self.m0_beta * t
+        if self.seasonal_mode == "deterministic":
+            out += float(self.m0_gamma[t % self.period])
+        return out
+
+    def _current_m0_P0(self) -> Tuple[np.ndarray, np.ndarray]:
+        m0, P0 = [], []
+        if self.idx_alpha is not None:
+            m0.append(self.m0_alpha); P0.append(self.P0_alpha)
+        if self.idx_beta is not None:
+            m0.append(self.m0_beta);  P0.append(self.P0_beta)
+        if self.seasonal_mode == "dynamic":
+            m0.extend(list(self.m0_gamma))
+            P0.extend([self.P0_gamma] * (self.period - 1))
+        return np.asarray(m0, float), np.asarray(P0, float)
+
+    # ------------------------- FFBS (Kalman + Carter–Kohn) ------------------------- #
+    def _ffbs(self) -> np.ndarray:
+        if self.dim == 0: return self.x.copy()
+        H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
+        m0_vec, P0_diag = self._current_m0_P0()
+        m = np.zeros((self.T + 1, self.dim))
+        C = np.zeros((self.T + 1, self.dim, self.dim))
+        a = np.zeros((self.T + 1, self.dim))
+        Rm = np.zeros((self.T + 1, self.dim, self.dim))
+        m[0] = m0_vec
+        C[0] = np.diag(P0_diag) + 1e-12 * np.eye(self.dim)
+        u = self._u()
+
+        # forward
+        for t in range(1, self.T + 1):
+            a[t]  = A @ m[t - 1] + u
+            Rm[t] = A @ C[t - 1] @ A.T + Q
+            Rm[t] = 0.5 * (Rm[t] + Rm[t].T) + 1e-12 * np.eye(self.dim)
+
+            resid_mean = float(self.y[t - 1] - self._mu_det(t - 1))
+            S = float(H @ Rm[t] @ H.T + R)
+            if S <= 0:
+                S = float(H @ (Rm[t] + 1e-10 * np.eye(self.dim)) @ H.T + R)
+            K = (Rm[t] @ H.T) / S
+            v = resid_mean - float(H @ a[t])
+            m[t] = a[t] + (K.flatten() * v)
+            C[t] = Rm[t] - K @ (H @ Rm[t])
+            C[t] = 0.5 * (C[t] + C[t].T) + 1e-12 * np.eye(self.dim)
+
+        # backward
+        x = np.zeros_like(self.x)
+        x[self.T] = np.random.multivariate_normal(m[self.T], C[self.T])
+        for t in range(self.T - 1, -1, -1):
+            J = C[t] @ A.T
+            J = J @ _spd_solve(Rm[t + 1], np.eye(self.dim))
+            mean = m[t] + J @ (x[t + 1] - (A @ m[t] + u))
+            cov  = C[t] - J @ Rm[t + 1] @ J.T
+            cov  = 0.5 * (cov + cov.T)
+            cov += max(0.0, 1e-12 - float(np.linalg.eigvalsh(cov).min())) * np.eye(cov.shape[0])
+            x[t] = np.random.multivariate_normal(mean, cov)
+        return x
+
+    def _propagate_initial_path(self, Q_init: np.ndarray) -> None:
+        if self.dim == 0: return
+        A, u = self._A(), self._u()
+        for t in range(1, self.T + 1):
+            self.x[t] = A @ self.x[t - 1] + u + np.random.normal(0.0, np.sqrt(Q_init), size=self.dim)
+
+    # ------------------ Helpers: μ and residuals ------------------ #
+    def _mu_vec(self) -> np.ndarray:
+        H = self._H()
+        mu = np.zeros(self.T, float)
+        for t in range(1, self.T + 1):
+            dyn = float(H @ self.x[t]) if self.dim > 0 else 0.0
+            mu[t - 1] = self._mu_det(t - 1) + dyn
+        return mu
+
+    # ------------------ σ² | rest  (Gamma on precision) ------------------ #
+    def update_sigma2(self) -> None:
+        e = self.y - self._mu_vec()
+        a = self.priors.a_sigma + 0.5 * self.T
+        b = self.priors.b_sigma + 0.5 * float(e @ e)
+        tau_prec = np.random.gamma(shape=a, scale=1.0 / b)  # precision
+        self.sigma2 = 1.0 / max(tau_prec, 1e-300)
+
+    # -------- Innovation sums of squares (for Q updates) -------- #
+    def _innovation_ss_alpha(self) -> Tuple[float, int]:
+        if self.idx_alpha is None: return 0.0, 0
+        ss = 0.0
+        for t in range(1, self.T + 1):
+            drift = 0.0
+            if self.idx_beta is not None:
+                drift = self.x[t - 1, self.idx_beta]
+            elif self.trend_mode == "deterministic":
+                drift = float(self.m0_beta)
+            mean = self.x[t - 1, self.idx_alpha] + drift
+            ss += (self.x[t, self.idx_alpha] - mean) ** 2
+        return float(ss), self.T
+
+    def _innovation_ss_beta(self) -> Tuple[float, int]:
+        if self.idx_beta is None: return 0.0, 0
+        d = self.x[1:, self.idx_beta] - self.x[:-1, self.idx_beta]
+        return float(np.sum(d * d)), self.T
+
+    def _innovation_ss_gamma(self) -> Tuple[float, int]:
+        if self.seasonal_mode != "dynamic": return 0.0, 0
+        gs, ge = self.idx_g_start, self.idx_g_end
+        ss = 0.0
+        for t in range(1, self.T + 1):
+            prev = self.x[t - 1, gs : ge + 1]
+            mean_new_first = -float(np.sum(prev))
+            ss += (self.x[t, gs] - mean_new_first) ** 2
+        return float(ss), self.T
+
+    # =============================================================================
+    # HORSESHOE log-posteriors for slice updates
+    # -----------------------------------------------------------------------------
+    # For any Half-Cauchy(0, a) on positive x:
+    #   p(x) = 2/(π a) * 1/(1 + (x/a)^2), x>0
+    # On z = log x (with Jacobian |dx/dz| = e^z):
+    #   log p(z) = const + z - log(a^2 + e^{2z})
+    #
+    # For process SDs s_k with a_k = c0 * tau * lambda_k:
+    #   log prior for z_k = log s_k:  z_k - log( (a_k)^2 + e^{2 z_k} )
+    # Likelihood (from innovation increments):
+    #   log lik(z_k) = -T_eff * z_k - 0.5 * SS * exp(-2 z_k)
+    # ----------------------------------------------------------------------------- 
+    # For local lambda_k ~ Half-Cauchy(0,1): let r_k=log lambda_k:
+    #   log prior(r_k) = r_k - log(1 + e^{2 r_k})
+    #   contribution from s_k prior: -log( (c0 * tau * e^{r_k})^2 + s_k^2 )
+    #
+    # For global tau ~ Half-Cauchy(0, A_tau): t=log tau:
+    #   log prior(t) = t - log( A_tau^2 + e^{2 t} )
+    #   plus sum_k -log( (c0 * e^{t} * lambda_k)^2 + s_k^2 )
+    # =============================================================================
+
+    # ----- build closures for current parameters -----
+    def _build_slice_objects(self) -> None:
+        w, m, rng = self.cfg.slice_w, self.cfg.slice_m, self._rng
+        c0 = float(self.priors.hs_c0)
+        A_tau = float(self.priors.hs_A_tau)
+
+        # z = log s targets
+        def h_s(z: float, SS: float, T_eff: int, lam: float) -> float:
+            # likelihood
+            z = float(z)
+            T_eff = max(int(T_eff), 0)
+            SS = max(float(SS), 1e-300)
+            ll = -(T_eff) * z - 0.5 * SS * math.exp(-2.0 * z)
+            # HS prior with scale a = c0 * tau * lam
+            a2 = (c0 * self.tau * lam)**2
+            lp = z - math.log(a2 + math.exp(2.0 * z))
+            return ll + lp
+
+        # r = log lambda targets
+        def h_lambda(r: float, s: float) -> float:
+            r = float(r)
+            # Half-Cauchy(0,1) prior on lambda with z=log lambda
+            lp_prior = r - math.log(1.0 + math.exp(2.0 * r))
+            # coupling via s prior scale a = c0 * tau * lambda
+            a2 = (c0 * self.tau * math.exp(r))**2
+            # s is current SD (fixed here)
+            return lp_prior - math.log(a2 + s*s)
+
+        # t = log tau target
+        def h_tau(t: float, s_active: Sequence[Tuple[float, float]] ) -> float:
+            # s_active: iterable of (s_k, lambda_k) for active (dynamic) blocks
+            t = float(t)
+            # global prior tau ~ Half-Cauchy(0, A_tau)
+            lp_prior = t - math.log(A_tau*A_tau + math.exp(2.0 * t))
+            # product factors from each s_k prior
+            acc = 0.0
+            for (s_k, lam_k) in s_active:
+                a2 = (c0 * math.exp(t) * lam_k)**2
+                acc += - math.log(a2 + s_k*s_k)
+            return lp_prior + acc
+
+        # make samplers per coordinate (built fresh each time we call updates)
+        self._h_s_alpha = (lambda z, SS, T_eff: h_s(z, SS, T_eff, self.lambda_alpha)) if self.idx_alpha is not None else None
+        self._h_s_beta  = (lambda z, SS, T_eff: h_s(z, SS, T_eff, self.lambda_beta )) if self.idx_beta  is not None else None
+        self._h_s_gamma = (lambda z, SS, T_eff: h_s(z, SS, T_eff, self.lambda_gamma)) if self.seasonal_mode == "dynamic" else None
+
+        self._slice_s_alpha = (Slice1D(lambda z: self._h_s_alpha(z, *self._ln_params_alpha()),
+                                       w=w, m=m, rng=rng) if self.idx_alpha is not None else None)
+        self._slice_s_beta  = (Slice1D(lambda z: self._h_s_beta(z, *self._ln_params_beta()),
+                                       w=w, m=m, rng=rng) if self.idx_beta  is not None else None)
+        self._slice_s_gamma = (Slice1D(lambda z: self._h_s_gamma(z, *self._ln_params_gamma()),
+                                       w=w, m=m, rng=rng) if self.seasonal_mode == "dynamic" else None)
+
+        self._slice_lambda_alpha = (Slice1D(lambda r: h_lambda(r, self.s_alpha), w=w, m=m, rng=rng)
+                                    if self.idx_alpha is not None else None)
+        self._slice_lambda_beta  = (Slice1D(lambda r: h_lambda(r, self.s_beta ), w=w, m=m, rng=rng)
+                                    if self.idx_beta  is not None else None)
+        self._slice_lambda_gamma = (Slice1D(lambda r: h_lambda(r, self.s_gamma), w=w, m=m, rng=rng)
+                                    if self.seasonal_mode == "dynamic" else None)
+
+        def _h_tau_closure():
+            active = []
+            if self.idx_alpha is not None: active.append( (self.s_alpha, self.lambda_alpha) )
+            if self.idx_beta  is not None: active.append( (self.s_beta , self.lambda_beta ) )
+            if self.seasonal_mode == "dynamic": active.append( (self.s_gamma, self.lambda_gamma) )
+            return lambda t: h_tau(t, active)
+
+        self._slice_tau = Slice1D(_h_tau_closure(), w=w, m=m, rng=rng)
+
+    # innovation SS and T_eff reused (same as LN case)
+    def _ln_params_alpha(self) -> Tuple[float, int]:
+        SS, T_eff = self._innovation_ss_alpha()
+        return float(SS), int(T_eff)
+
+    def _ln_params_beta(self) -> Tuple[float, int]:
+        SS, T_eff = self._innovation_ss_beta()
+        return float(SS), int(T_eff)
+
+    def _ln_params_gamma(self) -> Tuple[float, int]:
+        SS, T_eff = self._innovation_ss_gamma()
+        return float(SS), int(T_eff)
+
+    # --------------- Slice updates for HS SDs and HS scales --------------- #
+    def update_process_Q_horseshoe_slice(self) -> None:
+        # rebuild samplers to bind most-recent (lambda, tau) in closures
+        self._build_slice_objects()
+
+        # s_alpha
+        if self.idx_alpha is not None:
+            z0 = math.log(max(self.s_alpha, 1e-12))
+            z  = float(self._slice_s_alpha.sample(z0, 1)[0])
+            self.s_alpha = float(np.exp(z))
+
+        # s_beta
+        if self.idx_beta is not None:
+            z0 = math.log(max(self.s_beta, 1e-12))
+            z  = float(self._slice_s_beta.sample(z0, 1)[0])
+            self.s_beta = float(np.exp(z))
+
+        # s_gamma
+        if self.seasonal_mode == "dynamic":
+            z0 = math.log(max(self.s_gamma, 1e-12))
+            z  = float(self._slice_s_gamma.sample(z0, 1)[0])
+            self.s_gamma = float(np.exp(z))
+
+        # locals lambda_k (given current s and tau)
+        if self.idx_alpha is not None:
+            r0 = math.log(max(self.lambda_alpha, 1e-12))
+            r  = float(self._slice_lambda_alpha.sample(r0, 1)[0])
+            self.lambda_alpha = float(np.exp(r))
+
+        if self.idx_beta is not None:
+            r0 = math.log(max(self.lambda_beta, 1e-12))
+            r  = float(self._slice_lambda_beta.sample(r0, 1)[0])
+            self.lambda_beta = float(np.exp(r))
+
+        if self.seasonal_mode == "dynamic":
+            r0 = math.log(max(self.lambda_gamma, 1e-12))
+            r  = float(self._slice_lambda_gamma.sample(r0, 1)[0])
+            self.lambda_gamma = float(np.exp(r))
+
+        # global tau
+        t0 = math.log(max(self.tau, 1e-12))
+        t  = float(self._slice_tau.sample(t0, 1)[0])
+        self.tau = float(np.exp(t))
+
+    # --- m0 | P0, x0  (Normal)  +  P0 | m0, x0  (Inv-Gamma) --- #
+    @staticmethod
+    def _gibbs_m0_scalar(x0: float, m_prior: float, s_prior: float, P0: float) -> float:
+        prec = 1.0 / (s_prior**2) + 1.0 / max(1e-18, P0)
+        var = 1.0 / prec
+        mean = var * (m_prior / (s_prior**2) + x0 / max(1e-18, P0))
+        return float(np.random.normal(mean, math.sqrt(var)))
+
+    def update_m0(self) -> None:
+        if self.dim == 0: return
+        pos = 0
+        if self.idx_alpha is not None:
+            self.m0_alpha = self._gibbs_m0_scalar(
+                float(self.x[0, pos]), self.priors.m_m0_alpha, self.priors.s_m0_alpha, self.P0_alpha
+            ); pos += 1
+        if self.idx_beta is not None:
+            self.m0_beta = self._gibbs_m0_scalar(
+                float(self.x[0, pos]), self.priors.m_m0_beta, self.priors.s_m0_beta, self.P0_beta
+            ); pos += 1
+        if self.seasonal_mode == "dynamic":
+            m_prior = (
+                np.zeros(self.period - 1, float)
+                if self.priors.m_m0_gamma is None
+                else np.asarray(self.priors.m_m0_gamma, float)
+            )
+            if m_prior.size != self.period - 1:
+                raise ValueError("priors.m_m0_gamma must be length p-1 (NEWEST-FIRST)")
+            s = float(self.priors.s_m0_gamma)
+            for k in range(self.period - 1):
+                self.m0_gamma[k] = self._gibbs_m0_scalar(float(self.x[0, pos + k]), float(m_prior[k]), s, self.P0_gamma)
+
+    def update_P0(self) -> None:
+        if self.dim == 0: return
+        pos = 0
+        if self.idx_alpha is not None:
+            a = self.priors.a_P0_alpha + 0.5
+            b = self.priors.b_P0_alpha + 0.5 * (float(self.x[0, pos]) - self.m0_alpha) ** 2
+            self.P0_alpha = 1.0 / np.random.gamma(shape=a, scale=1.0 / b); pos += 1
+        if self.idx_beta is not None:
+            a = self.priors.a_P0_beta + 0.5
+            b = self.priors.b_P0_beta + 0.5 * (float(self.x[0, pos]) - self.m0_beta) ** 2
+            self.P0_beta = 1.0 / np.random.gamma(shape=a, scale=1.0 / b); pos += 1
+        if self.seasonal_mode == "dynamic":
+            diffsq = 0.0
+            for k in range(self.period - 1):
+                diffsq += (float(self.x[0, pos + k]) - float(self.m0_gamma[k])) ** 2
+            a = self.priors.a_P0_gamma + 0.5 * (self.period - 1)
+            b = self.priors.b_P0_gamma + 0.5 * diffsq
+            self.P0_gamma = 1.0 / np.random.gamma(shape=a, scale=1.0 / b)
+
+    # --- Deterministic params (all conjugate) --- #
+    def update_deterministic_params(self) -> None:
+        if self.level_mode == "deterministic":
+            r = self.y.copy()
+            if self.dim > 0:
+                H = self._H()
+                for t in range(1, self.T + 1):
+                    r[t - 1] -= float(H @ self.x[t])
+            if self.seasonal_mode == "deterministic":
+                r -= self.m0_gamma[np.arange(self.T) % self.period]
+            s2 = float(self.sigma2)
+            m0, s0 = float(self.priors.m_m0_alpha), float(self.priors.s_m0_alpha)
+            prec = self.T / s2 + 1.0 / (s0**2)
+            mean = ((r.sum() / s2) + m0 / (s0**2)) / prec
+            var = 1.0 / prec
+            self.m0_alpha = float(np.random.normal(mean, math.sqrt(var)))
+
+        if self.trend_mode == "deterministic":
+            if self.idx_alpha is not None:
+                d = self.x[1:, self.idx_alpha] - self.x[:-1, self.idx_alpha]
+                s2 = float(self.s_alpha**2) if self.s_alpha > 0 else 1e-12
+                m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
+                prec = (self.T / s2) + 1.0 / (s0**2)
+                mean = ((float(np.sum(d)) / s2) + m0 / (s0**2)) / prec
+                var = 1.0 / prec
+                self.m0_beta = float(np.random.normal(mean, math.sqrt(var)))
+            else:
+                t = np.arange(self.T, dtype=float)
+                r = self.y.copy()
+                if self.dim > 0:
+                    H = self._H()
+                    for k in range(1, self.T + 1):
+                        r[k - 1] -= float(H @ self.x[k])
+                if self.level_mode == "deterministic":
+                    r -= self.m0_alpha
+                if self.seasonal_mode == "deterministic":
+                    r -= self.m0_gamma[np.arange(self.T) % self.period]
+                m0, s0 = float(self.priors.m_m0_beta), float(self.priors.s_m0_beta)
+                sig2 = float(self.sigma2)
+                prec = (t @ t) / sig2 + 1.0 / (s0**2)
+                mean = ((t @ r) / sig2 + m0 / (s0**2)) / prec
+                var = 1.0 / prec
+                self.m0_beta = float(np.random.normal(mean, math.sqrt(var)))
+
+        if self.seasonal_mode == "deterministic":
+            if not hasattr(self, "_Z_season"):
+                midx = np.arange(self.T) % self.period
+                K = self.period - 1
+                Z = np.zeros((self.T, K))
+                for k in range(K):
+                    Z[:, k] = (midx == k).astype(float) - (midx == K).astype(float)
+                self._Z_season = Z
+
+            r = self.y.copy()
+            if self.dim > 0:
+                H = self._H()
+                for t in range(1, self.T + 1):
+                    r[t - 1] -= float(H @ self.x[t])
+            if self.level_mode == "deterministic":
+                r -= self.m0_alpha
+            if (self.idx_alpha is None) and (self.trend_mode == "deterministic"):
+                r -= self.m0_beta * np.arange(self.T, dtype=float)
+
+            K = self.period - 1
+            m_prior = (
+                np.zeros(K)
+                if self.priors.m_m0_gamma is None
+                else np.asarray(self.priors.m_m0_gamma, float).reshape(-1)
+            )
+            s2 = float(self.priors.s_m0_gamma) ** 2
+            Z = self._Z_season
+            sig2 = float(self.sigma2)
+            Prec = (Z.T @ Z) / sig2 + np.eye(K) / s2
+            b = (Z.T @ r) / sig2 + m_prior / s2
+            mu = np.linalg.solve(Prec, b)
+            L = np.linalg.cholesky(Prec)
+            z = np.random.randn(K)
+            theta = mu + np.linalg.solve(L.T, z)
+            self.m0_gamma = np.r_[theta, -theta.sum()]
+
+    # ------------------- Progress formatting ------------------- #
+    @staticmethod
+    def _fmt_list(vals, max_elems: int = 6, fmt: str = ".4g") -> str:
+        if vals is None: return "-"
+        v = np.asarray(vals, float).ravel()
+        if v.size == 0: return "[]"
+        if v.size <= max_elems:
+            return "[" + ", ".join(f"{x:{fmt}}" for x in v) + "]"
+        head = ", ".join(f"{x:{fmt}}" for x in v[:max_elems])
+        return f"[{head}, …]"
+
+    def _progress_line(self, it: int) -> str:
+        parts = [f"[it {it + 1}/{self.cfg.n_iter}]"]
+        parts.append(f"σ={math.sqrt(self.sigma2):.3f}")
+        if self.idx_alpha is not None: parts.append(f"Qα={self.s_alpha**2:.4g} (λ={self.lambda_alpha:.3g})")
+        if self.idx_beta  is not None: parts.append(f"Qβ={self.s_beta**2:.4g} (λ={self.lambda_beta:.3g})")
+        if self.seasonal_mode == "dynamic": parts.append(f"Qγ={self.s_gamma**2:.4g} (λ={self.lambda_gamma:.3g})")
+        parts.append(f"τ={self.tau:.3g}")
+        if self.level_mode != "none":
+            parts.append(f"m0α={self.m0_alpha:.4g} P0α={(self.P0_alpha if self.level_mode=='dynamic' else 0.0):.4g}")
+        if self.trend_mode != "none":
+            parts.append(f"m0β={self.m0_beta:.4g} P0β={(self.P0_beta if self.trend_mode=='dynamic' else 0.0):.4g}")
+        if self.seasonal_mode != "none":
+            g = self._fmt_list((self.m0_gamma if self.seasonal_mode == "dynamic" else self.m0_gamma[:-1]), 6, ".4g")
+            parts.append(f"m0γ={g} P0γ={(self.P0_gamma if self.seasonal_mode=='dynamic' else 0.0):.4g}")
+        return " | ".join(parts)
+
+    # --------------------------------- MCMC --------------------------------- #
+    def run(self) -> Dict[str, np.ndarray]:
+        cfg = self.cfg
+        save_iters = list(range(cfg.burn, cfg.n_iter, cfg.thin))
+        n_kept, keep_idx = len(save_iters), 0
+
+        # allocate storage
+        self.keep = {"sigma": np.zeros(n_kept, float), "mu": np.zeros((n_kept, self.T), float),
+                     "tau": np.zeros(n_kept, float)}
+        if self.idx_alpha is not None:
+            self.keep.update({"Q_alpha": np.zeros(n_kept),
+                              "m0_alpha": np.zeros(n_kept), "P0_alpha": np.zeros(n_kept),
+                              "lambda_alpha": np.zeros(n_kept)})
+        if self.idx_beta is not None:
+            self.keep.update({"Q_beta": np.zeros(n_kept),
+                              "m0_beta": np.zeros(n_kept), "P0_beta": np.zeros(n_kept),
+                              "lambda_beta": np.zeros(n_kept)})
+        if self.seasonal_mode == "dynamic":
+            self.keep.update({"Q_gamma": np.zeros(n_kept),
+                              "m0_gamma": np.zeros((n_kept, self.period - 1)), "P0_gamma": np.zeros(n_kept),
+                              "lambda_gamma": np.zeros(n_kept),
+                              "x": np.zeros((n_kept, self.T, self.dim))})
+        elif self.dim > 0:
+            self.keep["x"] = np.zeros((n_kept, self.T, self.dim))
+        if self.level_mode == "deterministic":
+            self.keep["m0_alpha"] = np.zeros(n_kept)
+        if self.trend_mode == "deterministic":
+            self.keep["m0_beta"] = np.zeros(n_kept)
+        if self.seasonal_mode == "deterministic":
+            self.keep["m0_gamma"] = np.zeros((n_kept, self.period))
+
+        print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50) or 1
+
+        for it in range(cfg.n_iter):
+            # 1) FFBS
+            if self.dim > 0:
+                self.x = self._ffbs()
+
+            # 2) process SDs + HS scales via slice
+            if self.dim > 0 or (self.seasonal_mode != "none"):
+                self.update_process_Q_horseshoe_slice()
+
+            # 3) m0 and 4) P0 (Gibbs)
+            if self.dim > 0:
+                self.update_m0()
+                self.update_P0()
+
+            # 5) deterministic params (all conjugate)
+            self.update_deterministic_params()
+
+            # 6) σ² (Gibbs)
+            self.update_sigma2()
+
+            # progress
+            if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
+                print(self._progress_line(it))
+
+            # save
+            if it in save_iters:
+                mu = self._mu_vec()
+                self.keep["mu"][keep_idx, :] = mu
+                self.keep["sigma"][keep_idx] = math.sqrt(self.sigma2)
+                self.keep["tau"][keep_idx] = self.tau
+                if self.idx_alpha is not None:
+                    self.keep["Q_alpha"][keep_idx] = self.s_alpha**2
+                    self.keep["m0_alpha"][keep_idx] = self.m0_alpha
+                    self.keep["P0_alpha"][keep_idx] = self.P0_alpha
+                    self.keep["lambda_alpha"][keep_idx] = self.lambda_alpha
+                if self.idx_beta is not None:
+                    self.keep["Q_beta"][keep_idx] = self.s_beta**2
+                    self.keep["m0_beta"][keep_idx] = self.m0_beta
+                    self.keep["P0_beta"][keep_idx] = self.P0_beta
+                    self.keep["lambda_beta"][keep_idx] = self.lambda_beta
+                if self.seasonal_mode == "dynamic":
+                    self.keep["Q_gamma"][keep_idx] = self.s_gamma**2
+                    self.keep["m0_gamma"][keep_idx, :] = self.m0_gamma
+                    self.keep["P0_gamma"][keep_idx] = self.P0_gamma
+                    self.keep["lambda_gamma"][keep_idx] = self.lambda_gamma
+                if "x" in self.keep and self.dim > 0:
+                    self.keep["x"][keep_idx, :, :] = self.x[1 : self.T + 1, :]
+                if self.level_mode == "deterministic":
+                    self.keep["m0_alpha"][keep_idx] = self.m0_alpha
+                if self.trend_mode == "deterministic":
+                    self.keep["m0_beta"][keep_idx] = self.m0_beta
+                if self.seasonal_mode == "deterministic":
+                    self.keep["m0_gamma"][keep_idx, :] = self.m0_gamma
+                keep_idx += 1
+
+        return self.keep
+
+    # ------------------------------- Persistence ---------------------------- #
+    def save_posterior(self, out_npz_path: str, extra_meta: Optional[dict] = None) -> None:
+        os.makedirs(os.path.dirname(out_npz_path), exist_ok=True)
+        arrays = dict(self.keep)
+        arrays["y"] = self.y.copy()
+        if "x" not in arrays:
+            arrays["x"] = np.zeros((0, 0, 0))
+        if self.true_sigma is not None:
+            arrays["true_sigma"] = float(self.true_sigma)
+        if self.true_Q is not None:
+            arrays["true_Q"] = np.asarray(self.true_Q, float)
+        if self.true_mu_t is not None:
+            arrays["true_mu_t"] = np.asarray(self.true_mu_t, float)
+        if self.true_alpha_t is not None:
+            arrays["true_alpha_t"] = np.asarray(self.true_alpha_t, float)
+        if self.true_beta_t is not None:
+            arrays["true_beta_t"] = np.asarray(self.true_beta_t, float)
+        if self.true_gamma_t is not None:
+            arrays["true_gamma_t"] = np.asarray(self.true_gamma_t, float)
+        np.savez_compressed(out_npz_path, **arrays)
+
+        meta = {
+            "T": int(self.T),
+            "dim": int(self.dim),
+            "period": int(self.period),
+            "modes": {
+                "level_mode": self.level_mode,
+                "trend_mode": self.trend_mode,
+                "seasonal_mode": self.seasonal_mode,
+            },
+            "layout": list(self._layout),
+            "cfg": asdict(self.cfg),
+            "priors": asdict(self.priors),
+            "horseshoe": {
+                "c0": float(self.priors.hs_c0),
+                "A_tau": float(self.priors.hs_A_tau),
+            },
+        }
+        if extra_meta: meta.update(extra_meta)
+        meta_path = out_npz_path.replace(".npz", ".meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        print(f"[save] Posterior -> {out_npz_path}")
+        print(f"[save] Metadata  -> {meta_path}")
+
+
+# ------------------------- CLI / Example run ------------------------------- #
+if __name__ == "__main__":
+    import argparse, sys
+    from datetime import datetime
+    import matplotlib.pyplot as plt
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.append(base_dir)
+    from simulator.mean_time_series import Mean_Time_Series  # newest-first
+
+    def _parse_date(s: str | None):
+        if not s: return datetime.today()
+        parts = [int(p) for p in s.split("-")]
+        if   len(parts) == 1: return datetime(parts[0], 1, 1)
+        elif len(parts) == 2: return datetime(parts[0], parts[1], 1)
+        elif len(parts) == 3: return datetime(parts[0], parts[1], parts[2])
+        raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+    def _csv_floats_or_none(s: str | None):
+        if s is None: return None
+        s = s.strip()
+        if s == "":   return None
+        return [float(z) for z in s.split(",") if z.strip() != ""]
+
+    p = argparse.ArgumentParser(
+        description=(
+            "Kalman FFBS + conjugate Gibbs for Gaussian DLM "
+            "(level/trend/season). Newest-first seasonal. "
+            "Process SDs have HORSESHOE priors and are updated via SLICE sampling."
+        )
+    )
+
+    # Simulation
+    p.add_argument("--T", type=int, default=500)
+    p.add_argument("--period", type=int, default=4)
+    p.add_argument("--start-date", type=str, default="2000-01-01")
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--sigma", type=float, default=2.0)
+    p.add_argument("--q-level", type=float, default=0.001)
+    p.add_argument("--q-trend", type=float, default=0.00002)
+    p.add_argument("--q-season", type=float, default=0.00005)
+    p.add_argument("--m0-level", type=float, default=3.0)
+    p.add_argument("--v0-level", type=float, default=0.25)
+    p.add_argument("--m0-trend", type=float, default=0.015)
+    p.add_argument("--v0-trend", type=float, default=0.05)
+    p.add_argument("--m0-season", type=str, default=None)
+    p.add_argument("--v0-season", type=str, default=None)
+
+    # Priors (non-HS)
+    p.add_argument("--prior-a-sigma", type=float, default=2.0)
+    p.add_argument("--prior-b-sigma", type=float, default=1.0)
+    p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
+    p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
+    p.add_argument("--prior-m-m0-beta",  type=float, default=0.0)
+    p.add_argument("--prior-s-m0-beta",  type=float, default=10.0)
+    p.add_argument("--prior-m-m0-gamma", type=str, default=None)
+    p.add_argument("--prior-s-m0-gamma", type=float, default=5.0)
+    p.add_argument("--prior-a-P0-alpha", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
+    p.add_argument("--prior-a-P0-beta",  type=float, default=5.0)
+    p.add_argument("--prior-b-P0-beta",  type=float, default=1.0)
+    p.add_argument("--prior-a-P0-gamma", type=float, default=5.0)
+    p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
+
+    # Horseshoe hyperparameters
+    p.add_argument("--hs-c0", type=float, default=1.0, help="baseline slab scale for s_k")
+    p.add_argument("--hs-A-tau", type=float, default=1.0, help="global half-Cauchy scale for tau")
+
+    # Sampler configuration
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
+    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--seed", type=int, default=40)
+    p.add_argument("--progress", default=True)
+    p.add_argument("--progress-every", type=int, default=1)
+    p.add_argument("--slice-w", type=float, default=1.0)
+    p.add_argument("--slice-m", type=int, default=20)
+    p.add_argument("--out-dir", type=str, default="results/simulations/DLM_HS_SLICE")
+    p.add_argument("--plot", default=True)
+    p.add_argument("--print-summary", default=True)
+
+    # Initial inference values
+    p.add_argument("--sigma-init", type=float, default=1.0)
+    p.add_argument("--s-alpha-init", type=float, default=1e-1)
+    p.add_argument("--s-beta-init",  type=float, default=1e-1)
+    p.add_argument("--s-gamma-init", type=float, default=1e-1)
+    p.add_argument("--lambda-alpha-init", type=float, default=1.0)
+    p.add_argument("--lambda-beta-init",  type=float, default=1.0)
+    p.add_argument("--lambda-gamma-init", type=float, default=1.0)
+    p.add_argument("--tau-init", type=float, default=1.0)
+    p.add_argument("--m0-gamma-init", type=str, default=None)
+    p.add_argument("--P0-alpha-init", type=float, default=0.25)
+    p.add_argument("--P0-beta-init",  type=float, default=0.05)
+    p.add_argument("--P0-gamma-init", type=float, default=0.25)
+
+    args = p.parse_args()
+    np.random.seed(args.seed)
+
+    # Simulate
+    start_date = _parse_date(args.start_date)
+    m0_season = _csv_floats_or_none(args.m0_season) or [1.0] * (args.period - 1)
+    v0_season = _csv_floats_or_none(args.v0_season) or [0.25] * (args.period - 1)
+
+    mts = Mean_Time_Series(
+        sigma=args.sigma,
+        period=args.period,
+        level_mode=args.level_mode,
+        trend_mode=args.trend_mode,
+        seasonal_mode=args.seasonal_mode,
+        q_level=args.q_level,
+        q_trend=args.q_trend,
+        q_season=args.q_season,
+        m0_level=args.m0_level,
+        v0_level=args.v0_level,
+        m0_trend=args.m0_trend,
+        v0_trend=args.v0_trend,
+        m0_season=m0_season,
+        v0_season=v0_season,
+        start_date=start_date,
+    )
+
+    y = np.array([mts.move() or mts.measure() for _ in range(args.T)], float)
+    truths = mts.get_truth_paths(as_numpy=True)
+    mu_T = truths["mu_t"][1:1 + args.T]
+    dates_T = truths["index"][:args.T]
+
+    # Priors
+    pri_gamma_vec = _csv_floats_or_none(args.prior_m_m0_gamma)
+    priors = Priors(
+        a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
+        m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
+        m_m0_beta=args.prior_m_m0_beta,   s_m0_beta=args.prior_s_m0_beta,
+        m_m0_gamma=None if pri_gamma_vec is None else pri_gamma_vec,
+        s_m0_gamma=args.prior_s_m0_gamma,
+        a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
+        a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
+        a_P0_gamma=args.prior_a_P0_gamma, b_P0_gamma=args.prior_b_P0_gamma,
+        hs_c0=float(args.hs_c0), hs_A_tau=float(args.hs_A_tau),
+    )
+
+    cfg = SamplerConfig(
+        n_iter=int(args.n_iter), burn=int(args.burn), thin=int(args.thin),
+        random_seed=int(args.seed), progress=bool(args.progress),
+        progress_every=int(args.progress_every),
+        slice_w=float(args.slice_w), slice_m=int(args.slice_m),
+    )
+
+    # Sampler
+    m0_gamma_init = (
+        [float(z) for z in (args.m0_gamma_init or "").split(",")] if args.m0_gamma_init else None
+    )
+
+    sampler = DLMGibbsConjugate(
+        y=y, period=args.period,
+        level_mode=args.level_mode, trend_mode=args.trend_mode, seasonal_mode=args.seasonal_mode,
+        sigma2_init=args.sigma_init ** 2,
+        s_alpha_init=args.s_alpha_init, s_beta_init=args.s_beta_init, s_gamma_init=args.s_gamma_init,
+        lambda_alpha_init=args.lambda_alpha_init, lambda_beta_init=args.lambda_beta_init,
+        lambda_gamma_init=args.lambda_gamma_init, tau_init=args.tau_init,
+        m0_alpha_init=args.m0_level, m0_beta_init=args.m0_trend,
+        P0_alpha_init=args.P0_alpha_init, P0_beta_init=args.P0_beta_init,
+        m0_gamma_init=m0_gamma_init, P0_gamma_init=args.P0_gamma_init,
+        priors=priors, cfg=cfg,
+    )
+
+    sampler.set_truth(
+        sigma=mts.sigma, Q=(mts.q_level, mts.q_trend, mts.q_season),
+        m0_level=mts.m0_level, m0_trend=mts.m0_trend, m0_season=mts.m0_season,
+        P0_level=mts.v0_level, P0_trend=mts.v0_trend, P0_season=mts.v0_season,
+    )
+    sampler.set_truth_paths(mu=mu_T)
+
+    if args.print_summary:
+        print(f"\nSimulated {args.T} observations (σ={mts.sigma}) with modes "
+              f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}.\n")
+        print("Horseshoe prior for process SDs s_k with slice sampling:")
+        print(f"  s_k ~ C^+(0, c0 * tau * lambda_k),  c0={priors.hs_c0:.3g},  tau ~ C^+(0, A_tau={priors.hs_A_tau:.3g})\n")
+
+    # Run
+    t0 = time.time()
+    post = sampler.run()
+    elapsed = time.time() - t0
+    print(f"\n[Run completed in {elapsed:.1f}s]")
+
+    out_dir = os.path.join(
+        args.out_dir,
+        f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    sampler.save_posterior(
+        out_npz_path=os.path.join(out_dir, "posterior.npz"),
+        extra_meta={
+            "elapsed_seconds": float(elapsed),
+            "horseshoe": {
+                "c0": priors.hs_c0,
+                "A_tau": priors.hs_A_tau,
+            },
+            "slice": {"w": cfg.slice_w, "m": cfg.slice_m}
+        },
+    )
+
+    # Summary + plot
+    if args.print_summary:
+        print("\n--- Posterior means ---")
+        print(f"σ = {np.mean(post['sigma']):.4f}")
+        if 'tau' in post:
+            print(f"τ = {np.mean(post['tau']):.4f}")
+        for k in ["alpha", "beta", "gamma"]:
+            key = f"Q_{k}"
+            if key in post:
+                mQ = np.mean(post[key])
+                print(f"Q_{k} = {mQ:.4g} (√Q ≈ {math.sqrt(mQ):.4g})")
+
+    if args.plot:
+        mu_hat = post["mu"].mean(axis=0)
+        plt.figure(figsize=(10, 4))
+        plt.plot(dates_T, y, label="y_t", lw=1)
+        plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
+        plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
+        plt.title(f"DLM (HORSESHOE SDs + SLICE) {args.level_mode}/{args.trend_mode}/{args.seasonal_mode}")
+        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
