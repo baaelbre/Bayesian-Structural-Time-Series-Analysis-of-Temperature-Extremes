@@ -104,8 +104,12 @@ class Priors:
     # Observation priors
     m_sigma: float = 0.0
     s_sigma: float = 10.0
+
+    # Truncated Normal prior for xi: Normal(m_xi, s_xi^2) truncated to [xi_lower, xi_upper]
     m_xi: float = 0.0
     s_xi: float = 1.0
+    xi_lower: float = -0.5
+    xi_upper: float = 0.5
 
     # m0 priors (dynamic x0 means); also used when block is deterministic
     m_m0_alpha: float = 0.0
@@ -281,6 +285,16 @@ class DGEVParticleGibbs:
         self.logsigma = float(np.log(max(1e-12, sigma_init)))
         self.sigma    = float(np.exp(self.logsigma))
         self.xi       = float(xi_init)
+
+        # Ensure initial xi lies in truncated Normal support
+        lo, hi = float(self.priors.xi_lower), float(self.priors.xi_upper)
+        if lo >= hi:
+            raise ValueError("priors.xi_lower must be < priors.xi_upper")
+        if not (lo <= self.xi <= hi):
+            # softly clamp inside the interval
+            width = hi - lo
+            eps = 1e-3 * width
+            self.xi = float(np.clip(self.xi, lo + eps, hi - eps))
 
         # Process SDs (log-normal priors)
         self.s_alpha = float(max(1e-12, s_alpha_init)) if self.idx_alpha is not None else 0.0
@@ -535,17 +549,46 @@ class DGEVParticleGibbs:
             self.sigma = sigma_prop
             self.accept["logsigma"] += 1
 
+    # -------- Truncated Normal prior for xi: helper & MH update ------------- #
+    def _log_prior_xi(self, xi: float) -> float:
+        """
+        Unnormalized log-density of truncated Normal prior:
+            xi ~ Normal(m_xi, s_xi^2) truncated to [xi_lower, xi_upper].
+        Normalizing constant cancels in MH; outside the interval we return -inf.
+        """
+        lo = float(self.priors.xi_lower)
+        hi = float(self.priors.xi_upper)
+        if xi < lo or xi > hi:
+            return -np.inf
+        m = float(self.priors.m_xi)
+        s = float(self.priors.s_xi)
+        if s <= 0.0:
+            return -np.inf
+        z = (xi - m) / s
+        return -0.5 * z * z
+
     def update_xi(self) -> None:
         step = self.cfg.step_xi
         cur = self.xi
         prop = cur + np.random.normal(0.0, step)
+
         mu_vec = self._mu_vec_current()
         ll_old = gev_loglike_sum(self.y, mu_vec, self.sigma, cur)
         ll_new = gev_loglike_sum(self.y, mu_vec, self.sigma, prop)
         self.proposals["xi"] += 1
-        if ll_new == -np.inf: return
-        lp_old = -0.5 * ((cur - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
-        lp_new = -0.5 * ((prop - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
+
+        # Invalid likelihood (support violation etc.) ⇒ reject
+        if ll_new == -np.inf:
+            return
+
+        # Truncated Normal prior contribution
+        lp_old = self._log_prior_xi(cur)
+        lp_new = self._log_prior_xi(prop)
+
+        # Proposal outside [xi_lower, xi_upper] ⇒ lp_new = -inf ⇒ reject
+        if lp_new == -np.inf:
+            return
+
         if self._mh_accept((ll_new + lp_new) - (ll_old + lp_old)):
             self.xi = prop
             self.accept["xi"] += 1
@@ -1023,9 +1066,6 @@ class DGEVParticleGibbs:
             if self.dim > 0:
                 self.update_process_s_lognormal_slice()
 
-            # Rebuild x path after s update? Not necessary: w unchanged and x is deterministic given w and x0.
-            # (We keep x as drawn by PGAS; next PGAS iteration will rebuild using current s in proposals.)
-
             # 3) m0 (Gibbs) and 4) P0 (Gibbs Inv-Gamma)
             if self.dim > 0:
                 self.update_m0()
@@ -1156,13 +1196,13 @@ if __name__ == "__main__":
     )
 
     # Simulation controls
-    parser.add_argument("--T", type=int, default=500)
+    parser.add_argument("--T", type=int, default=100)
     parser.add_argument("--period", type=int, default=4)
     parser.add_argument("--start-date", type=str, default="2000-01-01")
 
     parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
     parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="dynamic")
-    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="none")
+    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
 
     # Truth / simulator params
     parser.add_argument("--sigma",     type=float, default=4.0)
@@ -1187,10 +1227,10 @@ if __name__ == "__main__":
     parser.add_argument("--init-p0-season", type=float, default=None)
 
     # Inference priors (obs + deterministic)
-    parser.add_argument("--prior-m-sigma",  type=float, default=1.0)
-    parser.add_argument("--prior-s-sigma",  type=float, default=1.0)
+    parser.add_argument("--prior-m-sigma",  type=float, default=0.0)
+    parser.add_argument("--prior-s-sigma",  type=float, default=0.1)
     parser.add_argument("--prior-m-xi",     type=float, default=0.0)
-    parser.add_argument("--prior-s-xi",     type=float, default=0.2)
+    parser.add_argument("--prior-s-xi",     type=float, default=0.1)
 
     parser.add_argument("--prior-m-level",  type=float, default=0.0)
     parser.add_argument("--prior-s-level",  type=float, default=10.0)
@@ -1213,8 +1253,8 @@ if __name__ == "__main__":
     parser.add_argument("--thin",   type=int, default=1)
 
     # RW–MH steps (obs + deterministic)
-    parser.add_argument("--step-logsigma", type=float, default=0.2)
-    parser.add_argument("--step-xi",       type=float, default=0.1)
+    parser.add_argument("--step-logsigma", type=float, default=0.05)
+    parser.add_argument("--step-xi",       type=float, default=0.02)
     parser.add_argument("--step-level",    type=float, default=0.2)
     parser.add_argument("--step-slope",    type=float, default=0.001)
     parser.add_argument("--step-season",   type=float, default=0.02)
@@ -1227,9 +1267,9 @@ if __name__ == "__main__":
     parser.add_argument("--adapt-steps",        default=True)
     parser.add_argument("--adapt-every",        type=int,    default=20)
     parser.add_argument("--adapt-until",        choices=["burn","all"], default="burn")
-    parser.add_argument("--adapt-eta0",         type=float,  default=0.2)
+    parser.add_argument("--adapt-eta0",         type=float,  default=0.1)
     parser.add_argument("--adapt-decay",        type=float,  default=0.75)
-    parser.add_argument("--adapt-target-1d",    type=float,  default=0.44)
+    parser.add_argument("--adapt-target-1d",    type=float,  default=0.3)
     parser.add_argument("--step-min",           type=float,  default=1e-5)
     parser.add_argument("--step-max",           type=float,  default=1.0)
 
