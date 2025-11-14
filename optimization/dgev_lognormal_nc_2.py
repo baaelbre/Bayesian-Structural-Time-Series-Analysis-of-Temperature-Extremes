@@ -1224,10 +1224,10 @@ if __name__ == "__main__":
 
     # Truth / simulator params
     parser.add_argument("--sigma",     type=float, default=4.0)
-    parser.add_argument("--xi",        type=float, default=0.1)
-    parser.add_argument("--q-level",   type=float, default=1e-1)
-    parser.add_argument("--q-trend",   type=float, default=1e-3)
-    parser.add_argument("--q-season",  type=float, default=5e-2)
+    parser.add_argument("--xi",        type=float, default=-0.1)
+    parser.add_argument("--q-level",   type=float, default=1e-3)
+    parser.add_argument("--q-trend",   type=float, default=7e-6)
+    parser.add_argument("--q-season",  type=float, default=5e-7)
 
     parser.add_argument("--m0-level",  type=float, default=5.0)
     parser.add_argument("--v0-level",  type=float, default=0.2)
