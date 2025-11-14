@@ -80,9 +80,9 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         a_P0_gamma=5.0,
         b_P0_gamma=1.0,
         # log-normal priors for process SDs (roughly matching your old ln_s_* settings)
-        mu_log_s_alpha=-5.0; sd_log_s_alpha=1  # level almost deterministic
-        mu_log_s_beta =-5.0; sd_log_s_beta =1   # trend almost deterministic
-        mu_log_s_gamma=-5.0; sd_log_s_gamma=1   # seasonal almost fixed
+        mu_log_s_alpha=-3.0, sd_log_s_alpha=1,  # level almost deterministic
+        mu_log_s_beta =-3.0, sd_log_s_beta =1,   # trend almost deterministic
+        mu_log_s_gamma=-3.0, sd_log_s_gamma=1   # seasonal almost fixed
 
     )
 
@@ -110,9 +110,9 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         seasonal_mode="dynamic",
         # initial variance + process SDs
         sigma2_init=sigma2_init,
-        s_alpha_init=1e-5,
-        s_beta_init=1e-5,
-        s_gamma_init=1e-5,
+        s_alpha_init=1e-1,
+        s_beta_init=1e-1,
+        s_gamma_init=1e-1,
         # initial means for level / trend
         m0_alpha_init=float(np.mean(y[: min(len(y), 8)])),
         m0_beta_init=0.0,
