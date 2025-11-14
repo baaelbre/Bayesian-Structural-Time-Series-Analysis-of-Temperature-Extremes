@@ -80,12 +80,10 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         a_P0_gamma=5.0,
         b_P0_gamma=1.0,
         # log-normal priors for process SDs (roughly matching your old ln_s_* settings)
-        mu_log_s_alpha=-3.0,
-        sd_log_s_alpha=3.0,
-        mu_log_s_beta=-6.0,
-        sd_log_s_beta=3.0,
-        mu_log_s_gamma=-6.0,
-        sd_log_s_gamma=3.0,
+        mu_log_s_alpha=-5.0; sd_log_s_alpha=1  # level almost deterministic
+        mu_log_s_beta =-5.0; sd_log_s_beta =1   # trend almost deterministic
+        mu_log_s_gamma=-5.0; sd_log_s_gamma=1   # seasonal almost fixed
+
     )
 
     # ----- Sampler configuration -----
@@ -112,9 +110,9 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         seasonal_mode="dynamic",
         # initial variance + process SDs
         sigma2_init=sigma2_init,
-        s_alpha_init=1e-3,
-        s_beta_init=1e-3,
-        s_gamma_init=1e-3,
+        s_alpha_init=1e-5,
+        s_beta_init=1e-5,
+        s_gamma_init=1e-5,
         # initial means for level / trend
         m0_alpha_init=float(np.mean(y[: min(len(y), 8)])),
         m0_beta_init=0.0,
@@ -168,11 +166,10 @@ def main() -> None:
     print("TX head:\n", tx.head(), "\n")
     print("TN head:\n", tn.head(), "\n")
 
-    run_one("TXm_seasonal", tx, Path("results/uccle/TX_dummy_ncp"))
-    run_one("TNm_seasonal", tn, Path("results/uccle/TN_dummy_ncp"))
+    run_one("TXm_seasonal", tx, Path("results/uccle/TX/"))
+    run_one("TNm_seasonal", tn, Path("results/uccle/TN/"))
 
-    print("Saved results under results/uccle/{TX_dummy_ncp,TN_dummy_ncp}")
-
+    print("Saved results under results/uccle/{TX,TN}")
 
 if __name__ == "__main__":
     main()
