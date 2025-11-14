@@ -141,11 +141,9 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
 
 @dataclass
 class Priors:
-    # Observation (log σ prior is Normal; ξ prior is Normal)
+    # Observation (log σ prior is Normal; ξ has flat prior)
     m_sigma: float = 0.0
     s_sigma: float = 10.0
-    m_xi: float = 0.0
-    s_xi: float = 1.0
 
     # m0 priors (used both for dynamic x0 means and for deterministic components)
     m_m0_alpha: float = 0.0
@@ -642,6 +640,10 @@ class DGEVParticleGibbs:
             self.accept["logsigma"] += 1
 
     def update_xi(self) -> None:
+        """
+        Random-walk MH update for ξ with **flat (uniform) prior** on ℝ.
+        Acceptance ratio is based on the likelihood only.
+        """
         step = self.cfg.step_xi
         cur = self.xi
         prop = cur + np.random.normal(0.0, step)
@@ -651,9 +653,8 @@ class DGEVParticleGibbs:
         self.proposals["xi"] += 1
         if ll_new == -np.inf:
             return
-        lp_old = -0.5 * ((cur - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
-        lp_new = -0.5 * ((prop - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
-        if self._mh_accept((ll_new + lp_new) - (ll_old + lp_old)):
+        # Flat prior ⇒ posterior ∝ likelihood ⇒ logacc = ll_new - ll_old
+        if self._mh_accept(ll_new - ll_old):
             self.xi = prop
             self.accept["xi"] += 1
 
@@ -1291,7 +1292,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "DGEV PGAS Sampler with log-normal priors on process standard deviations "
-            "(slice sampling on ln s; no Half-Cauchy augmentation)."
+            "(slice sampling on ln s; no Half-Cauchy augmentation). "
+            "Shape parameter ξ now has a flat (uniform) prior."
         )
     )
 
@@ -1302,11 +1304,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")
     parser.add_argument("--trend-mode",   choices=["dynamic", "deterministic", "none"],    default="dynamic")
-    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="dynamic")
+    parser.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"],   default="none")
 
     # Truth / simulator params
     parser.add_argument("--sigma",     type=float, default=4.0)
-    parser.add_argument("--xi",        type=float, default=0.1)
+    parser.add_argument("--xi",        type=float, default=-0.1)
     parser.add_argument("--q-level",   type=float, default=1e-1)
     parser.add_argument("--q-trend",   type=float, default=1e-3)
     parser.add_argument("--q-season",  type=float, default=5e-2)
@@ -1337,8 +1339,11 @@ if __name__ == "__main__":
     # Inference priors (observation + deterministic components)
     parser.add_argument("--prior-m-sigma",  type=float, default=1.0)
     parser.add_argument("--prior-s-sigma",  type=float, default=1.0)
-    parser.add_argument("--prior-m-xi",     type=float, default=0.0)
-    parser.add_argument("--prior-s-xi",     type=float, default=0.2)
+    # These two remain for backward-compatibility but are ignored (ξ flat prior)
+    parser.add_argument("--prior-m-xi",     type=float, default=0.0,
+                        help="Ignored: ξ has a flat prior.")
+    parser.add_argument("--prior-s-xi",     type=float, default=0.2,
+                        help="Ignored: ξ has a flat prior.")
 
     parser.add_argument("--prior-m-level",  type=float, default=0.0)
     parser.add_argument("--prior-s-level",  type=float, default=10.0)
@@ -1442,19 +1447,11 @@ if __name__ == "__main__":
     pri_season_first = _csv_floats_or_none(args.prior_m_season)
     priors = Priors(
         m_sigma=float(args.prior_m_sigma), s_sigma=float(args.prior_s_sigma),
-        m_xi=float(args.prior_m_xi),       s_xi=float(args.prior_s_xi),
         m_level=float(args.prior_m_level), s_level=float(args.prior_s_level),
         m_slope=float(args.prior_m_slope), s_slope=float(args.prior_s_slope),
         m_season=None if pri_season_first is None else pri_season_first,
         s_season=float(args.prior_s_season),
-        # If your Priors dataclass exposes ln-s hyperparameters, you can
-        # wire them here (otherwise, defaults inside Priors are used):
-        # m_ln_s_alpha=args.prior_ln_s_alpha_m,
-        # s_ln_s_alpha=args.prior_ln_s_alpha_sd,
-        # m_ln_s_beta=args.prior_ln_s_beta_m,
-        # s_ln_s_beta=args.prior_ln_s_beta_sd,
-        # m_ln_s_gamma=args.prior_ln_s_gamma_m,
-        # s_ln_s_gamma=args.prior_ln_s_gamma_sd,
+        # ln-s hyperparameters could be wired here if you expose them differently
     )
 
     if args.level_mode == "deterministic":

@@ -136,16 +136,23 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
     return float(np.sum(-np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
 
 # =============================================================================
-# Priors & Config — Log-Normal on process SDs (LN on s, slice sampling on log s)
+# Priors & Config
+#   - Observation: σ² ~ InvGamma(a_sigma, b_sigma)
+#   - ξ ~ Uniform[xi_lower, xi_upper]  (bounded uniform prior)
+#   - Process SDs s_* still have log-normal priors (slice sampling on ln s)
 # =============================================================================
 
 @dataclass
 class Priors:
-    # Observation (log σ prior is Normal; ξ prior is Normal)
-    m_sigma: float = 0.0
-    s_sigma: float = 10.0
-    m_xi: float = 0.0
-    s_xi: float = 1.0
+    # Observation: σ² ~ InvGamma(a_sigma, b_sigma)
+    # (shape a_sigma, scale b_sigma, on the variance v = σ²)
+    a_sigma: float = 2.0
+    b_sigma: float = 2.0
+
+    # Bounded uniform prior for ξ
+    # ξ ~ Uniform[xi_lower, xi_upper]
+    xi_lower: float = -0.5
+    xi_upper: float = 0.5
 
     # m0 priors (used both for dynamic x0 means and for deterministic components)
     m_m0_alpha: float = 0.0
@@ -172,7 +179,6 @@ class Priors:
     s_season: float = 5.0
 
     # Log-Normal priors for process SDs: s_k ~ LogNormal(mu, sd^2)
-    # (these mirror the DLMGibbsConjugate defaults)
     mu_log_s_alpha: float = -2.3
     sd_log_s_alpha: float = 0.7
     mu_log_s_beta:  float = -3.5
@@ -279,6 +285,15 @@ class DGEVParticleGibbs:
             self._rng = np.random.default_rng(cfg.random_seed)
         else:
             self._rng = np.random.default_rng()
+
+        # Check bounded uniform prior for xi
+        if not (self.priors.xi_lower < self.priors.xi_upper):
+            raise ValueError("priors.xi_lower must be < priors.xi_upper")
+        if not (self.priors.xi_lower <= xi_init <= self.priors.xi_upper):
+            raise ValueError(
+                f"Initial xi_init={xi_init} must lie in [xi_lower, xi_upper] = "
+                f"[{self.priors.xi_lower}, {self.priors.xi_upper}]"
+            )
 
         # Dynamic state layout
         layout: List[str] = []
@@ -623,6 +638,16 @@ class DGEVParticleGibbs:
         elif key == "season":   self.cfg.step_season = v
         else: raise KeyError(key)
 
+    # Inverse-gamma prior on σ²:
+    # v = σ² ~ IG(a_sigma, b_sigma) (shape a, scale b)
+    # p(v) ∝ v^{-(a+1)} exp(-b / v)
+    # For l = ln σ, v = exp(2l), dv/dl = 2 exp(2l) = 2 v
+    # log p(l) = -a * log v - b / v + const = -2a l - b * exp(-2l) + const
+    def _log_prior_logsigma(self, logsigma: float) -> float:
+        a = float(self.priors.a_sigma)
+        b = float(self.priors.b_sigma)
+        return -2.0 * a * logsigma - b * math.exp(-2.0 * logsigma)
+
     def update_logsigma(self) -> None:
         step = self.cfg.step_logsigma
         cur = self.logsigma
@@ -634,26 +659,39 @@ class DGEVParticleGibbs:
         self.proposals["logsigma"] += 1
         if ll_new == -np.inf:
             return
-        lp_old = -0.5 * ((cur - self.priors.m_sigma) ** 2) / (self.priors.s_sigma ** 2)
-        lp_new = -0.5 * ((prop - self.priors.m_sigma) ** 2) / (self.priors.s_sigma ** 2)
+        lp_old = self._log_prior_logsigma(cur)
+        lp_new = self._log_prior_logsigma(prop)
         if self._mh_accept((ll_new + lp_new) - (ll_old + lp_old)):
             self.logsigma = prop
             self.sigma = sigma_prop
             self.accept["logsigma"] += 1
 
     def update_xi(self) -> None:
+        """
+        Random-walk MH update for ξ with **bounded uniform prior** on [xi_lower, xi_upper].
+        Proposals outside the interval are immediately rejected.
+        Inside the interval, the prior is constant, so the MH ratio depends on the likelihood only.
+        """
         step = self.cfg.step_xi
         cur = self.xi
         prop = cur + np.random.normal(0.0, step)
+
+        self.proposals["xi"] += 1
+
+        # Enforce bounded uniform prior support
+        lb = float(self.priors.xi_lower)
+        ub = float(self.priors.xi_upper)
+        if not (lb <= prop <= ub):
+            return
+
         mu_vec = self._mu_vec_current()
         ll_old = gev_loglike_sum(self.y, mu_vec, self.sigma, cur)
         ll_new = gev_loglike_sum(self.y, mu_vec, self.sigma, prop)
-        self.proposals["xi"] += 1
         if ll_new == -np.inf:
             return
-        lp_old = -0.5 * ((cur - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
-        lp_new = -0.5 * ((prop - self.priors.m_xi) ** 2) / (self.priors.s_xi ** 2)
-        if self._mh_accept((ll_new + lp_new) - (ll_old + lp_old)):
+
+        # Uniform prior over [lb, ub] ⇒ constant log prior, cancels in ratio
+        if self._mh_accept(ll_new - ll_old):
             self.xi = prop
             self.accept["xi"] += 1
 
@@ -1246,6 +1284,10 @@ class DGEVParticleGibbs:
                 "beta" : {"mu": self.priors.mu_log_s_beta , "sd": self.priors.sd_log_s_beta },
                 "gamma": {"mu": self.priors.mu_log_s_gamma, "sd": self.priors.sd_log_s_gamma},
             },
+            "inv_gamma_prior_sigma": {
+                "a_sigma": self.priors.a_sigma,
+                "b_sigma": self.priors.b_sigma,
+            },
             "true_sigma": self.true_sigma,
             "true_xi": self.true_xi,
             "true_Q": (None if self.true_Q is None else np.asarray(self.true_Q, float).tolist()),
@@ -1291,7 +1333,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "DGEV PGAS Sampler with log-normal priors on process standard deviations "
-            "(slice sampling on ln s; no Half-Cauchy augmentation)."
+            "and an inverse-gamma prior on the observation variance σ². "
+            "Shape parameter ξ has a bounded uniform prior on [xi_lower, xi_upper]."
         )
     )
 
@@ -1306,7 +1349,7 @@ if __name__ == "__main__":
 
     # Truth / simulator params
     parser.add_argument("--sigma",     type=float, default=4.0)
-    parser.add_argument("--xi",        type=float, default=0.1)
+    parser.add_argument("--xi",        type=float, default=-0.1)
     parser.add_argument("--q-level",   type=float, default=1e-1)
     parser.add_argument("--q-trend",   type=float, default=1e-3)
     parser.add_argument("--q-season",  type=float, default=5e-2)
@@ -1335,10 +1378,16 @@ if __name__ == "__main__":
                              "Default: mean of --v0-season or 0.5 if None.")
 
     # Inference priors (observation + deterministic components)
-    parser.add_argument("--prior-m-sigma",  type=float, default=1.0)
-    parser.add_argument("--prior-s-sigma",  type=float, default=1.0)
-    parser.add_argument("--prior-m-xi",     type=float, default=0.0)
-    parser.add_argument("--prior-s-xi",     type=float, default=0.2)
+    parser.add_argument("--prior-a-sigma",  type=float, default=2.0,
+                        help="Shape parameter a for InvGamma prior on σ².")
+    parser.add_argument("--prior-b-sigma",  type=float, default=2.0,
+                        help="Scale parameter b for InvGamma prior on σ².")
+
+    # Bounded uniform prior for xi
+    parser.add_argument("--prior-xi-lower", type=float, default=-0.5,
+                        help="Lower bound for bounded uniform prior on ξ.")
+    parser.add_argument("--prior-xi-upper", type=float, default=0.5,
+                        help="Upper bound for bounded uniform prior on ξ.")
 
     parser.add_argument("--prior-m-level",  type=float, default=0.0)
     parser.add_argument("--prior-s-level",  type=float, default=10.0)
@@ -1348,15 +1397,15 @@ if __name__ == "__main__":
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
     # (Optional) log-normal hyperparameters for process sds ln s_*
-    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-4.6,
+    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-1,
                         help="Mean of ln s_alpha prior (if used)")
     parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=2.0,
                         help="SD of ln s_alpha prior (if used)")
-    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-4.6,
+    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-1,
                         help="Mean of ln s_beta prior (if used)")
     parser.add_argument("--prior-ln-s-beta-sd", type=float, default=2.0,
                         help="SD of ln s_beta prior (if used)")
-    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-4.6,
+    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-1,
                         help="Mean of ln s_gamma prior (if used)")
     parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=2.0,
                         help="SD of ln s_gamma prior (if used)")
@@ -1441,20 +1490,15 @@ if __name__ == "__main__":
     # --- priors & config ----------------------------------------------------
     pri_season_first = _csv_floats_or_none(args.prior_m_season)
     priors = Priors(
-        m_sigma=float(args.prior_m_sigma), s_sigma=float(args.prior_s_sigma),
-        m_xi=float(args.prior_m_xi),       s_xi=float(args.prior_s_xi),
+        a_sigma=float(args.prior_a_sigma),
+        b_sigma=float(args.prior_b_sigma),
+        xi_lower=float(args.prior_xi_lower),
+        xi_upper=float(args.prior_xi_upper),
         m_level=float(args.prior_m_level), s_level=float(args.prior_s_level),
         m_slope=float(args.prior_m_slope), s_slope=float(args.prior_s_slope),
         m_season=None if pri_season_first is None else pri_season_first,
         s_season=float(args.prior_s_season),
-        # If your Priors dataclass exposes ln-s hyperparameters, you can
-        # wire them here (otherwise, defaults inside Priors are used):
-        # m_ln_s_alpha=args.prior_ln_s_alpha_m,
-        # s_ln_s_alpha=args.prior_ln_s_alpha_sd,
-        # m_ln_s_beta=args.prior_ln_s_beta_m,
-        # s_ln_s_beta=args.prior_ln_s_beta_sd,
-        # m_ln_s_gamma=args.prior_ln_s_gamma_m,
-        # s_ln_s_gamma=args.prior_ln_s_gamma_sd,
+        # ln-s hyperparameters wired below
     )
 
     if args.level_mode == "deterministic":
@@ -1464,6 +1508,14 @@ if __name__ == "__main__":
             # also center the prior on the level at the same place (helps mixing)
             priors.m_level = args.init_m0_level
             priors.s_level = max(2.0, 0.5 * y.std(ddof=1))  # not too tight, but informative
+
+    # (optional) override process ln-s priors from CLI if desired
+    priors.mu_log_s_alpha = float(args.prior_ln_s_alpha_m)
+    priors.sd_log_s_alpha = float(args.prior_ln_s_alpha_sd)
+    priors.mu_log_s_beta  = float(args.prior_ln_s_beta_m)
+    priors.sd_log_s_beta  = float(args.prior_ln_s_beta_sd)
+    priors.mu_log_s_gamma = float(args.prior_ln_s_gamma_m)
+    priors.sd_log_s_gamma = float(args.prior_ln_s_gamma_sd)
 
     cfg = SamplerConfig(
         n_iter=int(args.n_iter),
@@ -1537,6 +1589,9 @@ if __name__ == "__main__":
         P0_trend_init=float(init_p0_trend),
         m0_season_init=(init_m0_season if args.seasonal_mode == "dynamic" else None),
         P0_season_init=(init_p0_season_scalar if args.seasonal_mode == "dynamic" else 0.0),
+        s_alpha_init=1e-1,
+        s_beta_init=1e-2,
+        s_gamma_init=1e-1,
 
         # deterministic level warm start
         level_value_init=(float(args.init_m0_level) if args.level_mode == "deterministic" else 0.0),
@@ -1547,6 +1602,9 @@ if __name__ == "__main__":
 
         # deterministic seasonal initializer
         seasonal_vector_init=seasonal_init_pminus1,
+        # observation initial values
+        sigma_init=args.sigma,
+        xi_init=args.xi,
     )
 
     # truths for diagnostics/saving
@@ -1582,6 +1640,8 @@ if __name__ == "__main__":
                 print(f"P0_season_init={init_p0_season_scalar}")
             print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
             print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
+            print(f"InvGamma prior on σ²: a={priors.a_sigma:.3g}, b={priors.b_sigma:.3g}")
+            print(f"ξ ~ Uniform[{priors.xi_lower}, {priors.xi_upper}]")
 
     # --- run sampler --------------------------------------------------------
     t0 = time.time()
@@ -1616,7 +1676,7 @@ if __name__ == "__main__":
             sig_mean = float(np.mean(post["sigma"])) if "sigma" in post else float("nan")
             xi_mean  = float(np.mean(post["xi"]))    if "xi"    in post else float("nan")
             print(f"σ: {sig_mean:.4g}")
-            print(f"ξ: {xi_mean:.4g}")
+            print(f"ξ: {xi_mean:.4g}  (prior Uniform[{priors.xi_lower}, {priors.xi_upper}])")
 
             # Process variances (Q)
             if sampler.idx_alpha is not None and "Q_alpha" in post:
