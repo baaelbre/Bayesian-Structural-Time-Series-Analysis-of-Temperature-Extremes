@@ -96,7 +96,9 @@ def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) 
     return float(np.sum(-np.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
 
 # =============================================================================
-# Priors & Config — Log-Normal on process SDs (LN on s, slice sampling on log s)
+# Priors & Config
+#   • Log-Normal on process SDs (slice on ln s)
+#   • Uniform prior on ξ in [xi_lower, xi_upper]
 # =============================================================================
 
 @dataclass
@@ -105,9 +107,7 @@ class Priors:
     m_sigma: float = 0.0
     s_sigma: float = 10.0
 
-    # Truncated Normal prior for xi: Normal(m_xi, s_xi^2) truncated to [xi_lower, xi_upper]
-    m_xi: float = 0.0
-    s_xi: float = 1.0
+    # Uniform prior for xi on [xi_lower, xi_upper]
     xi_lower: float = -0.5
     xi_upper: float = 0.5
 
@@ -180,7 +180,7 @@ class SamplerConfig:
 # =============================================================================
 # PGAS in disturbance-space (NCP): particles are innovations w_t, not states x_t
 #
-# Layout (unchanged):
+# Layout:
 #   - Dynamic coords: [alpha] [beta] [g1 ... g_{p-1}]
 #   - Seasonal vector is NEWEST-FIRST; obs loads FIRST seasonal coord.
 # Dynamics (deterministic map + disturbances):
@@ -286,12 +286,11 @@ class DGEVParticleGibbs:
         self.sigma    = float(np.exp(self.logsigma))
         self.xi       = float(xi_init)
 
-        # Ensure initial xi lies in truncated Normal support
+        # Ensure initial xi lies in uniform prior support
         lo, hi = float(self.priors.xi_lower), float(self.priors.xi_upper)
         if lo >= hi:
             raise ValueError("priors.xi_lower must be < priors.xi_upper")
         if not (lo <= self.xi <= hi):
-            # softly clamp inside the interval
             width = hi - lo
             eps = 1e-3 * width
             self.xi = float(np.clip(self.xi, lo + eps, hi - eps))
@@ -325,8 +324,11 @@ class DGEVParticleGibbs:
         self.x = np.zeros((self.T + 1, self.dim), float)
         if self.dim > 0:
             m0_vec, P0_diag = self._current_m0_P0()
-            self.x[0] = np.random.multivariate_normal(m0_vec, np.diag(P0_diag) + 1e-10 * np.eye(self.dim))
-        self.w = np.zeros((self.T + 1, self.dim), float)  # note: only some entries are non-zero by design
+            self.x[0] = np.random.multivariate_normal(
+                m0_vec,
+                np.diag(P0_diag) + 1e-10 * np.eye(self.dim)
+            )
+        self.w = np.zeros((self.T + 1, self.dim), float)  # only some entries non-zero
 
         # initialize path with tiny innovations
         if self.dim > 0:
@@ -358,15 +360,22 @@ class DGEVParticleGibbs:
         self.last_pf_diag: Dict[str, float] = {}
 
         # Slice samplers for z = log s (disturbance SS is used)
-        self._slice_alpha = Slice1D(lambda z: self._h_lognorm(z, *self._ln_params_alpha()),
-                                    w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng) if self.idx_alpha is not None else None
-        self._slice_beta  = Slice1D(lambda z: self._h_lognorm(z, *self._ln_params_beta()),
-                                    w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng)  if self.idx_beta  is not None else None
-        self._slice_gamma = Slice1D(lambda z: self._h_lognorm(z, *self._ln_params_gamma()),
-                                    w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng)  if self.seasonal_mode == "dynamic" else None
+        self._slice_alpha = Slice1D(
+            lambda z: self._h_lognorm(z, *self._ln_params_alpha()),
+            w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng
+        ) if self.idx_alpha is not None else None
+        self._slice_beta  = Slice1D(
+            lambda z: self._h_lognorm(z, *self._ln_params_beta()),
+            w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng
+        ) if self.idx_beta  is not None else None
+        self._slice_gamma = Slice1D(
+            lambda z: self._h_lognorm(z, *self._ln_params_gamma()),
+            w=self.cfg.slice_w, m=self.cfg.slice_m, rng=self._rng
+        ) if self.seasonal_mode == "dynamic" else None
 
     # --------------------- Truth registration (optional) --------------------- #
-    def set_truth(self, sigma: Optional[float] = None, xi: Optional[float] = None, Q: Optional[np.ndarray] = None) -> None:
+    def set_truth(self, sigma: Optional[float] = None, xi: Optional[float] = None,
+                  Q: Optional[np.ndarray] = None) -> None:
         self.true_sigma = sigma
         self.true_xi = xi
         self.true_Q = None if Q is None else np.asarray(Q, float)
@@ -383,15 +392,22 @@ class DGEVParticleGibbs:
     # ------------------ Helpers: μ and current m0/P0 ------------------ #
     def _mu_vec_current(self) -> np.ndarray:
         if self.dim == 0:
-            base = (self.level_value + self.slope_value * np.arange(self.T)) if self.trend_mode == "deterministic" else self.level_value
-            seas = (self.season_vec[np.arange(self.T) % self.period] if self.seasonal_mode == "deterministic" else 0.0)
+            base = (self.level_value + self.slope_value * np.arange(self.T)) \
+                if self.trend_mode == "deterministic" else self.level_value
+            seas = (self.season_vec[np.arange(self.T) % self.period]
+                    if self.seasonal_mode == "deterministic" else 0.0)
             return np.asarray(base + seas, float)
-        return np.array([self.mu_from_state(self.x[t], t - 1) for t in range(1, self.T + 1)], float)
+        return np.array(
+            [self.mu_from_state(self.x[t], t - 1) for t in range(1, self.T + 1)],
+            float
+        )
 
     def _current_m0_P0(self) -> Tuple[np.ndarray, np.ndarray]:
         m0, P0 = [], []
-        if self.idx_alpha is not None: m0.append(self.m0_alpha); P0.append(self.P0_alpha)
-        if self.idx_beta  is not None: m0.append(self.m0_beta ); P0.append(self.P0_beta )
+        if self.idx_alpha is not None:
+            m0.append(self.m0_alpha); P0.append(self.P0_alpha)
+        if self.idx_beta  is not None:
+            m0.append(self.m0_beta ); P0.append(self.P0_beta )
         if self.seasonal_mode == "dynamic":
             m0.extend(list(self.m0_gamma))
             P0.extend([self.P0_gamma] * (self.period - 1))
@@ -549,47 +565,30 @@ class DGEVParticleGibbs:
             self.sigma = sigma_prop
             self.accept["logsigma"] += 1
 
-    # -------- Truncated Normal prior for xi: helper & MH update ------------- #
-    def _log_prior_xi(self, xi: float) -> float:
-        """
-        Unnormalized log-density of truncated Normal prior:
-            xi ~ Normal(m_xi, s_xi^2) truncated to [xi_lower, xi_upper].
-        Normalizing constant cancels in MH; outside the interval we return -inf.
-        """
-        lo = float(self.priors.xi_lower)
-        hi = float(self.priors.xi_upper)
-        if xi < lo or xi > hi:
-            return -np.inf
-        m = float(self.priors.m_xi)
-        s = float(self.priors.s_xi)
-        if s <= 0.0:
-            return -np.inf
-        z = (xi - m) / s
-        return -0.5 * z * z
-
+    # ---------------- Uniform prior for xi & MH update ---------------- #
     def update_xi(self) -> None:
         step = self.cfg.step_xi
         cur = self.xi
         prop = cur + np.random.normal(0.0, step)
+        self.proposals["xi"] += 1
+
+        lo = float(self.priors.xi_lower)
+        hi = float(self.priors.xi_upper)
+
+        # Uniform prior support: reject immediately if outside [lo, hi]
+        if (prop < lo) or (prop > hi):
+            return
 
         mu_vec = self._mu_vec_current()
         ll_old = gev_loglike_sum(self.y, mu_vec, self.sigma, cur)
         ll_new = gev_loglike_sum(self.y, mu_vec, self.sigma, prop)
-        self.proposals["xi"] += 1
 
-        # Invalid likelihood (support violation etc.) ⇒ reject
+        # Invalid likelihood (support violation, etc.) ⇒ reject
         if ll_new == -np.inf:
             return
 
-        # Truncated Normal prior contribution
-        lp_old = self._log_prior_xi(cur)
-        lp_new = self._log_prior_xi(prop)
-
-        # Proposal outside [xi_lower, xi_upper] ⇒ lp_new = -inf ⇒ reject
-        if lp_new == -np.inf:
-            return
-
-        if self._mh_accept((ll_new + lp_new) - (ll_old + lp_old)):
+        # Prior is constant on [lo, hi], so log prior cancels in MH ratio
+        if self._mh_accept(ll_new - ll_old):
             self.xi = prop
             self.accept["xi"] += 1
 
@@ -634,7 +633,7 @@ class DGEVParticleGibbs:
         else:
             ll_obs_old = 0.0; ll_obs_new = 0.0
 
-        # Transition part is independent of slope in NCP (disturbances do not depend on slope)
+        # Transition part is independent of slope in NCP
         lp_old = -0.5 * ((cur - self.priors.m_slope) ** 2) / (self.priors.s_slope ** 2)
         lp_new = -0.5 * ((prop - self.priors.m_slope) ** 2) / (self.priors.s_slope ** 2)
         logacc = (ll_obs_new + lp_new) - (ll_obs_old + lp_old)
@@ -773,14 +772,15 @@ class DGEVParticleGibbs:
             # no dynamics in state; pure deterministic mean block
             mu_vec = self._mu_vec_current()
             logZ = float(gev_loglike_sum(self.y, mu_vec, self.sigma, self.xi))
-            pf_diag = {"ess_mean": float(N), "ess_min": float(N), "maxw_mean": 1.0, "maxw_max": 1.0, "resample_count": 0, "resample_rate": 0.0}
-            # fabricate degenerate structures
+            pf_diag = {"ess_mean": float(N), "ess_min": float(N),
+                       "maxw_mean": 1.0, "maxw_max": 1.0,
+                       "resample_count": 0, "resample_rate": 0.0}
             parts_w = np.zeros((T + 1, N, 0), float)
             wnorm   = np.ones((T + 1, N), float) / N
             a       = np.zeros((T + 1, N), int)
             return parts_w, wnorm, a, logZ, pf_diag
 
-        # SD vector per dimension (alpha, beta, g1 possibly)
+        # SD vector per dimension
         svec = self._diag_s_vector()
 
         # buffers
@@ -790,7 +790,7 @@ class DGEVParticleGibbs:
         aidx    = np.zeros((T + 1, N), int)
         logZ    = 0.0
 
-        # x0 common to all particles (conditional SMC setting)
+        # x0 common to all particles
         parts_x[0, :, :] = self.x[0]
 
         # reference disturbances implied by current path
@@ -815,9 +815,7 @@ class DGEVParticleGibbs:
             mu = self.mu_from_state(parts_x[1, n, :], t=0)
             lw[n] = gev_logpdf(self.y[0], mu, self.sigma, self.xi)
 
-        # ancestor for ref particle at t=1:
-        # in disturbance-space the transition density of w_t does not depend on x_{t-1}
-        # => AS reduces to previous normalized weights (uniform at t=1); choose uniformly.
+        # ancestor for ref particle at t=1
         aidx[1, N - 1] = np.random.choice(N)
 
         lw_max = np.max(lw)
@@ -859,7 +857,6 @@ class DGEVParticleGibbs:
             parts_w[t, N - 1, :] = w_ref[t, :]
             mean_ref = self._state_mean(parts_x[t - 1, N - 1, :], t=t)
             parts_x[t, N - 1, :] = self._apply_innovation(mean_ref, parts_w[t, N - 1, :])
-            # AS in disturbance space: candidate ancestors ∝ previous normalized weights
             aidx[t, N - 1] = np.random.choice(N, p=res_p)
 
             # weights at time t (likelihood only; proposal is prior)
@@ -895,7 +892,8 @@ class DGEVParticleGibbs:
         }
         return parts_w, wnorm, aidx, float(logZ), pf_diag
 
-    def _trace_single_trajectory(self, parts_w: np.ndarray, a: np.ndarray, wnorm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _trace_single_trajectory(self, parts_w: np.ndarray, a: np.ndarray,
+                                 wnorm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Backward-sample one disturbance path; reconstruct x deterministically."""
         N, T, D = self.cfg.n_particles, self.T, self.dim
         idx = np.zeros(T + 1, dtype=int)
@@ -932,19 +930,29 @@ class DGEVParticleGibbs:
         if self.dim == 0: return
         pos = 0
         if self.idx_alpha is not None:
-            self.m0_alpha = self._gibbs_m0_scalar(float(self.x[0, pos]), self.priors.m_m0_alpha, self.priors.s_m0_alpha, self.P0_alpha)
+            self.m0_alpha = self._gibbs_m0_scalar(
+                float(self.x[0, pos]),
+                self.priors.m_m0_alpha, self.priors.s_m0_alpha, self.P0_alpha
+            )
             pos += 1
         if self.idx_beta is not None:
-            self.m0_beta = self._gibbs_m0_scalar(float(self.x[0, pos]), self.priors.m_m0_beta, self.priors.s_m0_beta, self.P0_beta)
+            self.m0_beta = self._gibbs_m0_scalar(
+                float(self.x[0, pos]),
+                self.priors.m_m0_beta, self.priors.s_m0_beta, self.P0_beta
+            )
             pos += 1
         if self.seasonal_mode == "dynamic":
-            m_prior = (np.zeros(self.period - 1, float) if self.priors.m_m0_gamma is None
+            m_prior = (np.zeros(self.period - 1, float)
+                       if self.priors.m_m0_gamma is None
                        else np.asarray(self.priors.m_m0_gamma, float))
             if m_prior.size != self.period - 1:
                 raise ValueError("priors.m_m0_gamma must be length p-1 (NEWEST-FIRST)")
             s = float(self.priors.s_m0_gamma)
             for k in range(self.period - 1):
-                self.m0_gamma[k] = self._gibbs_m0_scalar(float(self.x[0, pos + k]), float(m_prior[k]), s, self.P0_gamma)
+                self.m0_gamma[k] = self._gibbs_m0_scalar(
+                    float(self.x[0, pos + k]),
+                    float(m_prior[k]), s, self.P0_gamma
+                )
 
     def update_P0(self) -> None:
         if self.dim == 0: return
@@ -1008,11 +1016,13 @@ class DGEVParticleGibbs:
         if self.seasonal_mode != "none":
             if self.seasonal_mode == "dynamic":
                 head = self.m0_gamma; head_show = head[:6] if len(head) > 6 else head
-                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) + (", …]" if len(head) > 6 else "]")
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) \
+                           + (", …]" if len(head) > 6 else "]")
                 parts.append(f"m0γ={head_str} P0γ={self.P0_gamma:.4g}")
             elif self.seasonal_mode == "deterministic" and self.season_vec is not None:
                 head = self.season_vec[:-1]; head_show = head[:6] if len(head) > 6 else head
-                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) + (", …]" if len(head) > 6 else "]")
+                head_str = "[" + ", ".join(f"{float(x):.4g}" for x in head_show) \
+                           + (", …]" if len(head) > 6 else "]")
                 parts.append(f"m0γ={head_str} P0γ=0 ({pct('season')})")
         return " | ".join(parts)
 
@@ -1043,9 +1053,12 @@ class DGEVParticleGibbs:
             self.keep["x"] = np.zeros((n_kept, self.T, self.dim))
             self.keep["w"] = np.zeros((n_kept, self.T, self.dim))
 
-        if self.level_mode == "deterministic": self.keep["level_value"] = np.zeros(n_kept)
-        if self.trend_mode == "deterministic": self.keep["slope_value"] = np.zeros(n_kept)
-        if self.seasonal_mode == "deterministic": self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
+        if self.level_mode == "deterministic":
+            self.keep["level_value"] = np.zeros(n_kept)
+        if self.trend_mode == "deterministic":
+            self.keep["slope_value"] = np.zeros(n_kept)
+        if self.seasonal_mode == "deterministic":
+            self.keep["season_vector"] = np.zeros((n_kept, self.period), float)
 
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50) or 1
 
@@ -1062,7 +1075,7 @@ class DGEVParticleGibbs:
                 mu_vec_now = self._mu_vec_current()
                 current_log_ev = float(gev_loglike_sum(self.y, mu_vec_now, self.sigma, self.xi))
 
-            # 2) Process SDs via slice sampling on log s (uses disturbance SS)
+            # 2) Process SDs via slice sampling on log s
             if self.dim > 0:
                 self.update_process_s_lognormal_slice()
 
@@ -1078,7 +1091,7 @@ class DGEVParticleGibbs:
             self.update_logsigma()
             self.update_xi()
 
-            # 7) Adapt RW–MH step sizes (Robbins–Monro)
+            # 7) Adapt RW–MH step sizes
             self._adapt_steps(it)
 
             # 8) progress
@@ -1153,6 +1166,11 @@ class DGEVParticleGibbs:
                 "beta" : {"mu": self.priors.mu_log_s_beta , "sd": self.priors.sd_log_s_beta },
                 "gamma": {"mu": self.priors.mu_log_s_gamma, "sd": self.priors.sd_log_s_gamma},
             },
+            "xi_prior": {
+                "type": "uniform",
+                "lower": float(self.priors.xi_lower),
+                "upper": float(self.priors.xi_upper),
+            },
             "true_sigma": self.true_sigma,
             "true_xi": self.true_xi,
             "true_Q": (None if self.true_Q is None else np.asarray(self.true_Q, float).tolist()),
@@ -1192,7 +1210,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=("DGEV PGAS Sampler — disturbance-space NCP with log-normal priors on process SDs "
-                     "(slice on ln s; proposal is prior in innovation space).")
+                     "and a uniform prior for xi on [xi_lower, xi_upper].")
     )
 
     # Simulation controls
@@ -1229,9 +1247,10 @@ if __name__ == "__main__":
     # Inference priors (obs + deterministic)
     parser.add_argument("--prior-m-sigma",  type=float, default=0.0)
     parser.add_argument("--prior-s-sigma",  type=float, default=0.1)
-    parser.add_argument("--prior-m-xi",     type=float, default=0.0)
-    parser.add_argument("--prior-s-xi",     type=float, default=0.1)
-    
+
+    # Uniform prior bounds for xi
+    parser.add_argument("--prior-xi-lower", type=float, default=-0.5)
+    parser.add_argument("--prior-xi-upper", type=float, default=0.5)
 
     parser.add_argument("--prior-m-level",  type=float, default=0.0)
     parser.add_argument("--prior-s-level",  type=float, default=10.0)
@@ -1326,7 +1345,7 @@ if __name__ == "__main__":
     pri_season_first = _csv_floats_or_none(args.prior_m_season)
     priors = Priors(
         m_sigma=float(args.prior_m_sigma), s_sigma=float(args.prior_s_sigma),
-        m_xi=float(args.prior_m_xi),       s_xi=float(args.prior_s_xi),
+        xi_lower=float(args.prior_xi_lower), xi_upper=float(args.prior_xi_upper),
         m_level=float(args.prior_m_level), s_level=float(args.prior_s_level),
         m_slope=float(args.prior_m_slope), s_slope=float(args.prior_s_slope),
         m_season=None if pri_season_first is None else pri_season_first,
@@ -1443,6 +1462,7 @@ if __name__ == "__main__":
                 print(f"P0_season_init={init_p0_season_scalar}")
             print(f"period={args.period}, start={dates_T[0]}, end={dates_T[-1]}")
             print(f"y mean={y.mean():.3f}, sd={y.std(ddof=1):.3f}")
+            print(f"xi prior: Uniform[{priors.xi_lower}, {priors.xi_upper}]")
 
     # --- run sampler --------------------------------------------------------
     t0 = time.time()
