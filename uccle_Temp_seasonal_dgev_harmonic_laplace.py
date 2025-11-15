@@ -50,18 +50,20 @@ def load_seasonals(
     def read_one(path: str) -> pd.Series:
         df = pd.read_csv(path, index_col=0)
         # pick numeric column
-        col = (
-            df.columns[0]
-            if df.shape[1] == 1
-            else next(
+        if df.shape[1] == 1:
+            col = df.columns[0]
+        else:
+            col = next(
                 (c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])),
                 None,
             )
-        )
         if col is None:
             raise ValueError(f"No numeric column found in {path}.")
         ts = pd.to_datetime(df.index)
-        s = pd.Series(df[col].to_numpy(dtype=float), index=ts.to_period("Q-FEB")).sort_index()
+        s = pd.Series(
+            df[col].to_numpy(dtype=float),
+            index=ts.to_period("Q-FEB"),
+        ).sort_index()
         s = s[(s.index.year >= start_year) & (s.index.year <= end_year)]
         return s
 
@@ -97,6 +99,28 @@ def _default_seasonal_dummies(period: int) -> np.ndarray:
     g = np.cos(2.0 * np.pi * np.arange(period) / period)
     g -= g.mean()
     return g.astype(float)
+
+
+def _str2bool(v):
+    if isinstance(v, bool):
+        return v
+    v = str(v).strip().lower()
+    return v in {"true", "1", "yes", "y"}
+
+
+def _jsonify_dict(d: dict) -> dict:
+    """
+    Make a dict JSON-safe: convert any np.ndarray to list, np.generic to Python scalars.
+    """
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, np.ndarray):
+            out[k] = v.tolist()
+        elif isinstance(v, (np.generic,)):
+            out[k] = v.item()
+        else:
+            out[k] = v
+    return out
 
 
 # =========================
@@ -160,7 +184,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--init-xi",
         type=float,
-        default=-0.1,
+        default=-.1,
         help="Initial ξ for GEV (default: 0.0, clipped to [xi_lower, xi_upper]).",
     )
 
@@ -193,12 +217,12 @@ if __name__ == "__main__":
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
     # Log-normal priors for process SDs ln s_α, ln s_β, ln s_γ
-    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-3)
-    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=1.0)
-    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-5)
-    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=1.0)
-    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-4)
-    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=1.0)
+    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-2.3)
+    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=0.7)
+    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-3.5)
+    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=0.7)
+    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-3.0)
+    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=0.7)
 
     # ---------------- Sampler config ----------------
     parser.add_argument("--n-iter", type=int, default=4000)
@@ -219,6 +243,7 @@ if __name__ == "__main__":
     # Adaptive RW–MH
     parser.add_argument(
         "--adapt-steps",
+        type=_str2bool,
         default=True,
         help="Whether to adapt RW–MH step sizes (True/False).",
     )
@@ -237,6 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("--show-plots", action="store_true")
     parser.add_argument(
         "--progress",
+        type=_str2bool,
         default=True,
         help="Print per-iteration progress info (True/False).",
     )
@@ -305,8 +331,9 @@ if __name__ == "__main__":
             cos_prior_arr, sin_prior_arr, nyq_val = dummies_full_to_harmonics_fft(
                 centered, K=K_full, use_nyquist=use_nyq
             )
-            cos_prior = cos_prior_arr
-            sin_prior = sin_prior_arr
+            # IMPORTANT: convert to lists so Priors is JSON-serializable
+            cos_prior = cos_prior_arr.tolist()
+            sin_prior = sin_prior_arr.tolist()
             nyq_prior = 0.0 if nyq_val is None else float(nyq_val)
 
     # ---------------- Priors for DGEVApproxGibbs ----------------
@@ -320,7 +347,7 @@ if __name__ == "__main__":
         s_m0_alpha=float(args.prior_s_level),
         m_m0_beta=float(args.prior_m_slope),
         s_m0_beta=float(args.prior_s_slope),
-        # harmonic priors (can be None → defaults to 0 in code)
+        # harmonic priors (lists or None → handled inside sampler)
         m_m0_cos=None if cos_prior is None else cos_prior,
         m_m0_sin=None if sin_prior is None else sin_prior,
         m_m0_nyq=float(nyq_prior),
@@ -333,6 +360,11 @@ if __name__ == "__main__":
         mu_log_s_gamma=float(args.prior_ln_s_gamma_m),
         sd_log_s_gamma=float(args.prior_ln_s_gamma_sd),
     )
+
+    # For deterministic level: re-center its prior around the data (helps mixing)
+    if args.level_mode == "deterministic":
+        priors.m_m0_alpha = float(np.median(y))
+        priors.s_m0_alpha = max(2.0, 0.5 * y.std(ddof=1))
 
     # ---------------- Sampler config ----------------
     cfg = SamplerConfig(
@@ -451,8 +483,8 @@ if __name__ == "__main__":
             "trend_mode": args.trend_mode,
             "seasonal_mode": args.seasonal_mode,
         },
-        "cfg": asdict(cfg),
-        "priors": asdict(priors),
+        "cfg": _jsonify_dict(asdict(cfg)),
+        "priors": _jsonify_dict(asdict(priors)),
         "elapsed_seconds": float(elapsed),
         "timestamp": datetime.now().isoformat(),
         "years": {"start": int(args.start_year), "end": int(args.end_year)},
