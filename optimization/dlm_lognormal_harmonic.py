@@ -966,7 +966,7 @@ if __name__ == "__main__":
 
     p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
 
     p.add_argument("--q-level", type=float, default=0.05)
     p.add_argument("--q-trend", type=float, default=0.000002)
