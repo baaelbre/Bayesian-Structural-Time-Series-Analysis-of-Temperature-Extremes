@@ -2,6 +2,8 @@
   "T": 524,
   "dim": 5,
   "period": 4,
+  "harmonics": 1,
+  "use_nyquist": true,
   "modes": {
     "level_mode": "dynamic",
     "trend_mode": "dynamic",
@@ -10,9 +12,9 @@
   "layout": [
     "alpha",
     "beta",
-    "g1",
-    "g2",
-    "g3"
+    "c1",
+    "s1",
+    "nyq"
   ],
   "cfg": {
     "n_iter": 50000,
@@ -21,9 +23,9 @@
     "random_seed": 42,
     "progress": true,
     "progress_every": 10,
+    "print_dummies_every": 1,
     "slice_w": 3.0,
-    "slice_m": 50,
-    "sigma_update": "resid"
+    "slice_m": 50
   },
   "priors": {
     "a_sigma": 2.0,
@@ -32,24 +34,22 @@
     "s_m0_alpha": 10.0,
     "m_m0_beta": 0.0,
     "s_m0_beta": 10.0,
-    "m_m0_gamma": [
-      0.0,
-      0.0,
-      0.0
-    ],
-    "s_m0_gamma": 5.0,
+    "m_m0_nyq": 0.0,
+    "s_m0_harm": 5.0,
+    "m_m0_cos": null,
+    "m_m0_sin": null,
     "a_P0_alpha": 5.0,
     "b_P0_alpha": 1.0,
     "a_P0_beta": 5.0,
     "b_P0_beta": 1.0,
-    "a_P0_gamma": 5.0,
-    "b_P0_gamma": 1.0,
-    "mu_log_s_alpha": -1.0,
-    "sd_log_s_alpha": 1.0,
-    "mu_log_s_beta": -1.0,
-    "sd_log_s_beta": 1.0,
-    "mu_log_s_gamma": -1.0,
-    "sd_log_s_gamma": 1.0
+    "a_P0_harm": 5.0,
+    "b_P0_harm": 1.0,
+    "ln_s_alpha_mu": -3.0,
+    "ln_s_alpha_sd": 1.0,
+    "ln_s_beta_mu": -3.0,
+    "ln_s_beta_sd": 1.0,
+    "ln_s_gamma_mu": -3.0,
+    "ln_s_gamma_sd": 1.0
   },
   "label": "TNm_seasonal",
   "index_type": "DatetimeIndex",
@@ -579,5 +579,5 @@
     "2022-06-01 00:00:00",
     "2022-09-01 00:00:00"
   ],
-  "description": "Disturbance-NCP DLM with dummy-rotation seasonality (period=4, dynamic level/trend/season)."
+  "description": "Gaussian DLM with harmonic seasonality (cos/sin + Nyquist), dynamic level/trend/season, log-normal priors on process SDs."
 }
