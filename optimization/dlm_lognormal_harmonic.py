@@ -10,7 +10,6 @@ Key changes vs Half‑Cauchy version
 • We sample z_k = ln s_k by univariate **slice sampling** targeting:
       log post(z) = −T_eff·z − 0.5·SS·exp(−2z) − 0.5·((z−μ)/σ)^2   (up to constants)
   where SS and T_eff are innovation sum of squares and effective counts for each block.
-• Removed all Half‑Cauchy IG‑mixture code/auxiliaries.
 • CLI replaces --hc-scale-* with --ln-s-*-mu and --ln-s-*-sd; added slice controls (--slice-w, --slice-m).
 
 This file expects helper FFT mappers in `harmonic_helpers.py` providing:

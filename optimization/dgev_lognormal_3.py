@@ -1339,8 +1339,8 @@ if __name__ == "__main__":
     )
 
     # Simulation controls
-    parser.add_argument("--T", type=int, default=100)
-    parser.add_argument("--period", type=int, default=4)
+    parser.add_argument("--T", type=int, default=500)
+    parser.add_argument("--period", type=int, default=12)
     parser.add_argument("--start-date", type=str, default="2000-01-01")
 
     parser.add_argument("--level-mode",   choices=["dynamic", "deterministic"],            default="dynamic")

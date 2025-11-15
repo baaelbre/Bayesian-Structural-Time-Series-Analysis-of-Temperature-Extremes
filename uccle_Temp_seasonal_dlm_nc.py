@@ -79,10 +79,10 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         b_P0_beta=1.0,
         a_P0_gamma=5.0,
         b_P0_gamma=1.0,
-        # log-normal priors for process SDs (roughly matching your old ln_s_* settings)
-        mu_log_s_alpha=-3.0, sd_log_s_alpha=1,  # level almost deterministic
-        mu_log_s_beta =-3.0, sd_log_s_beta =1,   # trend almost deterministic
-        mu_log_s_gamma=-3.0, sd_log_s_gamma=1   # seasonal almost fixed
+        # log-normal priors for process SDs
+        mu_log_s_alpha=-3.0, sd_log_s_alpha=1,  
+        mu_log_s_beta =-3.0, sd_log_s_beta =1,   
+        mu_log_s_gamma=-3.0, sd_log_s_gamma=1   
 
     )
 
