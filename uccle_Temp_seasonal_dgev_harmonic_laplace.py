@@ -193,12 +193,12 @@ if __name__ == "__main__":
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
     # Log-normal priors for process SDs ln s_α, ln s_β, ln s_γ
-    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-2.3)
-    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=0.7)
-    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-3.5)
-    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=0.7)
-    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-3.0)
-    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=0.7)
+    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-3)
+    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=1.0)
+    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-5)
+    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=1.0)
+    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-4)
+    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=1.0)
 
     # ---------------- Sampler config ----------------
     parser.add_argument("--n-iter", type=int, default=4000)
