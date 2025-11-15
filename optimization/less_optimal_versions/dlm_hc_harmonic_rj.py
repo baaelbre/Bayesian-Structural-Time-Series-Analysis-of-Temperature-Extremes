@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, math, os, time, warnings
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
-from harmonic_helpers import (
+from optimization.harmonic_helpers import (
         center_and_report_dummies_full,
         dummies_full_to_harmonics_fft,
         harmonics_to_dummies_full_fft,

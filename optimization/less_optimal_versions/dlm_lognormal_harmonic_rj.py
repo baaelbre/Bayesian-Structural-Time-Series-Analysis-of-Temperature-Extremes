@@ -38,7 +38,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-from harmonic_helpers import (
+from optimization.harmonic_helpers import (
     center_and_report_dummies_full,
     dummies_full_to_harmonics_fft,
     harmonics_to_dummies_full_fft,
