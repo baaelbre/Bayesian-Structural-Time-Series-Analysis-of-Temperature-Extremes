@@ -172,8 +172,8 @@ def run_one(
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=100,
-        burn=10,
+        n_iter=10000,
+        burn=5000,
         thin=1,
         random_seed=42,
         progress=True,
