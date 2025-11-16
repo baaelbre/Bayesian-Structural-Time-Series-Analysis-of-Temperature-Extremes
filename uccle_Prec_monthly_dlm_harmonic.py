@@ -1,6 +1,7 @@
 # run_uccle_precip_harmonic.py  — monthly precipitation means (period = 12)
 import os
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,54 @@ from optimization.dlm_lognormal_harmonic import (
 DATA_DIR = Path("data")
 
 
+# ======================================================================
+# Small helpers
+# ======================================================================
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _series_out_root(series: str) -> Path:
+    """
+    Map series name to required output root directories:
+
+      Precm → results/uccle/Prec/Precm/Monthly/
+    """
+    base = Path("results/uccle")
+    mapping = {
+        "Precm": base / "Prec" / "Precm" / "Monthly",
+    }
+    if series not in mapping:
+        raise ValueError(f"Unknown series '{series}' for output mapping.")
+    return mapping[series]
+
+
+def _date_tag_from_index(idx: pd.Index) -> str:
+    """
+    Build a date tag 'start-end' from a pandas index.
+    • For DatetimeIndex: YYYY-MM-DD
+    • For PeriodIndex: str(period)
+    • Otherwise: str(index_value)
+    """
+    if len(idx) == 0:
+        return "NA-NA"
+
+    if isinstance(idx, pd.DatetimeIndex):
+        start = idx[0].strftime("%Y-%m-%d")
+        end = idx[-1].strftime("%Y-%m-%d")
+    elif isinstance(idx, pd.PeriodIndex):
+        start = str(idx[0])
+        end = str(idx[-1])
+    else:
+        start = str(idx[0])
+        end = str(idx[-1])
+
+    return f"{start}-{end}"
+
+
+# ======================================================================
+# Data loading
+# ======================================================================
 def load_series(csv_path: Path) -> pd.Series:
     """
     Load a univariate *monthly* precipitation series from CSV and trim to a
@@ -63,10 +112,31 @@ def load_series(csv_path: Path) -> pd.Series:
     return ser.iloc[:n]
 
 
-def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
+# ======================================================================
+# Core runner
+# ======================================================================
+def run_one(
+    series: str,
+    y_ser: pd.Series,
+    out_root: Path,
+    level_mode: str = "dynamic",
+    trend_mode: str = "dynamic",
+    seasonal_mode: str = "dynamic",
+) -> None:
     """
     Run the harmonic DLM (cos/sin + optional Nyquist) on a single *monthly*
     precipitation series.
+
+    Parameters
+    ----------
+    series : {"Precm"}
+        Short series code used in filenames.
+    y_ser : pd.Series
+        Time series of monthly means/totals.
+    out_root : Path
+        Base directory (e.g., results/uccle/Prec/Precm/Monthly).
+    level_mode, trend_mode, seasonal_mode : str
+        Mode strings passed to DLMGibbsHarmonic and used in filenames.
     """
     y = y_ser.to_numpy(dtype=float)
     period = 12  # 12 months per year
@@ -95,16 +165,16 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         # log-normal priors for process SDs (ln s ~ N(mu, sd^2))
         ln_s_alpha_mu=-2.0,
         ln_s_alpha_sd=1.0,
-        ln_s_beta_mu=-5.0,
+        ln_s_beta_mu=-4.0,
         ln_s_beta_sd=1.0,
-        ln_s_gamma_mu=-5.0,
+        ln_s_gamma_mu=-4.0,
         ln_s_gamma_sd=1.0,
     )
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=1000,
-        burn=100,
+        n_iter=100,
+        burn=10,
         thin=1,
         random_seed=42,
         progress=True,
@@ -116,6 +186,7 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
 
     # ----- Initial values ----- #
     sigma2_init = float(np.var(y) * 0.1) if len(y) > 1 else 1.0
+    modes_tag = f"{level_mode}_{trend_mode}_{seasonal_mode}"
 
     # For period=12, harmonics=None ⇒ use the sampler’s full harmonic basis.
     sampler = DLMGibbsHarmonic(
@@ -123,9 +194,9 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         period=period,
         harmonics=None,          # use full harmonic basis for monthly cycle
         use_nyquist=None,        # let the sampler decide
-        level_mode="dynamic",
-        trend_mode="dynamic",
-        seasonal_mode="dynamic",
+        level_mode=level_mode,
+        trend_mode=trend_mode,
+        seasonal_mode=seasonal_mode,
         # initial means/vars for dynamic level/trend
         m0_alpha_init=float(np.mean(y[: min(len(y), period)])),  # roughly first year
         P0_alpha_init=0.25,
@@ -145,53 +216,94 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         cfg=cfg,
     )
 
+    # ----- Construct run-specific directories and filenames ----- #
+    idx = y_ser.index[: len(y)]
+    date_tag = _date_tag_from_index(idx)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tag = f"{series}_{modes_tag}"
+
+    outdir = out_root / f"{tag}_{timestamp}"
+    _ensure_dir(outdir)
+
     # ----- Run sampler ----- #
+    print(f"Running harmonic DLM for {series} with modes={modes_tag} ...")
+    t0 = datetime.now().timestamp()
     post = sampler.run()
+    elapsed = datetime.now().timestamp() - t0
+    print(f"{series}: run time {elapsed:.2f} seconds")
 
     # ----- Save posterior + metadata ----- #
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_npz = outdir / "posterior.npz"
+    npz_name = f"posterior_{series}_{date_tag}_{modes_tag}.npz"
+    out_npz = outdir / npz_name
+
     sampler.save_posterior(
         out_npz_path=str(out_npz),
         extra_meta={
-            "label": label,
-            "index_type": type(y_ser.index).__name__,
-            "index_values": [str(ix) for ix in y_ser.index[: len(y)]],
+            "series": series,
+            "label": f"{series}_monthly",
+            "index_type": type(idx).__name__,
+            "index_values_preview": [str(ix) for ix in idx[: min(10, len(idx))]],
+            "modes": {
+                "level_mode": level_mode,
+                "trend_mode": trend_mode,
+                "seasonal_mode": seasonal_mode,
+            },
             "description": (
                 "Gaussian DLM with harmonic monthly seasonality (cos/sin + Nyquist), "
                 "dynamic level/trend/season, log-normal priors on process SDs, "
                 "applied to monthly mean precipitation (Precm)."
             ),
+            "period": period,
+            "date_tag": date_tag,
+            "elapsed_seconds": float(elapsed),
+            "timestamp": datetime.now().isoformat(),
         },
     )
 
     # ----- Quick fit plot ----- #
     mu_hat = post["mu"].mean(axis=0)
-    t_index = y_ser.index[: len(y)]
+    t_index = idx
 
     plt.figure(figsize=(12, 4))
-    plt.plot(t_index, y, label=f"{label}")
+    plt.plot(t_index, y, label=f"{series}")
     plt.plot(t_index, mu_hat, "-.", label="μ̂_t")
     plt.title(
-        f"{label}: harmonic DLM (dyn level/trend/season, "
+        f"{series}: harmonic DLM (L/T/S={modes_tag}, "
         f"s={period}, K={sampler.K}, nyq={sampler.use_nyq})"
     )
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(outdir / "fit.png", dpi=150)
+
+    fit_name = f"fit_{series}_{date_tag}_{modes_tag}.png"
+    plt.savefig(outdir / fit_name, dpi=150)
     plt.close()
 
+    print(f"Saved posterior to {out_npz}")
+    print(f"Saved fit plot to {outdir / fit_name}\n")
 
+
+# ======================================================================
+# Main
+# ======================================================================
 def main() -> None:
     # Monthly mean precipitation
     precm = load_series(DATA_DIR / "Precm.csv")
 
     print("Precm head:\n", precm.head(), "\n")
 
-    run_one("Precm_monthly", precm, Path("results/uccle/Precm_harm_monthly/"))
+    # Base root: results/uccle/Prec/Precm/Monthly
+    precm_root = _series_out_root("Precm")
 
-    print("Saved results under results/uccle/Precm_harm_monthly")
+    # Modes (can edit here if you want to experiment later)
+    level_mode = "dynamic"
+    trend_mode = "dynamic"
+    seasonal_mode = "dynamic"
+
+    run_one("Precm", precm, precm_root, level_mode, trend_mode, seasonal_mode)
+
+    print("Saved results under:")
+    print(f"  {precm_root}/*")
 
 
 if __name__ == "__main__":

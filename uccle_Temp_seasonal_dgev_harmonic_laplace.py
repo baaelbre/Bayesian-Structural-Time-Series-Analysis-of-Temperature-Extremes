@@ -1,4 +1,5 @@
 # uccle_Temp_seasonal_dgev_harmonic_laplace.py
+# for s in TXx TXn TNx TNn; do python -u uccle_Temp_seasonal_dgev_harmonic_laplace.py --series "$s"; done
 import os
 import sys
 import time
@@ -78,12 +79,12 @@ def _series_out_root(series: str) -> str:
     """
     Map series name to required output root:
 
-      TXx → results/TX/TXx/Seasonal/Laplace/
-      TXn → results/TX/TXn/Seasonal/Laplace/
-      TNx → results/TN/TNx/Seasonal/Laplace/
-      TNn → results/TN/TNn/Seasonal/Laplace/
+      TXx → results/uccle/TX/TXx/Seasonal/Laplace/
+      TXn → results/uccle/TX/TXn/Seasonal/Laplace/
+      TNx → results/uccle/TN/TNx/Seasonal/Laplace/
+      TNn → results/uccle/TN/TNn/Seasonal/Laplace/
     """
-    base = "results"
+    base = "results/uccle"
     mapping = {
         "TXx": os.path.join(base, "TX", "TXx", "Seasonal", "Laplace"),
         "TXn": os.path.join(base, "TX", "TXn", "Seasonal", "Laplace"),
@@ -188,7 +189,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--series",
         choices=["TXx", "TXn", "TNx", "TNn"],
-        default="TXx",
+        default="TNx",
         help="Which seasonal series to fit.",
     )
 
@@ -260,9 +261,9 @@ if __name__ == "__main__":
     parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=0.7)
 
     # ---------------- Sampler config ----------------
-    parser.add_argument("--n-iter", type=int, default=4000)
-    parser.add_argument("--burn", type=int, default=1000)
-    parser.add_argument("--thin", type=int, default=2)
+    parser.add_argument("--n-iter", type=int, default=100)
+    parser.add_argument("--burn", type=int, default=10)
+    parser.add_argument("--thin", type=int, default=1)
 
     # RW–MH step sizes
     parser.add_argument("--step-logsigma", type=float, default=0.1)
@@ -298,10 +299,10 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Override output directory. "
-            "By default, uses results/TX/TXx/Seasonal/Laplace/, "
-            "results/TX/TXn/Seasonal/Laplace/, "
-            "results/TN/TNx/Seasonal/Laplace/ or "
-            "results/TN/TNn/Seasonal/Laplace/ depending on series."
+            "By default, uses results/uccle/TX/TXx/Seasonal/Laplace/, "
+            "results/uccle/TX/TXn/Seasonal/Laplace/, "
+            "results/uccle/TN/TNx/Seasonal/Laplace/ or "
+            "results/uccle/TN/TNn/Seasonal/Laplace/ depending on series."
         ),
     )
     parser.add_argument("--no-plots", action="store_true")

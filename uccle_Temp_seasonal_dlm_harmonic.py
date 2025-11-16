@@ -29,12 +29,13 @@ def _series_out_root(series: str) -> Path:
     """
     Map series name to required output root directories:
 
-      TXm → TX/TXm/Seasonal/
-      TNm → TN/TNm/Seasonal/
+      TXm → results/TX/TXm/Seasonal/
+      TNm → results/TN/TNm/Seasonal/
     """
+    base = Path("results/uccle")
     mapping = {
-        "TXm": Path("TX") / "TXm" / "Seasonal",
-        "TNm": Path("TN") / "TNm" / "Seasonal",
+        "TXm": base / "TX" / "TXm" / "Seasonal",
+        "TNm": base / "TN" / "TNm" / "Seasonal",
     }
     if series not in mapping:
         raise ValueError(f"Unknown series '{series}' for output mapping.")
@@ -125,7 +126,7 @@ def run_one(
     y_ser : pd.Series
         Time series of seasonal means.
     out_root : Path
-        Base directory (e.g., TX/TXm/Seasonal or TN/TNm/Seasonal).
+        Base directory (e.g., results/TX/TXm/Seasonal or results/TN/TNm/Seasonal).
     level_mode, trend_mode, seasonal_mode : str
         Mode strings passed to DLMGibbsHarmonic and used in filenames.
     """
@@ -164,8 +165,8 @@ def run_one(
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=1000,
-        burn=100,
+        n_iter=100,
+        burn=10,
         thin=1,
         random_seed=42,
         progress=True,
@@ -284,9 +285,9 @@ def main() -> None:
     print("TXm head:\n", tx.head(), "\n")
     print("TNm head:\n", tn.head(), "\n")
 
-    # Base roots (no 'results/uccle', as requested)
-    tx_root = _series_out_root("TXm")  # TX/TXm/Seasonal
-    tn_root = _series_out_root("TNm")  # TN/TNm/Seasonal
+    # Base roots (now with 'results/' prefix)
+    tx_root = _series_out_root("TXm")  # results/TX/TXm/Seasonal
+    tn_root = _series_out_root("TNm")  # results/TN/TNm/Seasonal
 
     # Modes (can edit here if you want to experiment later)
     level_mode = "dynamic"

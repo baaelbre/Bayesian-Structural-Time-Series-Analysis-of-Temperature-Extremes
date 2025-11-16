@@ -31,6 +31,16 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _series_out_root() -> str:
+    """
+    Output root for seasonal precipitation extremes:
+
+      Precx → results/uccle/Prec/Precx/Seasonal/Laplace/
+    """
+    base = "results/uccle"
+    return os.path.join(base, "Prec", "Precx", "Seasonal", "Laplace")
+
+
 def load_precx_seasonal(
     start_year: int = 1892,
     end_year: int = 2022,
@@ -208,9 +218,9 @@ if __name__ == "__main__":
     parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=1)
 
     # ---------------- Sampler config ----------------
-    parser.add_argument("--n-iter", type=int, default=4000)
-    parser.add_argument("--burn", type=int, default=1000)
-    parser.add_argument("--thin", type=int, default=2)
+    parser.add_argument("--n-iter", type=int, default=100)
+    parser.add_argument("--burn", type=int, default=10)
+    parser.add_argument("--thin", type=int, default=1)
 
     # RW–MH step sizes
     parser.add_argument("--step-logsigma", type=float, default=0.1)
@@ -240,7 +250,16 @@ if __name__ == "__main__":
 
     # ---------------- Output & reproducibility ----------------
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help=(
+            "Override output directory. "
+            "By default: results/uccle/Prec/Precx/Seasonal/Laplace/"
+            "with subfolder Precx_<modes>_<timestamp>/"
+        ),
+    )
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--show-plots", action="store_true")
     parser.add_argument(
@@ -266,12 +285,16 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
 
     # ---------------- Load SEASONAL Precx series ----------------
-    s = load_precx_seasonal(
-        start_year=args.start_year,
-        end_year=args.end_year,
-        data_dir=args.data_dir,
-        precx_file=args.precx_file,
-    ).dropna().sort_index()  # PeriodIndex('Q-FEB')
+    s = (
+        load_precx_seasonal(
+            start_year=args.start_year,
+            end_year=args.end_year,
+            data_dir=args.data_dir,
+            precx_file=args.precx_file,
+        )
+        .dropna()
+        .sort_index()
+    )  # PeriodIndex('Q-FEB')
 
     y = s.to_numpy(dtype=float)
     T = y.size
@@ -432,12 +455,17 @@ if __name__ == "__main__":
     )
 
     # ---------------- Output directories ----------------
-    tag = f"UccleSeasonalLaplace-Precx_{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}"
-    out_dir = args.out_dir or os.path.join(
-        "results",
-        "uccle",
-        f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    modes_tag = f"{args.level_mode}_{args.trend_mode}_{args.seasonal_mode}"
+    series = "Precx"
+    tag = f"{series}_{modes_tag}"
+
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    else:
+        series_root = _series_out_root()
+        out_dir = os.path.join(series_root, f"{tag}_{timestamp}")
+
     fig_dir = os.path.join(out_dir, "figures")
     _ensure_dir(out_dir)
     _ensure_dir(fig_dir)
@@ -449,7 +477,10 @@ if __name__ == "__main__":
     print(f"Run time: {elapsed:.2f}s")
 
     # ---------------- Save posterior + metadata ----------------
-    npz_path = os.path.join(out_dir, "posterior.npz")
+    date_tag = f"{int(args.start_year)}-{int(args.end_year)}"
+    npz_filename = f"posterior_{series}_{date_tag}_{modes_tag}.npz"
+    npz_path = os.path.join(out_dir, npz_filename)
+
     extra_meta = {
         "series": "Precx_seasonal",
         "T": int(T),
@@ -480,3 +511,6 @@ if __name__ == "__main__":
             f"log p(y|θ) (approx GEV): mean={np.nanmean(le):.3f}, "
             f"median={np.nanmedian(le):.3f}, best={np.nanmax(le):.3f}"
         )
+
+    print("Saved results under:")
+    print(f"  {out_dir}/*")
