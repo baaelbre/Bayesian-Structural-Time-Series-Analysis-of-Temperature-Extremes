@@ -1,53 +1,92 @@
-# uccle_Temp_seasonal_dgev_harmonic_laplace.py
-import os
-import sys
-import time
+# uccle_Precx_seasonal_dgev_harmonic_laplace.py
+# Example:
+#   python -u uccle_Precx_seasonal_dgev_harmonic_laplace.py
+
+import os, sys, time, json
 from dataclasses import asdict
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------------------
-# Ensure project root on path
-# ---------------------------------------------------------------------------
-THIS_DIR = os.path.dirname(__file__)
-PROJECT_ROOT = os.path.join(THIS_DIR, "..")
-sys.path.append(PROJECT_ROOT)
+# Import from project root
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from optimization.dgev_lognormal_harmonic_laplace import (  # type: ignore
+from optimization.dgev_lognormal_harmonic_laplace import (
     DGEVApproxGibbs,
     Priors,
     SamplerConfig,
 )
-from optimization.harmonic_helpers import (  # type: ignore
+from optimization.harmonic_helpers import (
     center_and_report_dummies_full,
     dummies_full_to_harmonics_fft,
 )
-from simulator.dgev_plotter import DGEVPlotter  # optional  # type: ignore
+from simulator.dgev_plotter import DGEVPlotter  # optional
 
 
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
+# =========================
+# I/O + small helpers
+# =========================
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def load_precx_seasonal(
+    start_year: int = 1892,
+    end_year: int = 2022,
+    data_dir: str = "data",
+    precx_file: str = "Precx_seasonal.csv",
+) -> pd.Series:
+    """
+    Read a SEASONAL CSV for max precipitation:
+
+      Precx_seasonal.csv: seasonal max of daily precipitation,
+      1 row per meteorological season (DJF/MAM/JJA/SON).
+
+    The CSV is expected to have:
+      - a date-like first column (any date within the season, e.g. date of max),
+      - one numeric column with the precipitation maximum (e.g. 'Prec').
+
+    We convert the index to PeriodIndex('Q-FEB'):
+      Q1 = DJF (Dec–Jan–Feb, labeled by Jan/Feb year),
+      Q2 = MAM, Q3 = JJA, Q4 = SON.
+    """
+
+    path = os.path.join(data_dir, precx_file)
+    df = pd.read_csv(path, index_col=0)
+
+    # pick numeric column
+    if df.shape[1] == 1:
+        col = df.columns[0]
+    else:
+        col = next(
+            (c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])),
+            None,
+        )
+    if col is None:
+        raise ValueError(f"No numeric column found in {path}.")
+
+    ts = pd.to_datetime(df.index)
+    s = pd.Series(
+        df[col].to_numpy(dtype=float),
+        index=ts.to_period("Q-FEB"),
+    ).sort_index()
+
+    s = s[(s.index.year >= start_year) & (s.index.year <= end_year)]
+    return s
+
+
 def _parse_csv_floats(val: str | None):
-    """Parse '1,2,3' → [1.0, 2.0, 3.0] (or None if empty)."""
     if val is None:
         return None
     val = val.strip()
-    if not val:
-        return None
-    return [float(tok) for tok in val.split(",") if tok.strip()]
+    return None if not val else [float(tok) for tok in val.split(",") if tok.strip() != ""]
 
 
 def _default_seasonal_dummies(period: int) -> np.ndarray:
     """
-    Default smooth seasonal pattern over a full period, mean-centered.
-    Used when no explicit seasonal prior is provided.
+    Default smooth seasonal pattern as full-length dummies that sum to zero.
+    (Cosine over the period, mean-centered.)
     """
     g = np.cos(2.0 * np.pi * np.arange(period) / period)
     g -= g.mean()
@@ -62,142 +101,41 @@ def _str2bool(v):
 
 
 def _jsonify_dict(d: dict) -> dict:
-    """Convert numpy types to JSON-safe Python objects."""
+    """
+    Make a dict JSON-safe: convert any np.ndarray to list, np.generic to Python scalars.
+    """
     out = {}
     for k, v in d.items():
         if isinstance(v, np.ndarray):
             out[k] = v.tolist()
-        elif isinstance(v, np.generic):
+        elif isinstance(v, (np.generic,)):
             out[k] = v.item()
         else:
             out[k] = v
     return out
 
 
-def _series_out_root(series: str) -> str:
-    """
-    Map series name to required output root:
-
-      TXx → results/TX/TXx/Seasonal/Laplace/
-      TXn → results/TX/TXn/Seasonal/Laplace/
-      TNx → results/TN/TNx/Seasonal/Laplace/
-      TNn → results/TN/TNn/Seasonal/Laplace/
-    """
-    base = "results"
-    mapping = {
-        "TXx": os.path.join(base, "TX", "TXx", "Seasonal", "Laplace"),
-        "TXn": os.path.join(base, "TX", "TXn", "Seasonal", "Laplace"),
-        "TNx": os.path.join(base, "TN", "TNx", "Seasonal", "Laplace"),
-        "TNn": os.path.join(base, "TN", "TNn", "Seasonal", "Laplace"),
-    }
-    if series not in mapping:
-        raise ValueError(f"Unknown series '{series}' for output mapping.")
-    return mapping[series]
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def load_seasonals(
-    start_year: int = 1892,
-    end_year: int = 2022,
-    data_dir: str = "data",
-    txx_file: str = "TXx_seasonal.csv",
-    txn_file: str = "TXn_seasonal.csv",
-    tnx_file: str = "TNx_seasonal.csv",
-    tnn_file: str = "TNn_seasonal.csv",
-) -> dict:
-    """
-    Load four seasonal CSVs:
-
-      TXx: seasonal max of daily TX
-      TXn: seasonal min of daily TX
-      TNx: seasonal max of daily TN
-      TNn: seasonal min of daily TN
-
-    The index is converted to PeriodIndex('Q-FEB') so that:
-      Q1 = DJF, Q2 = MAM, Q3 = JJA, Q4 = SON.
-    All series are aligned on the common seasonal index and trimmed
-    to [start_year, end_year].
-    """
-
-    def read_one(path: str) -> pd.Series:
-        df = pd.read_csv(path, index_col=0)
-
-        # Select numeric data column
-        if df.shape[1] == 1:
-            col = df.columns[0]
-        else:
-            col = next(
-                (c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])),
-                None,
-            )
-        if col is None:
-            raise ValueError(f"No numeric column found in {path}.")
-
-        ts = pd.to_datetime(df.index)
-        s = pd.Series(
-            df[col].to_numpy(dtype=float),
-            index=ts.to_period("Q-FEB"),
-        ).sort_index()
-
-        s = s[(s.index.year >= start_year) & (s.index.year <= end_year)]
-        return s
-
-    series_dict = {
-        "TXx": read_one(os.path.join(data_dir, txx_file)),
-        "TXn": read_one(os.path.join(data_dir, txn_file)),
-        "TNx": read_one(os.path.join(data_dir, tnx_file)),
-        "TNn": read_one(os.path.join(data_dir, tnn_file)),
-    }
-
-    # Align to common PeriodIndex
-    common_idx = None
-    for s in series_dict.values():
-        common_idx = s.index if common_idx is None else common_idx.intersection(s.index)
-
-    for k in series_dict:
-        series_dict[k] = series_dict[k].reindex(common_idx).sort_index()
-
-    return series_dict
-
-
-# ---------------------------------------------------------------------------
+# =========================
 # Main
-# ---------------------------------------------------------------------------
+# =========================
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
         description=(
             "Structural DGEV with harmonic seasonality (Laplace + FFBS) on Uccle "
-            "SEASONAL TX/TN extremes (DJF/MAM/JJA/SON)."
+            "SEASONAL precipitation extremes (Precx_seasonal, meteorological seasons)."
         )
     )
 
     # ---------------- Data & selection ----------------
     parser.add_argument("--data-dir", type=str, default="data")
-    parser.add_argument("--txx-file", type=str, default="TXx_seasonal.csv")
-    parser.add_argument("--txn-file", type=str, default="TXn_seasonal.csv")
-    parser.add_argument("--tnx-file", type=str, default="TNx_seasonal.csv")
-    parser.add_argument("--tnn-file", type=str, default="TNn_seasonal.csv")
-
-    parser.add_argument("--start-year", type=int, default=1892)
-    parser.add_argument("--end-year", type=int, default=2022)
-
-    parser.add_argument(
-        "--series",
-        choices=["TXx", "TXn", "TNx", "TNn"],
-        default="TXx",
-        help="Which seasonal series to fit.",
-    )
+    parser.add_argument("--precx-file", type=str, default="Precx_seasonal.csv")
+    parser.add_argument("--start-year", type=int, default=1892, help="Season label year (e.g., DJF 1892).")
+    parser.add_argument("--end-year", type=int, default=2022, help="Season label year (e.g., DJF 2022).")
 
     # ---------------- Structural model modes ----------------
-    parser.add_argument(
-        "--level-mode",
-        choices=["dynamic", "deterministic"],
-        default="dynamic",
-    )
+    parser.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     parser.add_argument(
         "--trend-mode",
         choices=["dynamic", "deterministic", "none"],
@@ -212,18 +150,28 @@ if __name__ == "__main__":
         "--period",
         type=int,
         default=4,
-        help="Seasonal period (4 for DJF/MAM/JJA/SON).",
+        help="Seasonal period (meteorological seasons = 4).",
     )
 
     # ---------------- Initial structural values ----------------
-    parser.add_argument("--level-init", type=float, default=0.0)
-    parser.add_argument("--slope-init", type=float, default=0.0)
+    parser.add_argument("--level-init", type=float, default=0.0, help="Initial level (for m0 or deterministic).")
+    parser.add_argument("--slope-init", type=float, default=0.0, help="Initial slope (for m0 or deterministic).")
 
     # Observation parameter inits
-    parser.add_argument("--init-sigma", type=float, default=1.0)
-    parser.add_argument("--init-xi", type=float, default=-0.1)
+    parser.add_argument(
+        "--init-sigma",
+        type=float,
+        default=1,
+        help="Initial σ for GEV (default: sample sd of y).",
+    )
+    parser.add_argument(
+        "--init-xi",
+        type=float,
+        default=0.1,
+        help="Initial ξ for GEV (default: 0.0, clipped to [xi_lower, xi_upper]).",
+    )
 
-    # ---------------- Priors ----------------
+    # ---------------- Priors (match DGEVApproxGibbs Priors) ----------------
     # σ² ~ InvGamma(a_sigma, b_sigma)
     parser.add_argument("--prior-a-sigma", type=float, default=2.0)
     parser.add_argument("--prior-b-sigma", type=float, default=2.0)
@@ -232,32 +180,32 @@ if __name__ == "__main__":
     parser.add_argument("--prior-xi-lower", type=float, default=-0.5)
     parser.add_argument("--prior-xi-upper", type=float, default=0.5)
 
-    # Deterministic / initial level & slope
+    # Deterministic / initial level & slope (Gaussian)
     parser.add_argument("--prior-m-level", type=float, default=0.0)
     parser.add_argument("--prior-s-level", type=float, default=10.0)
     parser.add_argument("--prior-m-slope", type=float, default=0.0)
     parser.add_argument("--prior-s-slope", type=float, default=10.0)
 
-    # Seasonal prior in dummy space; converted to harmonics
+    # Seasonal prior: full dummy pattern (length = period or period-1; last implied)
     parser.add_argument(
         "--prior-m-season",
         type=str,
         default=None,
         help=(
-            "Comma-separated values giving a seasonal dummy pattern. "
-            "If length = period-1, last is implied by sum-to-zero; "
+            "Comma-separated seasonal dummy pattern. "
+            "If length = period-1, last entry is implied by sum-to-zero; "
             "if length = period, used as-is. Converted to harmonic prior means."
         ),
     )
     parser.add_argument("--prior-s-season", type=float, default=5.0)
 
-    # Log-normal priors on process SDs (ln s_α, ln s_β, ln s_γ)
-    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-2.3)
-    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=0.7)
-    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-3.5)
-    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=0.7)
-    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-3.0)
-    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=0.7)
+    # Log-normal priors for process SDs ln s_α, ln s_β, ln s_γ
+    parser.add_argument("--prior-ln-s-alpha-m", type=float, default=-3)
+    parser.add_argument("--prior-ln-s-alpha-sd", type=float, default=1)
+    parser.add_argument("--prior-ln-s-beta-m", type=float, default=-5)
+    parser.add_argument("--prior-ln-s-beta-sd", type=float, default=1)
+    parser.add_argument("--prior-ln-s-gamma-m", type=float, default=-5)
+    parser.add_argument("--prior-ln-s-gamma-sd", type=float, default=1)
 
     # ---------------- Sampler config ----------------
     parser.add_argument("--n-iter", type=int, default=4000)
@@ -280,7 +228,7 @@ if __name__ == "__main__":
         "--adapt-steps",
         type=_str2bool,
         default=True,
-        help="Adapt RW–MH step sizes during burn-in.",
+        help="Whether to adapt RW–MH step sizes (True/False).",
     )
     parser.add_argument("--adapt-every", type=int, default=25)
     parser.add_argument("--adapt-until", choices=["burn", "all"], default="burn")
@@ -292,32 +240,20 @@ if __name__ == "__main__":
 
     # ---------------- Output & reproducibility ----------------
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--out-dir",
-        type=str,
-        default=None,
-        help=(
-            "Override output directory. "
-            "By default, uses results/TX/TXx/Seasonal/Laplace/, "
-            "results/TX/TXn/Seasonal/Laplace/, "
-            "results/TN/TNx/Seasonal/Laplace/ or "
-            "results/TN/TNn/Seasonal/Laplace/ depending on series."
-        ),
-    )
+    parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--show-plots", action="store_true")
-
     parser.add_argument(
         "--progress",
         type=_str2bool,
         default=True,
-        help="Print per-iteration progress info.",
+        help="Print per-iteration progress info (True/False).",
     )
     parser.add_argument(
         "--progress-every",
         type=int,
         default=10,
-        help="Progress line every k iterations (0 = auto ~2% of n_iter).",
+        help="Progress line every k iterations (0 = auto ≈ 2% of n_iter).",
     )
     parser.add_argument(
         "--print-dummies-every",
@@ -329,34 +265,28 @@ if __name__ == "__main__":
     args = parser.parse_args()
     np.random.seed(args.seed)
 
-    # ---------------- Load data ----------------
-    all_series = load_seasonals(
+    # ---------------- Load SEASONAL Precx series ----------------
+    s = load_precx_seasonal(
         start_year=args.start_year,
         end_year=args.end_year,
         data_dir=args.data_dir,
-        txx_file=args.txx_file,
-        txn_file=args.txn_file,
-        tnx_file=args.tnx_file,
-        tnn_file=args.tnn_file,
-    )
-    s = all_series[args.series].dropna().sort_index()
+        precx_file=args.precx_file,
+    ).dropna().sort_index()  # PeriodIndex('Q-FEB')
+
     y = s.to_numpy(dtype=float)
     T = y.size
-
     if T < 5:
-        raise ValueError(
-            f"Not enough observations after filtering seasons/years; got T={T}."
-        )
+        raise ValueError(f"Not enough observations after filtering by seasons/years; got T={T}.")
 
-    # ---------------- Harmonic specification ----------------
-    K_full = (args.period - 1) // 2  # max number of harmonics
+    # ---------------- Harmonic spec ----------------
+    K_full = (args.period - 1) // 2  # maximum number of harmonics
     use_nyq = bool((args.period % 2 == 0) and (K_full > 0))
 
     # ---------------- Seasonal prior in harmonic form ----------------
     m_season_dummies = _parse_csv_floats(args.prior_m_season)
 
+    # If we have seasonality and no explicit prior, use a smooth cos pattern
     if m_season_dummies is None and args.seasonal_mode != "none":
-        # Use default smooth pattern if seasonality is present and no prior is given
         m_season_dummies = _default_seasonal_dummies(args.period).tolist()
 
     cos_prior = None
@@ -366,43 +296,41 @@ if __name__ == "__main__":
     if m_season_dummies is not None and args.seasonal_mode != "none":
         vals = list(m_season_dummies)
         if len(vals) == args.period - 1:
-            vals.append(-sum(vals))
+            last = -sum(vals)
+            vals.append(last)
         elif len(vals) != args.period:
             raise ValueError(
                 f"--prior-m-season must have length {args.period} "
-                f"or {args.period - 1} (with last implied)."
+                f"(or {args.period - 1} with last implied)."
             )
-
         full = np.asarray(vals, float)
         centered = center_and_report_dummies_full(full, tol=1e-12)
 
         if K_full > 0:
-            cos_arr, sin_arr, nyq_val = dummies_full_to_harmonics_fft(
-                centered,
-                K=K_full,
-                use_nyquist=use_nyq,
+            cos_prior_arr, sin_prior_arr, nyq_val = dummies_full_to_harmonics_fft(
+                centered, K=K_full, use_nyquist=use_nyq
             )
-            cos_prior = cos_arr.tolist()
-            sin_prior = sin_arr.tolist()
+            cos_prior = cos_prior_arr.tolist()
+            sin_prior = sin_prior_arr.tolist()
             nyq_prior = 0.0 if nyq_val is None else float(nyq_val)
 
-    # ---------------- Priors object ----------------
+    # ---------------- Priors for DGEVApproxGibbs ----------------
     priors = Priors(
         a_sigma=float(args.prior_a_sigma),
         b_sigma=float(args.prior_b_sigma),
         xi_lower=float(args.prior_xi_lower),
         xi_upper=float(args.prior_xi_upper),
-        # Level / slope
+        # level / trend priors
         m_m0_alpha=float(args.prior_m_level),
         s_m0_alpha=float(args.prior_s_level),
         m_m0_beta=float(args.prior_m_slope),
         s_m0_beta=float(args.prior_s_slope),
-        # Harmonic means
+        # harmonic priors (lists or None → handled inside sampler)
         m_m0_cos=None if cos_prior is None else cos_prior,
         m_m0_sin=None if sin_prior is None else sin_prior,
         m_m0_nyq=float(nyq_prior),
         s_m0_harm=float(args.prior_s_season),
-        # Log-normal on process SDs
+        # log-normal priors on process SDs ln s
         mu_log_s_alpha=float(args.prior_ln_s_alpha_m),
         sd_log_s_alpha=float(args.prior_ln_s_alpha_sd),
         mu_log_s_beta=float(args.prior_ln_s_beta_m),
@@ -411,12 +339,12 @@ if __name__ == "__main__":
         sd_log_s_gamma=float(args.prior_ln_s_gamma_sd),
     )
 
-    # If level is deterministic, center its prior around the data for better mixing
+    # For deterministic level: re-center its prior around the data (helps mixing)
     if args.level_mode == "deterministic":
         priors.m_m0_alpha = float(np.median(y))
         priors.s_m0_alpha = max(2.0, 0.5 * y.std(ddof=1))
 
-    # ---------------- Sampler configuration ----------------
+    # ---------------- Sampler config ----------------
     cfg = SamplerConfig(
         n_iter=int(args.n_iter),
         burn=int(args.burn),
@@ -442,13 +370,14 @@ if __name__ == "__main__":
         print_dummies_every=int(args.print_dummies_every),
     )
 
-    # ---------------- Initial state ----------------
+    # ---------------- Initial values for structural state ----------------
     init_m0_level = float(args.level_init)
     init_P0_level = 0.2
 
     init_m0_trend = float(args.slope_init if args.trend_mode != "none" else 0.0)
     init_P0_trend = 0.05
 
+    # Initial harmonic seasonal m0
     if cos_prior is not None:
         m0_cos_init = np.asarray(cos_prior, float)
         m0_sin_init = np.asarray(sin_prior, float)
@@ -459,7 +388,7 @@ if __name__ == "__main__":
         m0_nyq_init = 0.0
     P0_harm_init = 0.25
 
-    # Initial σ and ξ
+    # ---------------- Initial σ and ξ ----------------
     if args.init_sigma is not None:
         init_sigma = float(args.init_sigma)
     else:
@@ -468,10 +397,10 @@ if __name__ == "__main__":
     xi_lb = float(args.prior_xi_lower)
     xi_ub = float(args.prior_xi_upper)
     if args.init_xi is not None:
-        xi_raw = float(args.init_xi)
+        init_xi_raw = float(args.init_xi)
     else:
-        xi_raw = 0.0
-    init_xi = float(np.clip(xi_raw, xi_lb, xi_ub))
+        init_xi_raw = 0.0
+    init_xi = float(np.clip(init_xi_raw, xi_lb, xi_ub))
 
     # ---------------- Construct sampler ----------------
     sampler = DGEVApproxGibbs(
@@ -503,16 +432,12 @@ if __name__ == "__main__":
     )
 
     # ---------------- Output directories ----------------
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    modes_tag = f"{args.level_mode}_{args.trend_mode}_{args.seasonal_mode}"
-    tag = f"{args.series}_{modes_tag}"
-
-    if args.out_dir is not None:
-        out_dir = args.out_dir
-    else:
-        series_root = _series_out_root(args.series)
-        out_dir = os.path.join(series_root, f"{tag}_{timestamp}")
-
+    tag = f"UccleSeasonalLaplace-Precx_{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}"
+    out_dir = args.out_dir or os.path.join(
+        "results",
+        "uccle",
+        f"{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+    )
     fig_dir = os.path.join(out_dir, "figures")
     _ensure_dir(out_dir)
     _ensure_dir(fig_dir)
@@ -521,15 +446,12 @@ if __name__ == "__main__":
     t0 = time.time()
     posterior = sampler.run()
     elapsed = time.time() - t0
-    print(f"Run time: {elapsed:.2f} seconds")
+    print(f"Run time: {elapsed:.2f}s")
 
     # ---------------- Save posterior + metadata ----------------
-    date_tag = f"{int(args.start_year)}-{int(args.end_year)}"
-    npz_filename = f"posterior_{args.series}_{date_tag}_{modes_tag}.npz"
-    npz_path = os.path.join(out_dir, npz_filename)
-
-    meta = {
-        "series": args.series,
+    npz_path = os.path.join(out_dir, "posterior.npz")
+    extra_meta = {
+        "series": "Precx_seasonal",
         "T": int(T),
         "period": int(args.period),
         "index_type": "Q-FEB (DJF/MAM/JJA/SON), DJF labeled by Jan/Feb year",
@@ -545,7 +467,7 @@ if __name__ == "__main__":
         "years": {"start": int(args.start_year), "end": int(args.end_year)},
         "tag": tag,
     }
-    sampler.save_posterior(out_npz_path=npz_path, extra_meta=meta)
+    sampler.save_posterior(out_npz_path=npz_path, extra_meta=extra_meta)
 
     # ---------------- Quick summaries ----------------
     if "sigma" in posterior and posterior["sigma"].size:
@@ -553,10 +475,8 @@ if __name__ == "__main__":
     if "xi" in posterior and posterior["xi"].size:
         print(f"Posterior mean xi:    {np.mean(posterior['xi']):.3f}")
     if "loglike" in posterior and posterior["loglike"].size:
-        ll = posterior["loglike"]
+        le = posterior["loglike"]
         print(
-            "log p(y|θ) (approx GEV): "
-            f"mean={np.nanmean(ll):.3f}, "
-            f"median={np.nanmedian(ll):.3f}, "
-            f"best={np.nanmax(ll):.3f}"
+            f"log p(y|θ) (approx GEV): mean={np.nanmean(le):.3f}, "
+            f"median={np.nanmedian(le):.3f}, best={np.nanmax(le):.3f}"
         )

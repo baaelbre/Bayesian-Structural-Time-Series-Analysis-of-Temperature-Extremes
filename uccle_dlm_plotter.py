@@ -468,7 +468,7 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--target", type=str, default=None, help="Run dir or posterior.npz. If omitted, search --root.")
-    p.add_argument("--root", type=str, default="results/uccle/TX", help="Search root when --target omitted.")
+    p.add_argument("--root", type=str, default="results/uccle/Precm_harm_seasonal", help="Search root when --target omitted.")
     p.add_argument("--level", type=float, default=0.90, help="Credible band level.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Save dir (default: <run>/figures)")

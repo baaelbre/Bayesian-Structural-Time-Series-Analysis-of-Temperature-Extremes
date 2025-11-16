@@ -1,4 +1,4 @@
-# run_uccle_harmonic.py  — monthly summaries (period = 12)
+# run_uccle_precip_harmonic.py  — monthly precipitation means (period = 12)
 import os
 from pathlib import Path
 
@@ -7,7 +7,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # ---- import the harmonic DLM with log-normal process SDs ----
-# Adjust module name/path if needed.
 from optimization.dlm_lognormal_harmonic import (
     DLMGibbsHarmonic,
     Priors,
@@ -19,12 +18,12 @@ DATA_DIR = Path("data")
 
 def load_series(csv_path: Path) -> pd.Series:
     """
-    Load a univariate *monthly* time series from CSV and trim to a multiple of 12
-    (whole number of years).
+    Load a univariate *monthly* precipitation series from CSV and trim to a
+    multiple of 12 (whole number of years).
 
-    Expected format (flexible):
+    Expected format:
       - One date-like column (e.g. 'date', 'Date', 'time', 'year' + 'month', ...).
-      - One numeric column with the series values (e.g. 'TXm', 'TNm', 'value', ...).
+      - One numeric column with the series values (e.g. 'Prec', 'value', ...).
     """
     df = pd.read_csv(csv_path)
 
@@ -58,13 +57,16 @@ def load_series(csv_path: Path) -> pd.Series:
     # trim length to a multiple of 12 (full years of monthly data)
     n = len(ser) - (len(ser) % 12)
     if n <= 0:
-        raise ValueError(f"Series in {csv_path} is shorter than one full year (12 points).")
+        raise ValueError(
+            f"Series in {csv_path} is shorter than one full year (12 points)."
+        )
     return ser.iloc[:n]
 
 
 def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
     """
-    Run the harmonic DLM (cos/sin + optional Nyquist) on a single *monthly* series.
+    Run the harmonic DLM (cos/sin + optional Nyquist) on a single *monthly*
+    precipitation series.
     """
     y = y_ser.to_numpy(dtype=float)
     period = 12  # 12 months per year
@@ -101,8 +103,8 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=50_000,
-        burn=10_000,
+        n_iter=1000,
+        burn=100,
         thin=1,
         random_seed=42,
         progress=True,
@@ -120,12 +122,12 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         y=y,
         period=period,
         harmonics=None,          # use full harmonic basis for monthly cycle
-        use_nyquist=None,        # let the sampler decide (True for even s when appropriate)
+        use_nyquist=None,        # let the sampler decide
         level_mode="dynamic",
         trend_mode="dynamic",
         seasonal_mode="dynamic",
         # initial means/vars for dynamic level/trend
-        m0_alpha_init=float(np.mean(y[: min(len(y), period)])),  # use roughly first year
+        m0_alpha_init=float(np.mean(y[: min(len(y), period)])),  # roughly first year
         P0_alpha_init=0.25,
         m0_beta_init=0.0,
         P0_beta_init=0.05,
@@ -157,7 +159,8 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
             "index_values": [str(ix) for ix in y_ser.index[: len(y)]],
             "description": (
                 "Gaussian DLM with harmonic monthly seasonality (cos/sin + Nyquist), "
-                "dynamic level/trend/season, log-normal priors on process SDs."
+                "dynamic level/trend/season, log-normal priors on process SDs, "
+                "applied to monthly mean precipitation (Precm)."
             ),
         },
     )
@@ -181,17 +184,15 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
 
 
 def main() -> None:
-    # Monthly mean max / min temperatures
-    tx = load_series(DATA_DIR / "TXm.csv")
-    tn = load_series(DATA_DIR / "TNm.csv")
+    # Monthly mean precipitation
+    precm = load_series(DATA_DIR / "Precm.csv")
 
-    print("TXm head:\n", tx.head(), "\n")
-    print("TNm head:\n", tn.head(), "\n")
+    print("Precm head:\n", precm.head(), "\n")
 
-    run_one("TXm_monthly", tx, Path("results/uccle/TX/TXm/Monthly/"))
-    run_one("TNm_monthly", tn, Path("results/uccle/TN/TNm/Monthly/"))
+    run_one("Precm_monthly", precm, Path("results/uccle/Precm_harm_monthly/"))
 
-    print("Saved results under results/uccle/{TX/TXm/Monthly,TN/TNm/Monthly}")
+    print("Saved results under results/uccle/Precm_harm_monthly")
+
 
 if __name__ == "__main__":
     main()

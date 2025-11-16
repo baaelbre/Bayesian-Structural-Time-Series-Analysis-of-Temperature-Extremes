@@ -1,5 +1,6 @@
-# run_uccle_harmonic.py  — monthly summaries (period = 12)
+# run_uccle_precip_harmonic_seasonal.py
 import os
+import math
 from pathlib import Path
 
 import numpy as np
@@ -19,12 +20,12 @@ DATA_DIR = Path("data")
 
 def load_series(csv_path: Path) -> pd.Series:
     """
-    Load a univariate *monthly* time series from CSV and trim to a multiple of 12
-    (whole number of years).
+    Load a univariate time series from CSV and trim to a multiple of 4
+    (DJF/MAM/JJA/SON seasonal means).
 
-    Expected format (flexible):
-      - One date-like column (e.g. 'date', 'Date', 'time', 'year' + 'month', ...).
-      - One numeric column with the series values (e.g. 'TXm', 'TNm', 'value', ...).
+    Expected format:
+      - 'date' column (or similar) for the seasonal time index.
+      - One numeric column with the series values (e.g. 'Prec', 'value', ...).
     """
     df = pd.read_csv(csv_path)
 
@@ -34,7 +35,7 @@ def load_series(csv_path: Path) -> pd.Series:
     else:
         numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if not numcols:
-            # attempt coercion of non-numeric columns (skip the first, often an ID or date)
+            # attempt coercion of non-numeric columns
             for c in df.columns[1:]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -48,26 +49,25 @@ def load_series(csv_path: Path) -> pd.Series:
         if cand in df.columns:
             idx = pd.to_datetime(df[cand], errors="coerce")
             break
-
     if idx is None:
-        # fallback: simple integer index
         idx = pd.RangeIndex(len(s), name="t")
 
     ser = pd.Series(s.astype(float).to_numpy(), index=idx, name=csv_path.name).dropna()
 
-    # trim length to a multiple of 12 (full years of monthly data)
-    n = len(ser) - (len(ser) % 12)
+    # trim length to a multiple of 4 (seasonal cycle DJF/MAM/JJA/SON)
+    n = len(ser) - (len(ser) % 4)
     if n <= 0:
-        raise ValueError(f"Series in {csv_path} is shorter than one full year (12 points).")
+        raise ValueError(f"Series in {csv_path} is shorter than one full seasonal cycle (4 points).")
     return ser.iloc[:n]
 
 
 def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
     """
-    Run the harmonic DLM (cos/sin + optional Nyquist) on a single *monthly* series.
+    Run the harmonic DLM (cos/sin + optional Nyquist) on a single seasonal
+    precipitation series (DJF/MAM/JJA/SON).
     """
-    y = y_ser.to_numpy(dtype=float)
-    period = 12  # 12 months per year
+    y = y_ser.to_numpy(float)
+    period = 4  # four seasons per year (DJF/MAM/JJA/SON)
 
     # ----- Priors (log-normal on process SDs + weak-normal on m0) ----- #
     pri = Priors(
@@ -91,23 +91,23 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
         a_P0_harm=5.0,
         b_P0_harm=1.0,
         # log-normal priors for process SDs (ln s ~ N(mu, sd^2))
-        ln_s_alpha_mu=-2.0,
+        ln_s_alpha_mu=-3.0,
         ln_s_alpha_sd=1.0,
-        ln_s_beta_mu=-5.0,
+        ln_s_beta_mu=-3.0,
         ln_s_beta_sd=1.0,
-        ln_s_gamma_mu=-5.0,
+        ln_s_gamma_mu=-3.0,
         ln_s_gamma_sd=1.0,
     )
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=50_000,
-        burn=10_000,
+        n_iter=50000,
+        burn=10000,
         thin=1,
         random_seed=42,
         progress=True,
         progress_every=10,
-        print_dummies_every=0,  # set >0 if you want reconstructed monthly dummies printed
+        print_dummies_every=0,  # set >0 if you want reconstructed seasonal dummies printed
         slice_w=3.0,
         slice_m=50,
     )
@@ -115,17 +115,17 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
     # ----- Initial values ----- #
     sigma2_init = float(np.var(y) * 0.1) if len(y) > 1 else 1.0
 
-    # For period=12, harmonics=None ⇒ use the sampler’s full harmonic basis.
+    # For s=4, default harmonics=None ⇒ K_full = (4-1)//2 = 1, Nyquist auto enabled.
     sampler = DLMGibbsHarmonic(
         y=y,
         period=period,
-        harmonics=None,          # use full harmonic basis for monthly cycle
-        use_nyquist=None,        # let the sampler decide (True for even s when appropriate)
+        harmonics=None,          # use full harmonic basis for s=4
+        use_nyquist=None,        # let the sampler decide (True for s even & K large enough)
         level_mode="dynamic",
         trend_mode="dynamic",
         seasonal_mode="dynamic",
         # initial means/vars for dynamic level/trend
-        m0_alpha_init=float(np.mean(y[: min(len(y), period)])),  # use roughly first year
+        m0_alpha_init=float(np.mean(y[: min(len(y), 8)])),
         P0_alpha_init=0.25,
         m0_beta_init=0.0,
         P0_beta_init=0.05,
@@ -156,8 +156,9 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
             "index_type": type(y_ser.index).__name__,
             "index_values": [str(ix) for ix in y_ser.index[: len(y)]],
             "description": (
-                "Gaussian DLM with harmonic monthly seasonality (cos/sin + Nyquist), "
-                "dynamic level/trend/season, log-normal priors on process SDs."
+                "Gaussian DLM with harmonic DJF/MAM/JJA/SON seasonality "
+                "(cos/sin + Nyquist), dynamic level/trend/season, "
+                "log-normal priors on process SDs, applied to seasonal mean precipitation."
             ),
         },
     )
@@ -166,12 +167,12 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
     mu_hat = post["mu"].mean(axis=0)
     t_index = y_ser.index[: len(y)]
 
-    plt.figure(figsize=(12, 4))
+    plt.figure(figsize=(10, 4))
     plt.plot(t_index, y, label=f"{label}")
     plt.plot(t_index, mu_hat, "-.", label="μ̂_t")
     plt.title(
-        f"{label}: harmonic DLM (dyn level/trend/season, "
-        f"s={period}, K={sampler.K}, nyq={sampler.use_nyq})"
+        f"{label}: harmonic DLM (dyn level/trend/season, s={period}, "
+        f"K={sampler.K}, nyq={sampler.use_nyq})"
     )
     plt.grid(True)
     plt.legend()
@@ -181,17 +182,15 @@ def run_one(label: str, y_ser: pd.Series, outdir: Path) -> None:
 
 
 def main() -> None:
-    # Monthly mean max / min temperatures
-    tx = load_series(DATA_DIR / "TXm.csv")
-    tn = load_series(DATA_DIR / "TNm.csv")
+    # Seasonal mean precipitation (DJF/MAM/JJA/SON)
+    precm_seasonal = load_series(DATA_DIR / "Precm_seasonal.csv")
 
-    print("TXm head:\n", tx.head(), "\n")
-    print("TNm head:\n", tn.head(), "\n")
+    print("Precm_seasonal head:\n", precm_seasonal.head(), "\n")
 
-    run_one("TXm_monthly", tx, Path("results/uccle/TX/TXm/Monthly/"))
-    run_one("TNm_monthly", tn, Path("results/uccle/TN/TNm/Monthly/"))
+    run_one("Precm_seasonal", precm_seasonal, Path("results/uccle/Precm_harm_seasonal/"))
 
-    print("Saved results under results/uccle/{TX/TXm/Monthly,TN/TNm/Monthly}")
+    print("Saved results under results/uccle/Precm_harm_seasonal")
+
 
 if __name__ == "__main__":
     main()
