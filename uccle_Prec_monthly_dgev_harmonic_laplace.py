@@ -21,7 +21,6 @@ from optimization.harmonic_helpers import (
     center_and_report_dummies_full,
     dummies_full_to_harmonics_fft,
 )
-from simulator.dgev_plotter import DGEVPlotter  # optional
 
 
 # =========================

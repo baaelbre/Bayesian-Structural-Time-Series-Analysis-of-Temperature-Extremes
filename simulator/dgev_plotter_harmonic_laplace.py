@@ -15,6 +15,8 @@ Designed for the Laplace–based structural DGEV sampler with harmonic seasonali
     - traces_acf__*.png   : grouped trace + ACF (with ESS, Geweke) for σ, ξ, Q, m0, P0, ...
     - posteriors__*.png   : grouped posterior histograms (with means, medians, truth markers)
     - quick_report.png    : 3-panel diagnostic summary
+    - return_levels_N*.png: time-varying N-year return levels
+    - return_periods_u*.png: time-varying return periods for threshold u
 
 Expected posterior keys (subset)
 --------------------------------
@@ -38,7 +40,7 @@ import sys
 import json
 import math
 import argparse
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -276,6 +278,190 @@ class DGEVPlotter:
         self.Qa = _to_Q(draws, "alpha")
         self.Qb = _to_Q(draws, "beta")
         self.Qg = _to_Q(draws, "gamma")
+
+    # ---------------- time / calendar helpers ----------------
+
+    def _time_to_year_season(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Map t=0..T-1 to (year, season_index) using meta['period'] and meta['years'].
+
+        Returns
+        -------
+        years : (T,) array of calendar years
+        seasons : (T,) array with values in {0,..,period-1}
+        """
+        period = int(self.period)
+        years_meta = self.meta.get("years", {})
+        start_year = int(years_meta.get("start", 0))
+        idx = np.arange(self.T)
+        years = start_year + idx // period
+        seasons = idx % period
+        return years, seasons
+
+    # ---------------- GEV helpers (CDF, return levels, RPs) ----------------
+
+    def _gev_cdf(self, z: np.ndarray, mu: np.ndarray,
+                 sigma: np.ndarray, xi: np.ndarray) -> np.ndarray:
+        """
+        Vectorised GEV CDF G(z; mu, sigma, xi) with broadcasting.
+
+        Parameters
+        ----------
+        z    : (..., T)
+        mu   : (M, T) or broadcastable
+        sigma: (M, 1) or (M, T), broadcastable
+        xi   : (M, 1) or (M, T), broadcastable
+        """
+        z = np.asarray(z, float)
+        mu = np.asarray(mu, float)
+        sigma = np.asarray(sigma, float)
+        xi = np.asarray(xi, float)
+
+        # broadcast shapes
+        z, mu, sigma, xi = np.broadcast_arrays(z, mu, sigma, xi)
+        sigma = np.clip(sigma, 1e-12, None)
+
+        G = np.zeros_like(z)
+
+        # near-Gumbel
+        near0 = np.abs(xi) < 1e-6
+        if np.any(near0):
+            z_std = (z[near0] - mu[near0]) / sigma[near0]
+            G[near0] = np.exp(-np.exp(-z_std))
+
+        # general ξ != 0
+        non0 = ~near0
+        if np.any(non0):
+            t = 1.0 + xi[non0] * (z[non0] - mu[non0]) / sigma[non0]
+            # support handling
+            valid = t > 0
+            # ξ > 0: below support ⇒ G = 0 (already default)
+            # ξ < 0: above support ⇒ G = 1
+            xi_non0 = xi[non0]
+            # region with valid t
+            if np.any(valid):
+                G_non0_valid = np.zeros_like(t)
+                G_non0_valid[valid] = np.exp(-np.power(t[valid], -1.0 / xi_non0[valid]))
+                G[non0][valid] = G_non0_valid[valid]
+            # ξ<0 and invalid t ⇒ G=1
+            invalid = ~valid
+            if np.any(invalid):
+                mask_neg = (xi_non0[invalid] < 0)
+                if np.any(mask_neg):
+                    idx = np.where(non0)[0]
+                    bad_idx = idx[invalid][mask_neg]
+                    G.flat[bad_idx] = 1.0
+
+        return G
+
+    def _gev_return_level_block(self, N: float) -> np.ndarray:
+        """
+        Compute *block-wise* N-year return level series z_N(t) for each posterior draw.
+
+        Returns
+        -------
+        z : np.ndarray
+            Shape (n_draws, T) with return levels per draw and time.
+        """
+        if self.sigma is None or self.xi is None:
+            raise ValueError("Need sigma and xi in draws to compute return levels.")
+
+        mu = np.asarray(self.d["mu"], float)            # (M, T)
+        sigma = np.asarray(self.sigma, float)[:, None]  # (M, 1)
+        xi = np.asarray(self.xi, float)[:, None]        # (M, 1)
+
+        # p = 1 - 1/N ⇒ CDF at RL
+        c = -np.log(1.0 - 1.0 / float(N))  # = -log(p) > 0
+
+        # broadcast to (M,T)
+        sigma = np.broadcast_to(sigma, mu.shape)
+        xi = np.broadcast_to(xi, mu.shape)
+
+        z = np.empty_like(mu)
+
+        near0 = np.abs(xi) < 1e-6
+        non0 = ~near0
+
+        # Gumbel limit: z = mu - sigma * log(-log p) = mu - sigma * log(c)
+        if np.any(near0):
+            z[near0] = mu[near0] - sigma[near0] * np.log(c)
+
+        # ξ != 0: z = mu + sigma/ξ * ( [-log p]^{-ξ} - 1 )
+        if np.any(non0):
+            z[non0] = (
+                mu[non0]
+                + sigma[non0] / xi[non0]
+                * (np.power(c, -xi[non0]) - 1.0)
+            )
+        return z
+
+    def compute_return_periods(
+        self,
+        u: float,
+        yearly: bool = False,
+        season: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Compute time-varying return periods for a fixed threshold u.
+
+        Parameters
+        ----------
+        u : float
+            Threshold in data units.
+        yearly : bool
+            If False: block-wise RP_t(u) for each time step t.
+            If True : yearly RP_y(u) combining all seasons in a year
+                      via p_y = 1 - prod_s G_{y,s}(u).
+        season : int or None
+            If yearly=False and season is not None, restrict to that season index.
+
+        Returns
+        -------
+        x_axis : np.ndarray
+            Years (if yearly=True) or years per block (if yearly=False).
+        med, lo, hi : np.ndarray
+            Posterior median and credible band for 1 / p (return period).
+        """
+        if self.sigma is None or self.xi is None:
+            raise ValueError("Need sigma and xi in draws to compute return periods.")
+
+        mu = np.asarray(self.d["mu"], float)  # (M,T)
+        sigma = np.asarray(self.sigma, float)[:, None]
+        xi = np.asarray(self.xi, float)[:, None]
+        sigma = np.broadcast_to(sigma, mu.shape)
+        xi = np.broadcast_to(xi, mu.shape)
+
+        years, seasons = self._time_to_year_season()
+        T = self.T
+        M = mu.shape[0]
+
+        # block-wise exceed prob per draw/time
+        z = np.full((M, T), float(u))
+        G = self._gev_cdf(z, mu, sigma, xi)
+        p_ex = np.clip(1.0 - G, 1e-12, 1.0)  # (M,T)
+
+        if not yearly:
+            mask = np.ones(T, dtype=bool)
+            if season is not None:
+                mask &= (seasons == int(season))
+            p_ex_sel = p_ex[:, mask]          # (M,T_sel)
+            rp = 1.0 / p_ex_sel               # (M,T_sel)
+            med, lo, hi = _qtiles(rp, self.level)
+            return years[mask], med, lo, hi
+
+        # yearly aggregation: p_y(u) = 1 - prod_s G_{y,s}(u)
+        uniq_years = np.unique(years)
+        Y = uniq_years.size
+        rp_year = np.empty((M, Y), float)
+
+        for j, yv in enumerate(uniq_years):
+            mask_y = (years == yv)
+            G_y = np.prod(G[:, mask_y], axis=1)    # (M,)
+            p_y = np.clip(1.0 - G_y, 1e-12, 1.0)   # (M,)
+            rp_year[:, j] = 1.0 / p_y
+
+        med, lo, hi = _qtiles(rp_year, self.level)
+        return uniq_years, med, lo, hi
 
     # ---------------- figure builders ----------------
 
@@ -588,7 +774,7 @@ class DGEVPlotter:
             ax.set_title(name)
             _uniq_legend(ax)
 
-        # hide any unused subplots
+        # hide unused subplots
         for k in range(len(items), R * C):
             r, c = divmod(k, C)
             axs[r, c].axis("off")
@@ -599,6 +785,119 @@ class DGEVPlotter:
         if save_dir:
             _ensure_dir(save_dir)
             path = os.path.join(save_dir, f"posteriors__{_san(fam)}.png")
+            fig.savefig(path, dpi=200, bbox_inches="tight")
+            print(f"[save] {path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return path
+
+    # ---------------- extra figures: return levels / periods ----------------
+
+    def figure_return_levels(
+        self,
+        N: float = 10.0,
+        season: Optional[int] = None,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+    ) -> Optional[str]:
+        """
+        Plot block-wise N-year return levels over time.
+
+        Parameters
+        ----------
+        N : float
+            Return period in block units (years if each block is yearly).
+        season : int or None
+            If not None, restrict to a specific season index within the period:
+              e.g. 0=DJF,1=MAM,2=JJA,3=SON when period=4.
+        """
+        z_draws = self._gev_return_level_block(N)  # (M,T)
+        med, lo, hi = _qtiles(z_draws, self.level)  # (T,)
+
+        years, seasons = self._time_to_year_season()
+
+        mask = np.ones(self.T, dtype=bool)
+        if season is not None:
+            mask &= (seasons == int(season))
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+
+        ax.plot(years[mask], med[mask], lw=1.8, label=f"{N}-year RL (median)")
+        ax.fill_between(years[mask], lo[mask], hi[mask], alpha=0.25,
+                        label=f"{int(self.level * 100)}% band")
+
+        if self.y is not None and len(self.y) == self.T:
+            ax.scatter(years[mask], np.asarray(self.y)[mask], s=10, alpha=0.3,
+                       label="observed block maxima")
+
+        if season is not None:
+            ax.set_title(f"{N}-year return level over time (season index {season})")
+        else:
+            ax.set_title(f"{N}-year return level over time (all blocks)")
+
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Return level")
+        _uniq_legend(ax)
+        fig.tight_layout()
+
+        path = None
+        if save_dir:
+            _ensure_dir(save_dir)
+            path = os.path.join(save_dir, f"return_levels_N{N:g}.png")
+            fig.savefig(path, dpi=200, bbox_inches="tight")
+            print(f"[save] {path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return path
+
+    def figure_return_periods(
+        self,
+        u: float,
+        yearly: bool = False,
+        season: Optional[int] = None,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+    ) -> Optional[str]:
+        """
+        Plot time-varying return periods for threshold u.
+
+        Parameters
+        ----------
+        u : float
+            Threshold in data units.
+        yearly : bool
+            If True, combine seasons in each year (at least one exceedance in year).
+            If False, block-wise RP_t(u).
+        season : int or None
+            Only used when yearly=False; season index within period.
+        """
+        x, med, lo, hi = self.compute_return_periods(u=u, yearly=yearly, season=season)
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+        ax.plot(x, med, lw=1.8, label="Return period (median)")
+        ax.fill_between(x, lo, hi, alpha=0.25,
+                        label=f"{int(self.level * 100)}% band")
+
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Return period (years)")
+        title = f"Return period for threshold u={u:g}"
+        if yearly:
+            title += " (yearly aggregated)"
+        elif season is not None:
+            title += f" (season index {season})"
+        ax.set_title(title)
+        ax.set_yscale("log")
+        _uniq_legend(ax)
+        fig.tight_layout()
+
+        path = None
+        if save_dir:
+            _ensure_dir(save_dir)
+            path = os.path.join(save_dir, f"return_periods_u{u:g}.png")
             fig.savefig(path, dpi=200, bbox_inches="tight")
             print(f"[save] {path}")
         if show:
@@ -763,7 +1062,7 @@ if __name__ == "__main__":
         "--out",
         type=str,
         default=None,
-        help="Save dir (default: <run>/figures)",
+        help="Save dir (default: <run>/figures).",
     )
     parser.add_argument(
         "--skip-overview",
@@ -801,6 +1100,38 @@ if __name__ == "__main__":
         default=200,
         help="ACF/ESS max lag for trace plots.",
     )
+    # Return levels / periods
+    parser.add_argument(
+        "--rl-N",
+        type=float,
+        default=100,
+        help="If set, plot N-year (block-wise) return level time series.",
+    )
+    parser.add_argument(
+        "--rl-season",
+        type=int,
+        default=1,
+        help="Season index for block-wise return levels (0..period-1).",
+    )
+    parser.add_argument(
+        "--rp-u",
+        type=float,
+        default=1,
+        help="If set, plot return period time series for threshold u.",
+    )
+    parser.add_argument(
+        "--rp-yearly",
+        action="store_true",
+        default=True,
+        help="If set, combine seasons within each year when computing return periods.",
+    )
+    parser.add_argument(
+        "--rp-season",
+        type=int,
+        default=1,
+        help="Season index for block-wise return periods (0..period-1). Ignored if --rp-yearly.",
+    )
+
     args = parser.parse_args()
 
     if args.target:
@@ -828,5 +1159,22 @@ if __name__ == "__main__":
         pl.figure_posteriors_grouped_all(out_dir, args.show)
     if not args.skip_quick:
         pl.quick_report(out_dir, args.show)
+
+    # Return levels / periods
+    if args.rl_N is not None:
+        pl.figure_return_levels(
+            N=float(args.rl_N),
+            season=args.rl_season,
+            save_dir=out_dir,
+            show=args.show,
+        )
+    if args.rp_u is not None:
+        pl.figure_return_periods(
+            u=float(args.rp_u),
+            yearly=bool(args.rp_yearly),
+            season=None if args.rp_yearly else args.rp_season,
+            save_dir=out_dir,
+            show=args.show,
+        )
 
     print("[done] plots written.")

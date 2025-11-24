@@ -3,30 +3,16 @@ from __future__ import annotations
 DLM Harmonic Plotter — compact, layout‑aware, truth‑aware
 =========================================================
 
-Works with the harmonic sampler you just built (alpha/beta + cos/sin pairs + optional Nyquist).
+Works with the harmonic sampler (alpha/beta + cos/sin pairs + optional Nyquist).
 Handles both dynamic and deterministic seasonality outputs.
 
-What this rewrite focuses on
-----------------------------
-• Robust loading of posterior bundles (npz + meta.json) with fallbacks.
-• Automatic discovery of alpha/beta and harmonic indices from meta["layout"].
-• Clear separation of figure types (overview, states, grouped traces, grouped posteriors, m0/P0, quick report).
-• Credible bands from draws and optional truth overlays (mu/alpha/beta/gamma).
-• Seasonal plotting uses the **first harmonic cosine coordinate** (the one loaded by H) and
-  optionally composes a deterministic seasonal curve from (m0_cos/m0_sin/nyq) when season is deterministic.
-• Conservative numerics for ESS/ACF; legends de-duplicated.
-
 Expected posterior keys (subset):
-  - mu (n_kept, T), sigma OR sigma2, y (T), x (n_kept, T, dim)
-  - Q_alpha/Q_beta/Q_gamma OR s_alpha/s_beta/s_gamma
+  - mu (n_kept, T), sigma or sigma2, y (T), x (n_kept, T, dim)
+  - Q_alpha/Q_beta/Q_gamma or s_alpha/s_beta/s_gamma
   - m0_alpha/m0_beta, P0_alpha/P0_beta, and for harmonics either dynamic (P0_harm, m0_cos/m0_sin[/m0_nyq])
     or deterministic seasonal coefficients stored similarly.
   - Optional truth_* arrays (true_mu_t, true_alpha_t, true_beta_t, true_gamma_t, true_sigma, true_Q,...)
 
-CLI examples
-------------
-python dlm_plotter_harmonic_rewrite.py --target results/.../posterior.npz --show
-python dlm_plotter_harmonic_rewrite.py --root results/simulations/DLM_harm --level 0.9
 """
 
 import os, re, sys, json, math, argparse
@@ -65,7 +51,6 @@ def _find_latest_run(root: str) -> Optional[str]:
                 if (best is None) or (os.path.getmtime(p) > os.path.getmtime(best)):
                     best = p
     return best
-
 
 def load_posterior(target_or_dir: str) -> Tuple[Dict[str, Any], Dict[str, Any], str]:
     """Load npz (arrays) and sibling meta.json if present."""

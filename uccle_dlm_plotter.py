@@ -36,6 +36,9 @@ python uccle_dlm_plotter.py --target results/uccle/TX/TXm/Seasonal/TXm_dynamic_d
 
 # Or a specific posterior.npz:
 python uccle_dlm_plotter.py --target results/uccle/TX/TXm/Seasonal/.../posterior.npz
+
+# With additional post-hoc burn-in and thinning:
+python uccle_dlm_plotter.py --series TNm --freq Monthly --burn 1000 --thin 5
 """
 
 import os, re, sys, json, math, argparse
@@ -260,6 +263,74 @@ def _truth_Q(d: Dict[str, Any], comp: str, layout: Dict[str, Any]) -> Optional[f
         return float(max(0.0, QQ[j, j]))
     except Exception:
         return None
+
+
+# -----------------------------------------------------------------------------#
+# Post-processing: burn-in + thinning
+# -----------------------------------------------------------------------------#
+
+def apply_burn_thin(
+    draws: Dict[str, Any],
+    meta: Dict[str, Any],
+    burn: int = 0,
+    thin: int = 1,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Apply additional post-hoc burn-in and thinning to all arrays whose first
+    dimension matches the MCMC sample size (inferred from draws["mu"]).
+
+    burn : number of *initial* draws to discard (>=0)
+    thin : keep every `thin`-th draw after burn (>=1)
+    """
+    if "mu" not in draws:
+        # Nothing we can safely do
+        print("[warn] 'mu' not in draws; skipping burn/thin.")
+        return draws, meta
+
+    burn = int(burn or 0)
+    thin = int(thin or 1)
+    if burn < 0:
+        raise ValueError(f"--burn must be >= 0, got {burn}")
+    if thin < 1:
+        raise ValueError(f"--thin must be >= 1, got {thin}")
+
+    mu_arr = np.asarray(draws["mu"])
+    if mu_arr.ndim < 2:
+        print("[warn] 'mu' does not look like (n_samp, T); skipping burn/thin.")
+        return draws, meta
+
+    n_samp = int(mu_arr.shape[0])
+    if burn >= n_samp:
+        raise ValueError(f"--burn={burn} ≥ number of saved samples ({n_samp}).")
+
+    idx = slice(burn, None, thin)
+    n_used = math.ceil((n_samp - burn) / thin)
+
+    print(
+        f"[info] post-processing chains: raw n={n_samp}, burn={burn}, "
+        f"thin={thin} → used n={n_used}"
+    )
+
+    for k, v in list(draws.items()):
+        if not isinstance(v, np.ndarray):
+            continue
+        arr = np.asarray(v)
+        # Only touch arrays whose first dimension matches the sample size
+        if arr.ndim >= 1 and arr.shape[0] == n_samp:
+            draws[k] = arr[idx, ...]
+
+    # Record in meta for traceability
+    postproc = meta.get("postproc", {})
+    postproc.update(
+        {
+            "extra_burn": burn,
+            "thin": thin,
+            "n_samples_raw": n_samp,
+            "n_samples_used": int(np.asarray(draws["mu"]).shape[0]),
+        }
+    )
+    meta["postproc"] = postproc
+    return draws, meta
 
 
 # -----------------------------------------------------------------------------#
@@ -669,14 +740,14 @@ if __name__ == "__main__":
         "--series",
         type=str,
         choices=["TXm", "TNm", "Precm"],
-        default="TXm",
+        default="TNm",
         help="Series code when searching by default roots.",
     )
     p.add_argument(
         "--freq",
         type=str,
         choices=["Seasonal", "Monthly"],
-        default="Seasonal",
+        default="Monthly",
         help="Frequency (Seasonal or Monthly) when searching by default roots.",
     )
     p.add_argument(
@@ -697,6 +768,21 @@ if __name__ == "__main__":
     p.add_argument("--skip-grouped-post", action="store_true", default=False)
     p.add_argument("--skip-quick", action="store_true", default=False)
     p.add_argument("--max-lag", type=int, default=200, help="ACF/ESS max lag")
+
+    # New: post-hoc burn-in and thinning
+    p.add_argument(
+        "--burn",
+        type=int,
+        default=0,
+        help="Extra burn-in iterations to discard from the front of each chain (post-hoc).",
+    )
+    p.add_argument(
+        "--thin",
+        type=int,
+        default=1,
+        help="Thinning factor k: keep every k-th draw after burn-in (post-hoc).",
+    )
+
     a = p.parse_args()
 
     # ----- pick posterior path -----
@@ -718,6 +804,9 @@ if __name__ == "__main__":
             )
             sys.exit(1)
         draws, meta, npz_path = load_posterior(npz)
+
+    # ----- apply extra burn-in and thinning (post-hoc) -----
+    draws, meta = apply_burn_thin(draws, meta, burn=a.burn, thin=a.thin)
 
     out_dir = a.out or os.path.join(os.path.dirname(npz_path), "figures")
     _ensure_dir(out_dir)

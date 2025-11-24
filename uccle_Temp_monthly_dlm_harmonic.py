@@ -143,7 +143,7 @@ def run_one(
     # ----- Priors (log-normal on process SDs + weak-normal on m0) ----- #
     pri = Priors(
         a_sigma=2.0,
-        b_sigma=1.0,
+        b_sigma=2.0,
         # m0 priors (weak)
         m_m0_alpha=0.0,
         s_m0_alpha=10.0,
@@ -162,18 +162,18 @@ def run_one(
         a_P0_harm=5.0,
         b_P0_harm=1.0,
         # log-normal priors for process SDs (ln s ~ N(mu, sd^2))
-        ln_s_alpha_mu=-2.0,
+        ln_s_alpha_mu=-3.0,
         ln_s_alpha_sd=1.0,
-        ln_s_beta_mu=-5.0,
+        ln_s_beta_mu=-4.0,
         ln_s_beta_sd=1.0,
-        ln_s_gamma_mu=-5.0,
+        ln_s_gamma_mu=-4.0,
         ln_s_gamma_sd=1.0,
     )
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=10000,
-        burn=5000,
+        n_iter=50000,
+        burn=10000,
         thin=1,
         random_seed=42,
         progress=True,
@@ -208,9 +208,9 @@ def run_one(
         P0_harm_init=0.25,
         # observation variance + process SD inits
         sigma2_init=sigma2_init,
-        s_alpha_init=1e-1,
-        s_beta_init=1e-1,
-        s_gamma_init=1e-1,
+        s_alpha_init=1e-2,
+        s_beta_init=1e-2,
+        s_gamma_init=1e-2,
         priors=pri,
         cfg=cfg,
     )

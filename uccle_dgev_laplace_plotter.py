@@ -12,6 +12,8 @@ This is the *Uccle* wrapper around the generic DGEV Laplace harmonic plotter:
   - traces_acf__*.png
   - posteriors__*.png
   - quick_report.png
+  - return_levels_N*.png
+  - return_periods_u*.png
 
 • Uccle-specific default roots (where the Laplace runs live):
   TXx, Seasonal  → results/uccle/TX/TXx/Seasonal/Laplace
@@ -37,24 +39,28 @@ python -u uccle_dgev_plotter.py --series TNn --agg Monthly \
 # Or point directly at a posterior.npz or its run directory:
 python -u uccle_dgev_plotter.py \
   --target results/uccle/TX/TXx/Seasonal/Laplace/TXx_dynamic_dynamic_dynamic_20251116_151500
+
+# Example with return levels / periods:
+python -u uccle_dgev_plotter.py --series TXx --agg Seasonal \
+  --rl-N 50 --rl-season 2 --rp-u 35 --rp-yearly
 """
 
 import os
 import sys
 import argparse
-from typing import Optional, Tuple
+from typing import Optional
 
 from simulator.dgev_plotter_harmonic_laplace import (  # type: ignore
     DGEVPlotter,
     load_posterior,
 )
 
-
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_dir(p: Optional[str]) -> None:
+    """Create directory `p` if not empty and it does not yet exist."""
     if p:
         os.makedirs(p, exist_ok=True)
 
@@ -113,7 +119,7 @@ def _find_latest_posterior_npz(root: str) -> str:
             if not fn.endswith(".npz"):
                 continue
             if not fn.startswith("posterior_"):
-                # if you want to allow any .npz, drop this check
+                # If you want to allow any .npz, drop this check.
                 continue
             full = os.path.join(dirpath, fn)
             mtime = os.path.getmtime(full)
@@ -161,7 +167,7 @@ if __name__ == "__main__":
         "--agg",
         type=str,
         choices=["Seasonal", "Monthly"],
-        default="Seasonal",
+        default="Monthly",
         help="Seasonal (DJF/MAM/JJA/SON) or Monthly aggregation.",
     )
 
@@ -200,6 +206,56 @@ if __name__ == "__main__":
         help="ACF / ESS max lag for trace plots.",
     )
 
+    # -----------------------------------------------------------------------
+    # Return levels / return periods
+    # -----------------------------------------------------------------------
+    p.add_argument(
+        "--rl-N",
+        type=int,
+        default=1000,
+        help=(
+            "If set, plot block-wise N-block return level time series "
+            "(N is in block units: years if each block is yearly)."
+        ),
+    )
+    p.add_argument(
+        "--rl-season",
+        type=int,
+        default=None,
+        help=(
+            "Season index within the period for return levels (0..period-1). "
+            "Default: all blocks."
+        ),
+    )
+    p.add_argument(
+        "--rp-u",
+        type=float,
+        default=None,
+        help=(
+            "If set, plot time-varying return periods for threshold u "
+            "in data units."
+        ),
+    )
+    p.add_argument(
+        "--rp-yearly",
+        action="store_true",
+        default=False,
+        help=(
+            "If set, aggregate within each calendar year when computing "
+            "return periods (at least one exceedance in that year). "
+            "Otherwise, block-wise return periods."
+        ),
+    )
+    p.add_argument(
+        "--rp-season",
+        type=int,
+        default=None,
+        help=(
+            "Season index within the period for block-wise return periods "
+            "(0..period-1). Ignored if --rp-yearly is set. Default: all blocks."
+        ),
+    )
+
     args = p.parse_args()
 
     # -----------------------------------------------------------------------
@@ -234,10 +290,30 @@ if __name__ == "__main__":
     if not args.skip_grouped_traces:
         pl.figure_traces_grouped_all(out_dir, args.show, int(args.max_lag))
 
-    if not args.skip_grouped_post:
-        pl.figure_posteriors_grouped_all(out_dir, args.show)
+    #if not args.skip_grouped_post:
+    #    pl.figure_posteriors_grouped_all(out_dir, args.show)
 
     if not args.skip_quick:
         pl.quick_report(out_dir, args.show)
+
+    # -----------------------------------------------------------------------
+    # Return levels / return periods
+    # -----------------------------------------------------------------------
+    if args.rl_N is not None:
+        pl.figure_return_levels(
+            N=float(args.rl_N),
+            season=args.rl_season,
+            save_dir=out_dir,
+            show=args.show,
+        )
+
+    if args.rp_u is not None:
+        pl.figure_return_periods(
+            u=float(args.rp_u),
+            yearly=bool(args.rp_yearly),
+            season=None if args.rp_yearly else args.rp_season,
+            save_dir=out_dir,
+            show=args.show,
+        )
 
     print("[done] Uccle DGEV Laplace plots written.")
