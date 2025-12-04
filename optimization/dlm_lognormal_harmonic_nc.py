@@ -1,11 +1,35 @@
 from __future__ import annotations
 
-import json, math, os, warnings
+"""
+Gaussian structural time–series model with harmonic seasonality (cos/sin pairs + optional Nyquist)
+— FFBS + Gibbs for Gaussian parts — and **log‑normal priors on process standard deviations**.
+
+Key changes vs Half‑Cauchy version
+----------------------------------
+• Process SDs s_k for k∈{α (level), β (trend), γ (season)} have priors:  ln s_k ~ Normal(μ_k, σ_k^2).
+• We sample z_k = ln s_k by univariate slice sampling targeting:
+      log post(z) = −T_eff·z − 0.5·SS·exp(−2z) − 0.5·((z−μ)/σ)^2   (up to constants)
+  where SS and T_eff are innovation sum of squares and effective counts for each block.
+• CLI replaces --hc-scale-* with --ln-s-*-mu and --ln-s-*-sd; added slice controls (--slice-w, --slice-m).
+
+This file expects helper FFT mappers in `harmonic_helpers.py` providing:
+  center_and_report_dummies_full, dummies_full_to_harmonics_fft, harmonics_to_dummies_full_fft
+"""
+
+import json, math, os, sys, time, warnings
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(base_dir)
+
+from optimization.harmonic_helpers import (
+    center_and_report_dummies_full,
+    dummies_full_to_harmonics_fft,
+    harmonics_to_dummies_full_fft,
+)
 
 # =============================================================================
 # Small utils
@@ -33,80 +57,48 @@ def _spd_solve(M: np.ndarray, B: np.ndarray, eps: float = 1e-10) -> np.ndarray:
             continue
     return np.linalg.pinv(M) @ B
 
-def _extend_sum_to_zero(d_short: Sequence[float], period: int) -> np.ndarray:
-    """Given s-1 seasonal dummies, append the s-th so that the sum is zero."""
-    d_short = np.asarray(d_short, float)
-    if d_short.size != period - 1:
-        raise ValueError(f"season_dummies must have length period-1 = {period-1}")
-    last = -float(np.sum(d_short))
-    return np.concatenate([d_short, np.array([last], float)])
+# =============================================================================
+# Slice sampler (univariate)
+# =============================================================================
 
-def _dummies_to_harmonics(
-    dummies_short: Sequence[float],
-    period: int,
-    K: int,
-    use_nyquist: bool,
-) -> Tuple[np.ndarray, np.ndarray, Optional[float]]:
-    """
-    Project a seasonal dummy vector (provided as length s-1; last implied)
-    onto the first K real Fourier harmonics. Returns (cos[K], sin[K], nyq_or_None).
-    """
-    s = int(period)
-    if s < 2:
-        raise ValueError("period s must be >= 2")
-    x = _extend_sum_to_zero(dummies_short, s)  # now length s and sum zero
+def _slice_sample(
+    logpdf, z0: float, rng: np.random.Generator,
+    w: float = 1.0, m: int = 10,
+    max_shrink: int = 1000
+) -> float:
+    """Neal (2003) style stepping-out + shrinkage slice sampler for 1D.
+    logpdf: callable(z)->log p(z) up to a constant. Must be finite near z0.
+    w: initial bracket width; m: max stepping-out steps per side (<=0 means infinite)."""
+    z0 = float(z0)
+    logy = float(logpdf(z0)) - rng.exponential(1.0)  # log of uniform slice
 
-    K_full = (s - 1) // 2
-    if not (0 <= K <= K_full):
-        raise ValueError(f"K must be in [0, {(s-1)//2}] for s={s}")
+    # Step out
+    u = rng.uniform(0.0, 1.0)
+    L = z0 - u * w
+    R = L + w
+    J = int(rng.integers(0, m + 1)) if m > 0 else 0
+    K = (m - 1 - J) if m > 0 else 0
 
-    even = (s % 2) == 0
-    use_nyquist = bool(use_nyquist and even)
+    while (J > 0) and (logpdf(L) > logy):
+        L -= w
+        J -= 1
+    while (K > 0) and (logpdf(R) > logy):
+        R += w
+        K -= 1
 
-    t = np.arange(s, dtype=float)
-    c = np.zeros(K, float)
-    sines = np.zeros(K, float)
-
-    # No mean-centering needed: sum(x)=0 already
-    for k in range(1, K + 1):
-        w = 2.0 * np.pi * k / s
-        c[k-1]     = (2.0 / s) * np.dot(x, np.cos(w * t))
-        sines[k-1] = (2.0 / s) * np.dot(x, np.sin(w * t))
-
-    nyq_val: Optional[float] = None
-    if use_nyquist:
-        nyq_vec = (-1.0) ** t  # cos(pi t), sin(pi t)=0
-        nyq_val = (2.0 / s) * float(np.dot(x, nyq_vec))
-
-    return c, sines, nyq_val
-
-def _harmonics_to_dummies(
-    period: int,
-    cos_coefs: Sequence[float],
-    sin_coefs: Sequence[float],
-    use_nyquist: bool,
-    nyq_coef: Optional[float] = None,
-) -> np.ndarray:
-    """
-    Reconstruct the (length s) seasonal pattern from harmonics; mean is ~0
-    (no k=0 term). If even and use_nyquist, include Nyquist. Returns length s.
-    """
-    s = int(period)
-    K = int(len(cos_coefs))
-    cos_coefs = np.asarray(cos_coefs, float)
-    sin_coefs = np.asarray(sin_coefs, float)
-    t = np.arange(s, dtype=float)
-    out = np.zeros(s, float)
-    for k in range(1, K + 1):
-        w = 2.0 * np.pi * k / s
-        out += cos_coefs[k-1] * np.cos(w * t) + sin_coefs[k-1] * np.sin(w * t)
-    if use_nyquist and (s % 2 == 0) and (nyq_coef is not None):
-        out += float(nyq_coef) * ((-1.0) ** t)
-    # guard tiny drift due to numerics: enforce exact sum-to-zero
-    out -= np.mean(out)
-    out[:-1] -= (np.sum(out) / (s - 1.0))  # distribute minutely; last will auto fix to 0-sum
-    out[-1] = -np.sum(out[:-1])
-    return out
+    # Shrinkage
+    it = 0
+    while it < max_shrink:
+        z1 = rng.uniform(L, R)
+        if logpdf(z1) >= logy:
+            return float(z1)
+        if z1 < z0:
+            L = z1
+        else:
+            R = z1
+        it += 1
+    # Failsafe
+    return float(z0)
 
 # =============================================================================
 # Priors & Config
@@ -114,19 +106,23 @@ def _harmonics_to_dummies(
 
 @dataclass
 class Priors:
+    # σ² ~ IG(a_sigma, b_sigma) via Gamma on precision
     a_sigma: float = 2.0
     b_sigma: float = 1.0
 
+    # m0 priors (Normal)
     m_m0_alpha: float = 0.0
     s_m0_alpha: float = 10.0
     m_m0_beta: float = 0.0
     s_m0_beta: float = 10.0
-
+    m_m0_nyq: float = 0.0
+    # common sd for harmonic m0 priors (cos/sin)
+    s_m0_harm: float = 5.0
+    # optional means for harmonics (if desired)
     m_m0_cos: Optional[Sequence[float]] = None
     m_m0_sin: Optional[Sequence[float]] = None
-    m_m0_nyq: float = 0.0
-    s_m0_harm: float = 5.0
 
+    # P0 priors (Inv-Gamma)
     a_P0_alpha: float = 2.0
     b_P0_alpha: float = 1.0
     a_P0_beta: float = 2.0
@@ -134,9 +130,13 @@ class Priors:
     a_P0_harm: float = 2.0
     b_P0_harm: float = 1.0
 
-    hc_scale_alpha: float = 0.5
-    hc_scale_beta:  float = 0.5
-    hc_scale_gamma: float = 0.5
+    # Log-normal priors on process SDs:  ln s_k ~ Normal(mu, sd^2)
+    ln_s_alpha_mu: float = -5.0
+    ln_s_alpha_sd: float = 1.0
+    ln_s_beta_mu:  float = -7.0
+    ln_s_beta_sd:  float = 1.0
+    ln_s_gamma_mu: float = -6.0
+    ln_s_gamma_sd: float = 1.0
 
 @dataclass
 class SamplerConfig:
@@ -146,8 +146,12 @@ class SamplerConfig:
     random_seed: Optional[int] = 7
     progress: bool = True
     progress_every: int = 0  # 0 => ~2% of n_iter
-    # NEW: print reconstructed dummies (length s-1) every N iters (0=off)
+    # print reconstructed (sized s) dummies each N iterations (0=off)
     print_dummies_every: int = 0
+
+    # Slice parameters for log SD updates
+    slice_w: float = 1.0  # initial bracket width in z-space
+    slice_m: int = 10     # max stepping-out steps per side
 
 # =============================================================================
 # DLM Sampler – harmonic seasonality (cos/sin pairs + optional Nyquist)
@@ -155,24 +159,24 @@ class SamplerConfig:
 
 class DLMGibbsHarmonic:
     """
-    Gaussian structural DLM with harmonic seasonal states.
+    Gaussian structural DLM with harmonic seasonal states, **disturbance non-centred** version.
 
     State (dynamic):
       [alpha] [beta] [c1 s1 | c2 s2 | ... | cK sK | nyq?]
 
-    Observation (constant H):
-      y_t = alpha_t  + sum_k c_{k,t}  + (nyq_t if used) + ε_t
-      (sin states s_{k,t} are not directly loaded in H; the rotation in A
-       makes their effect appear over time.)
+    Observation:
+      y_t = (deterministic: level/trend/season pieces) + H x_t + ε_t,
+      ε_t ~ N(0, σ²).
 
-    Transition:
-      alpha_t   = alpha_{t-1} + beta_{t-1} (if trend dynamic) + η_{α,t}
-      beta_t    = beta_{t-1} + η_{β,t}
-      [c_k; s_k]_t = R(ω_k) [c_k; s_k]_{t-1} + η_{k,t},   η_{k,t} ~ N(0, q_γ I_2)
-      nyq_t     = (-1) * nyq_{t-1} + η_{nyq,t},            η_{nyq,t} ~ N(0, q_γ)
+    Process disturbances (NCP):
+      x_t = A x_{t-1} + u + S eta_t,    eta_t ~ N(0, I_dim),
+      S = diag(s_alpha, s_beta, s_gamma, ...).
 
-    Process noises:
-      q_α = s_α^2,  q_β = s_β^2,  q_γ = s_γ^2  (single s_γ shared by all seasonal coords)
+    • Latent block we keep is (x0, eta_{1:T}).
+    • Process SDs s_k have log-normal priors: ln s_k ~ N(μ_k, σ_k²).
+    • Updates for ln s_k use slice sampling on the **non-centred** posterior
+      p(ln s_k | x0, eta, y) ∝ p(y | x0, eta, s) p(ln s_k),
+      where x is reconstructed deterministically from (x0, eta, s).
     """
 
     # --------------------------- Construction --------------------------- #
@@ -185,25 +189,26 @@ class DLMGibbsHarmonic:
         level_mode: str = "dynamic",
         trend_mode: str = "dynamic",
         seasonal_mode: str = "dynamic",
+        # Initial means/vars (used as priors if dynamic; as fixed params if deterministic)
         m0_alpha_init: float = 0.0,
         P0_alpha_init: float = 1.0,
         m0_beta_init: float = 0.0,
         P0_beta_init: float = 1.0,
-        # (harmonic) initial means/vars for dynamic season
+
+        # Seasonal initialisation:
+        #   - If seasonal_mode == "dynamic": these are initial state means (priors)
+        #   - If seasonal_mode == "deterministic": these are fixed coefficients
         m0_cos_init: Optional[Sequence[float]] = None,
         m0_sin_init: Optional[Sequence[float]] = None,
         m0_nyq_init: float = 0.0,
         P0_harm_init: float = 1.0,
+
         # observation variance + process SD inits
         sigma2_init: float = 1.0,
         s_alpha_init: float = 1e-2,
         s_beta_init: float = 1e-3,
         s_gamma_init: float = 1e-3,
-        # user-provided harmonics OR dummies (harmonics override if both given)
-        m0_cos_provided: Optional[Sequence[float]] = None,
-        m0_sin_provided: Optional[Sequence[float]] = None,
-        m0_nyq_provided: Optional[float] = None,
-        season_dummies_short: Optional[Sequence[float]] = None,  # length s-1
+
         # priors / config
         priors: Priors = Priors(),
         cfg: SamplerConfig = SamplerConfig(),
@@ -234,37 +239,17 @@ class DLMGibbsHarmonic:
             raise ValueError("dynamic trend requires dynamic level")
         self.level_mode, self.trend_mode, self.seasonal_mode = level_mode, trend_mode, seasonal_mode
 
-        # RNG / config
         self.priors, self.cfg = priors, cfg
         if cfg.random_seed is not None:
             np.random.seed(cfg.random_seed)
-
-        # ---------------- harmonics from user / dummies ----------------
-        have_harm = (m0_cos_provided is not None) and (m0_sin_provided is not None)
-        if have_harm:
-            if len(m0_cos_provided) != self.K or len(m0_sin_provided) != self.K:
-                raise ValueError(f"provided m0_cos/m0_sin must have length K={self.K}")
-            base_cos = np.asarray(m0_cos_provided, float)
-            base_sin = np.asarray(m0_sin_provided, float)
-            base_nyq = (float(m0_nyq_provided) if (self.use_nyq and m0_nyq_provided is not None) else
-                        (0.0 if self.use_nyq else None))
-            source = "harmonics(provided)"
+            self._rng = np.random.default_rng(cfg.random_seed)
         else:
-            if season_dummies_short is None:
-                # default: flat zero seasonal dummies
-                season_dummies_short = np.zeros(self.s - 1, float)
-            season_dummies_short = np.asarray(season_dummies_short, float)
-            c, sines, nyq_val = _dummies_to_harmonics(
-                season_dummies_short, period=self.s, K=self.K, use_nyquist=self.use_nyq
-            )
-            base_cos, base_sin = c, sines
-            base_nyq = float(0.0 if nyq_val is None else nyq_val) if self.use_nyq else None
-            source = "dummies(projected s-1)"
+            self._rng = np.random.default_rng()
 
-        # rotation caches
+        # rotation caches for seasonal dynamics
         self._omegas = 2.0 * np.pi * (np.arange(1, self.K + 1, dtype=float)) / float(self.s)
-        self._cos = np.cos(self._omegas)
-        self._sin = np.sin(self._omegas)
+        self._cosw = np.cos(self._omegas)
+        self._sinw = np.sin(self._omegas)
 
         # ---------------- layout (dynamic) ----------------
         layout: List[str] = []
@@ -283,7 +268,6 @@ class DLMGibbsHarmonic:
         self.idx_alpha = layout.index("alpha") if "alpha" in layout else None
         self.idx_beta  = layout.index("beta")  if "beta"  in layout else None
 
-        # pair indexer
         def _idx_pair(k: int) -> int:
             pos = 0
             if self.idx_alpha is not None: pos += 1
@@ -294,12 +278,10 @@ class DLMGibbsHarmonic:
 
         if self.seasonal_mode == "dynamic":
             self.idx_first_season = (_idx_pair(1) if self.K > 0 else None)
-            self.idx_nyq = None
-            if self.use_nyq:
-                self.idx_nyq = (0
-                    + (1 if self.idx_alpha is not None else 0)
-                    + (1 if self.idx_beta  is not None else 0)
-                    + 2*self.K)
+            self.idx_nyq = (None if not self.use_nyq else
+                            ((1 if self.idx_alpha is not None else 0) +
+                             (1 if self.idx_beta  is not None else 0) +
+                             2*self.K))
         else:
             self.idx_first_season = None
             self.idx_nyq = None
@@ -310,61 +292,60 @@ class DLMGibbsHarmonic:
         self.s_beta  = float(s_beta_init)  if self.idx_beta  is not None else 0.0
         self.s_gamma = float(s_gamma_init) if self.seasonal_mode == "dynamic" else 0.0
 
-        # Aux variables for Half-Cauchy mixtures
-        self.a_alpha = 1.0
-        self.a_beta  = 1.0
-        self.a_gamma = 1.0
-
-        # Initial m0/P0 for dynamic coords
         self.m0_alpha = float(m0_alpha_init) if self.idx_alpha is not None else 0.0
         self.P0_alpha = float(P0_alpha_init) if self.idx_alpha is not None else 0.0
         self.m0_beta  = float(m0_beta_init)  if self.idx_beta  is not None else 0.0
         self.P0_beta  = float(P0_beta_init)  if self.idx_beta  is not None else 0.0
 
-        if self.seasonal_mode == "dynamic":
-            if m0_cos_init is None: m0_cos_init = base_cos
-            if m0_sin_init is None: m0_sin_init = base_sin
+        # Seasonal (dynamic priors OR deterministic fixed coefficients)
+        if self.K > 0:
+            if m0_cos_init is None: m0_cos_init = np.zeros(self.K, float)
+            if m0_sin_init is None: m0_sin_init = np.zeros(self.K, float)
             if len(m0_cos_init) != self.K or len(m0_sin_init) != self.K:
                 raise ValueError("m0_cos_init and m0_sin_init must have length K")
             self.m0_cos = np.asarray(m0_cos_init, float)
             self.m0_sin = np.asarray(m0_sin_init, float)
-            self.m0_nyq = (float(m0_nyq_init) if self.use_nyq else None)
-            self.P0_harm = float(P0_harm_init)
         else:
-            # deterministic seasonal coefficients (fixed parameters to estimate)
-            self.m0_cos = np.asarray(base_cos, float)
-            self.m0_sin = np.asarray(base_sin, float)
-            self.m0_nyq = float(0.0 if base_nyq is None else base_nyq) if self.use_nyq else None
-            self.P0_harm = 0.0
+            self.m0_cos = np.zeros(0, float)
+            self.m0_sin = np.zeros(0, float)
+        self.m0_nyq = (float(m0_nyq_init) if self.use_nyq else None)
+        self.P0_harm = float(P0_harm_init)
 
-        # latent path
+        # latent path (states) — will always be reconstructed from (x0, eta, s)
         self.x = np.zeros((self.T + 1, self.dim), float)
+        # disturbance non-centred block: eta_t ~ N(0, I_dim)
+        self.eta = np.zeros((self.T, self.dim), float) if self.dim > 0 else np.zeros((0, 0))
+        # initial state x0
+        self.x0 = np.zeros(self.dim, float) if self.dim > 0 else np.zeros(0, float)
+
         if self.dim > 0:
             m0_vec, P0_diag = self._current_m0_P0()
-            self.x[0] = np.random.multivariate_normal(
+            self.x0 = np.random.multivariate_normal(
                 m0_vec, np.diag(P0_diag) + 1e-12 * np.eye(self.dim)
             )
-            self._propagate_initial_path(Q_init=np.full(self.dim, 1e-6, float))
-
-        self._season_note = f"init={source} | K={self.K} nyq={self.use_nyq}"
+            # start with tiny process noise + random eta
+            self.eta = self._rng.normal(size=(self.T, self.dim))
+            S_diag_init = self._S_diag()
+            self.x = self._x_from_eta(S_diag=S_diag_init)
 
         # storage
         self.keep: Dict[str, np.ndarray] = {}
-
-        # ---- Truth overlays (optional) ----
-        self.true_sigma: Optional[float] = None
-        self.true_Q: Optional[np.ndarray] = None
-        self.true_mu_t: Optional[np.ndarray] = None
-        self.true_alpha_t: Optional[np.ndarray] = None
-        self.true_beta_t: Optional[np.ndarray] = None
-        self.true_gamma_t: Optional[np.ndarray] = None
 
         # handy scales
         if self.cfg.progress:
             y = self.y
             sd1 = _robust_sd(np.diff(y)) if y.size >= 2 else 0.0
             sd2 = _robust_sd(np.diff(y, n=2)) if y.size >= 3 else 0.0
-            print(f"[init] sd1={sd1:.4g}, sd2={sd2:.4g} | {self._season_note}")
+            nyq_tag = f"nyq={self.use_nyq}"
+            print(f"[init] sd1={sd1:.4g}, sd2={sd2:.4g} | K={self.K} {nyq_tag}")
+
+        # Optional truth overlays (placeholders)
+        self.true_sigma: Optional[float] = None
+        self.true_Q: Optional[np.ndarray] = None
+        self.true_mu_t: Optional[np.ndarray] = None
+        self.true_alpha_t: Optional[np.ndarray] = None
+        self.true_beta_t: Optional[np.ndarray] = None
+        self.true_gamma_t: Optional[np.ndarray] = None
 
     # --------------------- Truth overlays (optional) --------------------- #
     def set_truth(self, **kwargs) -> None:
@@ -378,7 +359,6 @@ class DLMGibbsHarmonic:
     def set_truth_paths(self, mu: Optional[np.ndarray] = None, **_) -> None:
         self.true_mu_t = None if mu is None else np.asarray(mu, float)
 
-    # ----------------------------- Model matrices -----------------------------
 
     def _H(self) -> np.ndarray:
         if self.dim == 0:
@@ -403,7 +383,7 @@ class DLMGibbsHarmonic:
         if self.seasonal_mode == "dynamic" and self.K > 0:
             for k in range(1, self.K + 1):
                 i = self._idx_pair(k)
-                co, si = float(self._cos[k - 1]), float(self._sin[k - 1])
+                co, si = float(self._cosw[k - 1]), float(self._sinw[k - 1])
                 A[i,   i  ] =  co
                 A[i,   i+1] =  si
                 A[i+1, i  ] = -si
@@ -421,6 +401,10 @@ class DLMGibbsHarmonic:
         return u
 
     def _Q(self) -> np.ndarray:
+        """
+        Process covariance for the *centred* representation, used only in FFBS.
+        In the NCP view, this corresponds to w_t = S eta_t, Q = diag(S^2).
+        """
         if self.dim == 0:
             return np.zeros((0, 0))
         Q = np.zeros((self.dim, self.dim))
@@ -436,6 +420,104 @@ class DLMGibbsHarmonic:
             if self.use_nyq:
                 Q[self.idx_nyq, self.idx_nyq] = self.s_gamma**2
         return Q
+
+    # ---------------- disturbance NCP helpers ---------------- #
+
+    def _S_diag(self) -> np.ndarray:
+        """
+        Diagonal of S such that w_t = S eta_t (elementwise) and Q = diag(S^2).
+        """
+        d = np.zeros(self.dim, float)
+        if self.idx_alpha is not None:
+            d[self.idx_alpha] = self.s_alpha
+        if self.idx_beta is not None:
+            d[self.idx_beta] = self.s_beta
+        if self.seasonal_mode == "dynamic":
+            if self.K > 0:
+                for k in range(1, self.K + 1):
+                    i = self._idx_pair(k)
+                    d[i]   = self.s_gamma
+                    d[i+1] = self.s_gamma
+            if self.use_nyq:
+                d[self.idx_nyq] = self.s_gamma
+        return d
+
+    def _x_from_eta(self, S_diag: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Reconstruct the full state path x[0:T] from (x0, eta[1:T]) and a given S_diag.
+        """
+        if self.dim == 0:
+            return np.zeros((self.T + 1, 0), float)
+        if S_diag is None:
+            S_diag = self._S_diag()
+        A, u = self._A(), self._u()
+        x = np.zeros((self.T + 1, self.dim), float)
+        x[0] = self.x0
+        for t in range(1, self.T + 1):
+            noise = S_diag * self.eta[t - 1]  # elementwise
+            x[t] = A @ x[t - 1] + u + noise
+        return x
+
+    def _update_eta_from_x(self) -> None:
+        """
+        Given a state path self.x (from FFBS under Q), compute the implied disturbances
+        eta_t = S^{-1}(x_t - A x_{t-1} - u) for the current SDs.
+        """
+        if self.dim == 0:
+            return
+        A, u = self._A(), self._u()
+        S_diag = self._S_diag()
+        S_safe = np.where(S_diag > 0, S_diag, 1e-12)
+        eta = np.zeros((self.T, self.dim), float)
+        for t in range(1, self.T + 1):
+            innov = self.x[t] - (A @ self.x[t - 1] + u)
+            eta[t - 1] = innov / S_safe
+        self.eta = eta
+        self.x0 = self.x[0].copy()
+
+    def _mu_from_x(self, x: np.ndarray) -> np.ndarray:
+        """
+        Compute μ_t from a given state path x[0:T].
+        """
+        H = self._H()
+        mu = np.zeros(self.T, float)
+        for t in range(1, self.T + 1):
+            dyn = float(H @ x[t]) if self.dim > 0 else 0.0
+            mu[t - 1] = self._mu_det(t - 1) + dyn
+        return mu
+
+    def _loglik_y_given_eta_s(self, s_alpha: float, s_beta: float, s_gamma: float) -> float:
+        """
+        Non-centred log-likelihood log p(y | x0, eta, s_alpha, s_beta, s_gamma, sigma2).
+        Rebuilds x from (x0, eta, s) and computes the Gaussian likelihood.
+        """
+        if self.dim == 0:
+            # purely deterministic mean
+            mu_det = np.array([self._mu_det(t) for t in range(self.T)], float)
+            e = self.y - mu_det
+            s2 = float(self.sigma2)
+            return -0.5 * (self.T * math.log(2 * math.pi * s2) + float(e @ e) / s2)
+
+        # build S_diag for these candidate SDs
+        d = np.zeros(self.dim, float)
+        if self.idx_alpha is not None:
+            d[self.idx_alpha] = s_alpha
+        if self.idx_beta is not None:
+            d[self.idx_beta] = s_beta
+        if self.seasonal_mode == "dynamic":
+            if self.K > 0:
+                for k in range(1, self.K + 1):
+                    i = self._idx_pair(k)
+                    d[i]   = s_gamma
+                    d[i+1] = s_gamma
+            if self.use_nyq:
+                d[self.idx_nyq] = s_gamma
+
+        x = self._x_from_eta(S_diag=d)
+        mu = self._mu_from_x(x)
+        e = self.y - mu
+        s2 = float(self.sigma2)
+        return -0.5 * (self.T * math.log(2 * math.pi * s2) + float(e @ e) / s2)
 
     # ---------------- deterministic mean pieces ----------------
 
@@ -477,6 +559,10 @@ class DLMGibbsHarmonic:
     # ------------------------- FFBS (Kalman + Carter–Kohn) -------------------------
 
     def _ffbs(self) -> np.ndarray:
+        """
+        Centred FFBS on x using Q(s); used only as a *proposal* to draw x,
+        which is then mapped to eta via _update_eta_from_x().
+        """
         if self.dim == 0:
             return self.x.copy()
         H, A, Q, R = self._H(), self._A(), self._Q(), float(self.sigma2)
@@ -520,21 +606,14 @@ class DLMGibbsHarmonic:
             x[t] = np.random.multivariate_normal(mean, cov)
         return x
 
-    def _propagate_initial_path(self, Q_init: np.ndarray) -> None:
-        if self.dim == 0:
-            return
-        A, u = self._A(), self._u()
-        for t in range(1, self.T + 1):
-            self.x[t] = A @ self.x[t - 1] + u + np.random.normal(0.0, np.sqrt(Q_init), size=self.dim)
-
     # ------------------ Helpers: μ and residuals ------------------ #
     def _mu_vec(self) -> np.ndarray:
-        H = self._H()
-        mu = np.zeros(self.T, float)
-        for t in range(1, self.T + 1):
-            dyn = float(H @ self.x[t]) if self.dim > 0 else 0.0
-            mu[t - 1] = self._mu_det(t - 1) + dyn
-        return mu
+        """
+        Convenience wrapper for μ_t using the *current* x path.
+        """
+        if self.dim == 0:
+            return np.array([self._mu_det(t) for t in range(self.T)], float)
+        return self._mu_from_x(self.x)
 
     # ------------------ σ² | rest  (Gamma on precision) ------------------ #
     def update_sigma2(self) -> None:
@@ -544,87 +623,72 @@ class DLMGibbsHarmonic:
         tau = np.random.gamma(shape=a, scale=1.0 / b)  # precision
         self.sigma2 = 1.0 / max(tau, 1e-300)
 
-    # ------------- Innovation sums of squares (for Q updates) ------------- #
-    def _innovation_ss_alpha(self) -> Tuple[float, int]:
-        if self.idx_alpha is None:
-            return 0.0, 0
-        ss = 0.0
-        for t in range(1, self.T + 1):
-            drift = 0.0
-            if self.idx_beta is not None:
-                drift = self.x[t - 1, self.idx_beta]
-            elif self.trend_mode == "deterministic":
-                drift = float(self.m0_beta)
-            mean = self.x[t - 1, self.idx_alpha] + drift
-            ss += (self.x[t, self.idx_alpha] - mean) ** 2
-        return float(ss), self.T
-
-    def _innovation_ss_beta(self) -> Tuple[float, int]:
-        if self.idx_beta is None:
-            return 0.0, 0
-        d = self.x[1:, self.idx_beta] - self.x[:-1, self.idx_beta]
-        return float(np.sum(d * d)), self.T
-
-    def _innovation_ss_gamma(self) -> Tuple[float, int]:
-        if self.seasonal_mode != "dynamic":
-            return 0.0, 0
-        ss = 0.0
-        per_step = 0
-        for k in range(1, self.K + 1):
-            i = self._idx_pair(k)
-            co, si = float(self._cos[k - 1]), float(self._sin[k - 1])
-            R = np.array([[co, si], [-si, co]], float)
-            for t in range(1, self.T + 1):
-                prev = self.x[t - 1, i:i+2]
-                mean = R @ prev
-                err = self.x[t, i:i+2] - mean
-                ss += float(err @ err)
-        per_step += 2 * self.K
-        if self.use_nyq:
-            j = self.idx_nyq
-            for t in range(1, self.T + 1):
-                mean = -self.x[t - 1, j]
-                err = self.x[t, j] - mean
-                ss += float(err * err)
-            per_step += 1
-        T_eff = self.T * per_step
-        return float(ss), int(T_eff)
-
     # =============================================================================
-    # Pure Gibbs for process variances with Half-Cauchy priors
+    # Process SDs with log-normal priors in **non-centred disturbance** parametrisation
     # =============================================================================
-    @staticmethod
-    def _sample_invgamma(shape: float, scale: float) -> float:
-        return 1.0 / np.random.gamma(shape, 1.0 / scale)
 
-    def update_process_Q_halfcauchy(self) -> None:
+    def _logpost_z_block(self, z: float, which: str) -> float:
+        """
+        ln s_k = z, k in {alpha, beta, gamma}.
+        Posterior ∝ likelihood(y | x0, eta, s) * prior(z).
+        Other SDs kept fixed at current values.
+        """
+        z = float(z)
+        if which == "alpha":
+            s_alpha = math.exp(z)
+            s_beta  = self.s_beta
+            s_gamma = self.s_gamma
+            mu, sd = float(self.priors.ln_s_alpha_mu), float(self.priors.ln_s_alpha_sd)
+        elif which == "beta":
+            s_alpha = self.s_alpha
+            s_beta  = math.exp(z)
+            s_gamma = self.s_gamma
+            mu, sd = float(self.priors.ln_s_beta_mu), float(self.priors.ln_s_beta_sd)
+        elif which == "gamma":
+            s_alpha = self.s_alpha
+            s_beta  = self.s_beta
+            s_gamma = math.exp(z)
+            mu, sd = float(self.priors.ln_s_gamma_mu), float(self.priors.ln_s_gamma_sd)
+        else:
+            raise ValueError("which must be one of 'alpha', 'beta', 'gamma'")
+
+        ll = self._loglik_y_given_eta_s(s_alpha, s_beta, s_gamma)
+        lp = -0.5 * ((z - mu) ** 2) / (sd ** 2)
+        return ll + lp
+
+    def update_process_Q_lognormal_ncp(self) -> None:
+        """
+        Non-centred update of process SDs s_alpha, s_beta, s_gamma via slice sampling in z=ln s.
+        Uses the likelihood p(y | x0, eta, s) and normal priors on ln s.
+        """
+        rng = self._rng
+        w, m = float(self.cfg.slice_w), int(self.cfg.slice_m)
+
         # α
         if self.idx_alpha is not None:
-            SS, T_eff = self._innovation_ss_alpha()
-            A = float(self.priors.hc_scale_alpha)
-            shape_Q = 0.5 * T_eff + 0.5
-            scale_Q = 0.5 * SS + 1.0 / max(self.a_alpha, 1e-300)
-            Q_alpha = self._sample_invgamma(shape_Q, scale_Q)
-            self.s_alpha = math.sqrt(max(Q_alpha, 0.0))
-            self.a_alpha = self._sample_invgamma(1.0, (1.0 / (A * A)) + (1.0 / max(Q_alpha, 1e-300)))
+            z0 = math.log(max(self.s_alpha, 1e-16))
+            logpdf = lambda z: self._logpost_z_block(z, which="alpha")
+            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
+            self.s_alpha = float(math.exp(z))
+
         # β
         if self.idx_beta is not None:
-            SS, T_eff = self._innovation_ss_beta()
-            A = float(self.priors.hc_scale_beta)
-            shape_Q = 0.5 * T_eff + 0.5
-            scale_Q = 0.5 * SS + 1.0 / max(self.a_beta, 1e-300)
-            Q_beta = self._sample_invgamma(shape_Q, scale_Q)
-            self.s_beta = math.sqrt(max(Q_beta, 0.0))
-            self.a_beta = self._sample_invgamma(1.0, (1.0 / (A * A)) + (1.0 / max(Q_beta, 1e-300)))
+            z0 = math.log(max(self.s_beta, 1e-16))
+            logpdf = lambda z: self._logpost_z_block(z, which="beta")
+            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
+            self.s_beta = float(math.exp(z))
+
         # γ
         if self.seasonal_mode == "dynamic":
-            SS, T_eff = self._innovation_ss_gamma()
-            A = float(self.priors.hc_scale_gamma)
-            shape_Q = 0.5 * T_eff + 0.5
-            scale_Q = 0.5 * SS + 1.0 / max(self.a_gamma, 1e-300)
-            Q_gamma = self._sample_invgamma(shape_Q, scale_Q)
-            self.s_gamma = math.sqrt(max(Q_gamma, 0.0))
-            self.a_gamma = self._sample_invgamma(1.0, (1.0 / (A * A)) + (1.0 / max(Q_gamma, 1e-300)))
+            z0 = math.log(max(self.s_gamma, 1e-16))
+            logpdf = lambda z: self._logpost_z_block(z, which="gamma")
+            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
+            self.s_gamma = float(math.exp(z))
+
+        # after SD updates, rebuild x from (x0, eta, s)
+        if self.dim > 0:
+            S_diag = self._S_diag()
+            self.x = self._x_from_eta(S_diag=S_diag)
 
     # --- m0 | P0, x0 (Normal); P0 | m0, x0 (Inv-Gamma) --- #
 
@@ -641,11 +705,11 @@ class DLMGibbsHarmonic:
         pos = 0
         if self.idx_alpha is not None:
             self.m0_alpha = self._gibbs_m0_scalar(
-                float(self.x[0, pos]), self.priors.m_m0_alpha, self.priors.s_m0_alpha, self.P0_alpha
+                float(self.x0[pos]), self.priors.m_m0_alpha, self.priors.s_m0_alpha, self.P0_alpha
             ); pos += 1
         if self.idx_beta is not None:
             self.m0_beta = self._gibbs_m0_scalar(
-                float(self.x[0, pos]), self.priors.m_m0_beta, self.priors.s_m0_beta, self.P0_beta
+                float(self.x0[pos]), self.priors.m_m0_beta, self.priors.s_m0_beta, self.P0_beta
             ); pos += 1
         if self.seasonal_mode == "dynamic":
             s0 = float(self.priors.s_m0_harm)
@@ -656,11 +720,11 @@ class DLMGibbsHarmonic:
             if m_cos.size != self.K or m_sin.size != self.K:
                 raise ValueError("priors.m_m0_cos/m_m0_sin must have length K")
             for k in range(self.K):
-                self.m0_cos[k] = self._gibbs_m0_scalar(float(self.x[0, pos + 2*k    ]), float(m_cos[k]), s0, self.P0_harm)
-                self.m0_sin[k] = self._gibbs_m0_scalar(float(self.x[0, pos + 2*k + 1]), float(m_sin[k]), s0, self.P0_harm)
+                self.m0_cos[k] = self._gibbs_m0_scalar(float(self.x0[pos + 2*k    ]), float(m_cos[k]), s0, self.P0_harm)
+                self.m0_sin[k] = self._gibbs_m0_scalar(float(self.x0[pos + 2*k + 1]), float(m_sin[k]), s0, self.P0_harm)
             if self.use_nyq:
                 j = pos + 2*self.K
-                self.m0_nyq = self._gibbs_m0_scalar(float(self.x[0, j]), float(self.priors.m_m0_nyq), s0, self.P0_harm)
+                self.m0_nyq = self._gibbs_m0_scalar(float(self.x0[j]), float(self.priors.m_m0_nyq), s0, self.P0_harm)
 
     def update_P0(self) -> None:
         if self.dim == 0:
@@ -668,23 +732,24 @@ class DLMGibbsHarmonic:
         pos = 0
         if self.idx_alpha is not None:
             a = self.priors.a_P0_alpha + 0.5
-            b = self.priors.b_P0_alpha + 0.5 * (float(self.x[0, pos]) - self.m0_alpha) ** 2
+            b = self.priors.b_P0_alpha + 0.5 * (float(self.x0[pos]) - self.m0_alpha) ** 2
             self.P0_alpha = 1.0 / np.random.gamma(shape=a, scale=1.0 / b); pos += 1
         if self.idx_beta is not None:
             a = self.priors.a_P0_beta + 0.5
-            b = self.priors.b_P0_beta + 0.5 * (float(self.x[0, pos]) - self.m0_beta) ** 2
+            b = self.priors.b_P0_beta + 0.5 * (float(self.x0[pos]) - self.m0_beta) ** 2
             self.P0_beta = 1.0 / np.random.gamma(shape=a, scale=1.0 / b); pos += 1
         if self.seasonal_mode == "dynamic":
             diffsq = 0.0
             Ktot = 2*self.K + (1 if self.use_nyq else 0)
             target = [*self.m0_cos, *self.m0_sin] + ([float(self.m0_nyq)] if self.use_nyq else [])
             for k in range(Ktot):
-                diffsq += (float(self.x[0, pos + k]) - float(target[k])) ** 2
+                diffsq += (float(self.x0[pos + k]) - float(target[k])) ** 2
             a = self.priors.a_P0_harm + 0.5 * Ktot
             b = self.priors.b_P0_harm + 0.5 * diffsq
             self.P0_harm = 1.0 / np.random.gamma(shape=a, scale=1.0 / b)
 
     # --- Deterministic parameter updates (conjugate) --- #
+    # (unchanged except they now use self.x that was rebuilt from (x0, eta, s))
 
     def update_deterministic_params(self) -> None:
         # deterministic level
@@ -809,18 +874,15 @@ class DLMGibbsHarmonic:
             return
         if (it + 1) % n != 0 and it != self.cfg.n_iter - 1:
             return
-        # reconstruct length-s dummies, then print first s-1 as requested
         if self.seasonal_mode in ("dynamic", "deterministic"):
-            d = _harmonics_to_dummies(
-                period=self.s,
+            d = harmonics_to_dummies_full_fft(
+                s=self.s,
                 cos_coefs=self.m0_cos if self.K > 0 else np.zeros(0),
                 sin_coefs=self.m0_sin if self.K > 0 else np.zeros(0),
                 use_nyquist=self.use_nyq,
                 nyq_coef=self.m0_nyq,
             )
-            tag = "dyn" if self.seasonal_mode == "dynamic" else "det"
-            d_short = d[:-1]
-            print(f"[it {it + 1}] dummies({tag}) first s-1 = {self._fmt_list(d_short, max_elems=self.s-1, fmt='.4f')}")
+            print(f"seasonal dummies = {self._fmt_list(d, max_elems=self.s, fmt='.4f')}")
 
     # --------------------------------- MCMC --------------------------------- #
 
@@ -858,15 +920,16 @@ class DLMGibbsHarmonic:
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50) or 1
 
         for it in range(cfg.n_iter):
-            # 1) FFBS
+            # 1) centred FFBS draw of x | y, theta, then map to eta (disturbances)
             if self.dim > 0:
                 self.x = self._ffbs()
+                self._update_eta_from_x()
 
-            # 2) process Q via Half-Cauchy IG mixtures (pure Gibbs)
-            if self.dim > 0:
-                self.update_process_Q_halfcauchy()
+                # 2) process SDs via NON-CENTRED log-normal priors (slice on log s)
+                self.update_process_Q_lognormal_ncp()
+            # after this, self.x has been rebuilt from (x0, eta, s)
 
-            # 3) m0 and 4) P0 for dynamic coords
+            # 3) m0 and 4) P0 for dynamic coords (use x0)
             if self.dim > 0:
                 self.update_m0()
                 self.update_P0()
@@ -881,7 +944,7 @@ class DLMGibbsHarmonic:
             if cfg.progress and ((it + 1) % print_every == 0 or it == cfg.n_iter - 1):
                 print(self._progress_line(it))
 
-            # print dummies (first s-1) per your request
+            # print reconstructed full-length dummies
             self._maybe_print_dummies(it)
 
             # save
@@ -914,7 +977,7 @@ class DLMGibbsHarmonic:
                 keep_idx += 1
 
         return self.keep
-
+    
     # ------------------------------- Persistence ---------------------------- #
     def save_posterior(self, out_npz_path: str, extra_meta: Optional[dict] = None) -> None:
         os.makedirs(os.path.dirname(out_npz_path), exist_ok=True)
@@ -949,7 +1012,6 @@ class DLMGibbsHarmonic:
             "layout": list(self._layout),
             "cfg": asdict(self.cfg),
             "priors": asdict(self.priors),
-            "note": self._season_note,
         }
         if extra_meta:
             meta.update(extra_meta)
@@ -960,19 +1022,17 @@ class DLMGibbsHarmonic:
         print(f"[save] Metadata  -> {meta_path}")
 
 
+
 # ------------------------- CLI / Example run ------------------------------- #
 if __name__ == "__main__":
-    import argparse, os, sys, time
+    import argparse
     from datetime import datetime
-    import numpy as np
-    import matplotlib.pyplot as plt
 
-    # make simulator importable (expects simulator/mean_time_series_harmonic.py)
+    import sys, os
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     sys.path.append(base_dir)
-    from simulator.mean_time_series_harmonic import Mean_Time_Series  # harmonic simulator
+    from simulator.mean_time_series_harmonic import Mean_Time_Series
 
-    # ------------------------- small parsers -------------------------
     def _parse_date(s: str | None):
         if not s:
             from datetime import datetime as _dt
@@ -983,61 +1043,73 @@ if __name__ == "__main__":
         elif len(parts) == 3: return datetime(parts[0], parts[1], parts[2])
         raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
 
-    # ------------------------- CLI args -------------------------
+    def _parse_csv_maybe(s: Optional[str]) -> Optional[List[float]]:
+        if s is None: return None
+        s = s.strip()
+        if s == "": return None
+        return [float(z) for z in s.split(",")]
+
     p = argparse.ArgumentParser(
         description=(
             "Gaussian DLM with harmonic seasonality (cos/sin pairs + optional Nyquist). "
-            "FFBS + conjugate Gibbs; Half-Cauchy (IG-mixture) on process SDs. "
-            "Dummies input is length s-1; last implied."
+            "FFBS + conjugate Gibbs for Gaussian parts; **log-normal priors** on process SDs (slice on log SD). "
+            "Sampler does NOT accept dummies; the CLI can project full-length dummies "
+            "to (cos,sin,nyq) if m0_cos_init/m0_sin_init are not supplied."
         )
     )
 
     # Simulation controls
     p.add_argument("--T", type=int, default=500)
-    p.add_argument("--period", type=int, default=12)
+    p.add_argument("--period", type=int, default=4)
     p.add_argument("--start-date", type=str, default="2000-01-01")
     p.add_argument("--sigma", type=float, default=2.0)
 
-    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="deterministic")
-    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
+    p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
     p.add_argument("--q-level", type=float, default=0.05)
     p.add_argument("--q-trend", type=float, default=0.000002)
     p.add_argument("--q-season", type=float, default=0.0001, help="One scalar seasonal process variance (simulator)")
 
-    # Simulator priors (used for truth generation)
+    # Simulator priors (truth generation)
     p.add_argument("--m0-level", type=float, default=5.0)
     p.add_argument("--v0-level", type=float, default=0.25)
     p.add_argument("--m0-trend", type=float, default=0.02)
     p.add_argument("--v0-trend", type=float, default=0.05)
 
     # Harmonic spec for both simulator & sampler
-    p.add_argument("--harmonics", type=int, default=5, help="K; None=full floor((s-1)/2)")
+    p.add_argument("--harmonics", type=int, default=None, help="K; None=full floor((s-1)/2)")
     p.add_argument("--use-nyquist", type=int, default=1, help="1/0; None=auto if even period & K allows Nyquist")
 
-    # Option A: provide harmonic coefficients (overrides dummies if given)
-    p.add_argument("--m0-cos", type=str, default="1,1,1,1,1", help="CSV length K")
-    p.add_argument("--m0-sin", type=str, default="1,1,1,1,1", help="CSV length K")
-    p.add_argument("--m0-nyq", type=float, default=0.0)
+    # Option A (simulator): provide harmonic coefficients for the simulator only
+    p.add_argument("--sim-m0-cos", type=str, default=None, help="CSV length K (simulator only)")
+    p.add_argument("--sim-m0-sin", type=str, default=None, help="CSV length K (simulator only)")
+    p.add_argument("--sim-m0-nyq", type=float, default=0.0)
 
-    # Option B: provide seasonal dummies (length s-1) to be projected to harmonics
-    p.add_argument("--season-dummies", type=str, default=None, help="CSV length=period-1 (last is implied)")
-    p.add_argument("--center-dummies", type=int, default=1, help="(kept for compatibility; ignored since sum-to-zero)")
+    # Option B (simulator & CLI init): provide full-length seasonal dummies (length = period)
+    p.add_argument("--season-dummies", type=str, default='1,1,1,-3', help="CSV length=period.")
 
     # Sampler configuration
     p.add_argument("--n-iter", type=int, default=20000)
-    p.add_argument("--burn", type=int, default=5000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--burn", type=int, default=3000)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=int, default=1)
     p.add_argument("--progress-every", type=int, default=1)
-    p.add_argument("--print-dummies-every", type=int, default=1, help="Print first s-1 reconstructed dummies every N iters (0=off)")
+    p.add_argument("--print-dummies-every", type=int, default=1, help="Print reconstructed full-length dummies every N iters (0=off)")
 
-    # Half-Cauchy scales (process SDs)
-    p.add_argument("--hc-scale-alpha", type=float, default=0.5)
-    p.add_argument("--hc-scale-beta",  type=float, default=0.5)
-    p.add_argument("--hc-scale-gamma", type=float, default=0.5)
+    # Log-normal prior hyperparameters (process SDs)
+    p.add_argument("--ln-s-alpha-mu", type=float, default=-1.0)
+    p.add_argument("--ln-s-alpha-sd", type=float, default=2.0)
+    p.add_argument("--ln-s-beta-mu",  type=float, default=-2.0)
+    p.add_argument("--ln-s-beta-sd",  type=float, default=2.0)
+    p.add_argument("--ln-s-gamma-mu", type=float, default=-2.0)
+    p.add_argument("--ln-s-gamma-sd", type=float, default=2.0)
+
+    # Slice controls
+    p.add_argument("--slice-w", type=float, default=1.0)
+    p.add_argument("--slice-m", type=int, default=10)
 
     # Observation variance prior
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
@@ -1069,9 +1141,9 @@ if __name__ == "__main__":
     p.add_argument("--P0-alpha-init", type=float, default=0.25)
     p.add_argument("--P0-beta-init", type=float, default=0.05)
     p.add_argument("--P0-harm-init", type=float, default=0.25)
-    p.add_argument("--m0-cos-init", type=str, default='1,1,1,1,1', help="CSV length K (dynamic season)")
-    p.add_argument("--m0-sin-init", type=str, default='1,1,1,1,1', help="CSV length K (dynamic season)")
-    p.add_argument("--m0-nyq-init", type=float, default=0.0)
+    p.add_argument("--m0-cos-init", type=str, default=None, help="CSV length K (sampler init; if None and dummies given, CLI projects)")
+    p.add_argument("--m0-sin-init", type=str, default=None, help="CSV length K (sampler init; if None and dummies given, CLI projects)")
+    p.add_argument("--m0-nyq-init", type=float, default=None, help="If None and dummies given (and nyq used), CLI projects")
 
     # Output / UX
     p.add_argument("--out-dir", type=str, default="results/simulations/DLM_harm")
@@ -1081,18 +1153,20 @@ if __name__ == "__main__":
     args = p.parse_args()
     np.random.seed(args.seed)
 
-    if args.harmonics == None:
+    if args.harmonics is None:
         args.harmonics = (args.period - 1) // 2
+    use_nyq = bool(int(args.use_nyquist))
 
-    if args.m0_cos is not None:
-        args.m0_cos = [float(z) for z in args.m0_cos.split(",")]
-    if args.m0_sin is not None:
-        args.m0_sin = [float(z) for z in args.m0_sin.split(",")]
-    if args.season_dummies is not None:
-        args.season_dummies = [float(z) for z in args.season_dummies.split(",")]
+    # ---------- (optional) parse lists ----------
+    sim_m0_cos = _parse_csv_maybe(args.sim_m0_cos)
+    sim_m0_sin = _parse_csv_maybe(args.sim_m0_sin)
+    pri_m_cos  = _parse_csv_maybe(args.prior_m_m0_cos)
+    pri_m_sin  = _parse_csv_maybe(args.prior_m_m0_sin)
+    m0_cos_init = _parse_csv_maybe(args.m0_cos_init)
+    m0_sin_init = _parse_csv_maybe(args.m0_sin_init)
+    season_dummies = _parse_csv_maybe(args.season_dummies)
 
-    # ---------- simulate data (truth) ----------
-
+    # ---------- simulator inputs ----------
     mts = Mean_Time_Series(
         sigma=args.sigma,
         period=args.period,
@@ -1100,30 +1174,26 @@ if __name__ == "__main__":
         trend_mode=args.trend_mode,
         seasonal_mode=args.seasonal_mode,
         season_harmonics=args.harmonics,
-        season_use_nyquist=args.use_nyq,
+        season_use_nyquist=use_nyq,
         q_level=args.q_level,
         q_trend=args.q_trend,
-        q_season=args.q_season,  # one scalar for all seasonal states, possibly generalize later
+        q_season=args.q_season,
         m0_level=args.m0_level, v0_level=args.v0_level,
         m0_trend=(0.0 if args.trend_mode == "none" else args.m0_trend), v0_trend=args.v0_trend,
-        m0_cos=args.m0_cos, # if given, it overrides dummies
-        m0_sin=args.m0_sin, # if given, it overrides dummies
-        m0_nyquist=args.m0_nyq, # if given, it overrides dummies
-        season_dummies=args.season_dummies,
-        center_dummies=bool(int(args.center_dummies)),
+        # Simulator can use harmonics if provided; else it will project its own dummies logic
+        m0_cos=sim_m0_cos, m0_sin=sim_m0_sin, m0_nyq=args.sim_m0_nyq,
+        season_dummies=season_dummies,  # simulator still accepts dummies (full length)
         start_date=_parse_date(args.start_date),
         rng=np.random.default_rng(args.seed),
     )
 
+    # simulate
     y = np.array([mts.move() or mts.measure() for _ in range(args.T)], float)
     truth = mts.get_truth_paths(as_numpy=True)
     mu_T = truth["mu_t"][1:1 + args.T]
     dates_T = truth["index"][:args.T]
 
     # ---------- priors ----------
-    pri_m_cos = _parse_csv_maybe(args.prior_m_m0_cos)
-    pri_m_sin = _parse_csv_maybe(args.prior_m_m0_sin)
-
     priors = Priors(
         a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
         m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
@@ -1135,9 +1205,9 @@ if __name__ == "__main__":
         a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
         a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
         a_P0_harm=args.prior_a_P0_harm,   b_P0_harm=args.prior_b_P0_harm,
-        hc_scale_alpha=args.hc_scale_alpha,
-        hc_scale_beta=args.hc_scale_beta,
-        hc_scale_gamma=args.hc_scale_gamma,
+        ln_s_alpha_mu=args.ln_s_alpha_mu, ln_s_alpha_sd=args.ln_s_alpha_sd,
+        ln_s_beta_mu=args.ln_s_beta_mu,   ln_s_beta_sd=args.ln_s_beta_sd,
+        ln_s_gamma_mu=args.ln_s_gamma_mu, ln_s_gamma_sd=args.ln_s_gamma_sd,
     )
 
     cfg = SamplerConfig(
@@ -1145,27 +1215,38 @@ if __name__ == "__main__":
         random_seed=int(args.seed), progress=bool(args.progress),
         progress_every=int(args.progress_every),
         print_dummies_every=int(args.print_dummies_every),
+        slice_w=float(args.slice_w), slice_m=int(args.slice_m),
     )
 
-    # initial seasonal means for dynamic season (optional)
-    m0_cos_init = _parse_csv_maybe(args.m0_cos_init)
-    m0_sin_init = _parse_csv_maybe(args.m0_sin_init)
+    # ---------- derive sampler seasonal inits from full-length dummies if needed ----------
+    if (m0_cos_init is None or m0_sin_init is None) and (season_dummies is not None):
+        if len(season_dummies) != args.period:
+            raise ValueError(f"--season-dummies must have length period={args.period}")
+        centered = center_and_report_dummies_full(season_dummies, tol=1e-12)
+        # project to (cos,sin,nyq)
+        K = args.harmonics
+        cos_coefs, sin_coefs, nyq_val = dummies_full_to_harmonics_fft(centered, K=K, use_nyquist=use_nyq)
+        if m0_cos_init is None: m0_cos_init = list(cos_coefs)
+        if m0_sin_init is None: m0_sin_init = list(sin_coefs)
+        if args.m0_nyq_init is None and use_nyq:
+            args.m0_nyq_init = float(0.0 if nyq_val is None else nyq_val)
+
+    # Ensure arrays exist if still None
+    if m0_cos_init is None: m0_cos_init = [0.0] * args.harmonics
+    if m0_sin_init is None: m0_sin_init = [0.0] * args.harmonics
+    if args.m0_nyq_init is None:
+        args.m0_nyq_init = 0.0
 
     # ---------- sampler ----------
     sampler = DLMGibbsHarmonic(
         y=y, period=args.period,
-        harmonics=args.harmonics, use_nyquist=args.use_nyq,
+        harmonics=args.harmonics, use_nyquist=use_nyq,
         level_mode=args.level_mode, trend_mode=args.trend_mode, seasonal_mode=args.seasonal_mode,
         sigma2_init=args.sigma_init ** 2,
         s_alpha_init=args.s_alpha_init, s_beta_init=args.s_beta_init, s_gamma_init=args.s_gamma_init,
         m0_alpha_init=args.m0_level, m0_beta_init=(0.0 if args.trend_mode == "none" else args.m0_trend),
         P0_alpha_init=args.P0_alpha_init, P0_beta_init=args.P0_beta_init, P0_harm_init=args.P0_harm_init,
-        # preferred harmonics (override dummies if present)
-        m0_cos_provided=args.m0_cos, m0_sin_provided=args.m0_sin,
-        m0_nyq_provided=(args.m0_nyq if (args.m0_cos and args.m0_sin) else None),
-        # or dummies (length s-1) to be projected
-        season_dummies_short=args.season_dummies,
-        # dynamic initial means
+        # seasonal initialisation (NO dummies passed into the sampler)
         m0_cos_init=m0_cos_init, m0_sin_init=m0_sin_init, m0_nyq_init=args.m0_nyq_init,
         priors=priors, cfg=cfg,
     )
@@ -1177,31 +1258,39 @@ if __name__ == "__main__":
         print(f"\nSimulated {args.T} observations (σ={mts.sigma:.3g}) with modes "
               f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}.")
         print(f"Harmonics: K={sampler.K}, Nyquist={sampler.use_nyq}\n"
-              f"HC scales: Aα={priors.hc_scale_alpha}, Aβ={priors.hc_scale_beta}, Aγ={priors.hc_scale_gamma}")
+              f"LN priors (ln s): α~N({priors.ln_s_alpha_mu:.2f},{priors.ln_s_alpha_sd:.2f}²), "
+              f"β~N({priors.ln_s_beta_mu:.2f},{priors.ln_s_beta_sd:.2f}²), "
+              f"γ~N({priors.ln_s_gamma_mu:.2f},{priors.ln_s_gamma_sd:.2f}²)")
 
     # ---------- run ----------
     t0 = time.time()
     post = sampler.run()
     elapsed = time.time() - t0
-    print(f"\n[Run completed in {elapsed:.1f}s]")
+    print(f"[Run completed in {elapsed:.1f}s]")
 
     # ---------- save ----------
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(
         args.out_dir,
-        f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}_K{sampler.K}_nyq{int(bool(sampler.use_nyq))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        f"{args.level_mode}-{args.trend_mode}-{args.seasonal_mode}_K{sampler.K}_nyq{int(bool(sampler.use_nyq))}_{stamp}",
     )
     os.makedirs(out_dir, exist_ok=True)
     sampler.save_posterior(
         out_npz_path=os.path.join(out_dir, "posterior.npz"),
         extra_meta={
             "elapsed_seconds": float(elapsed),
-            "hc_scales": {"alpha": priors.hc_scale_alpha, "beta": priors.hc_scale_beta, "gamma": priors.hc_scale_gamma},
+            "ln_s_priors": {
+                "alpha": {"mu": priors.ln_s_alpha_mu, "sd": priors.ln_s_alpha_sd},
+                "beta":  {"mu": priors.ln_s_beta_mu,  "sd": priors.ln_s_beta_sd},
+                "gamma": {"mu": priors.ln_s_gamma_mu, "sd": priors.ln_s_gamma_sd},
+            },
         },
     )
 
     # ---------- quick summary + plot ----------
     if args.print_summary:
-        print("\n--- Posterior means ---")
+        print("\
+--- Posterior means ---")
         print(f"σ = {np.mean(post['sigma']):.4f}")
         for k in ["alpha", "beta", "gamma"]:
             key = f"Q_{k}"
@@ -1210,10 +1299,11 @@ if __name__ == "__main__":
                 print(f"Q_{k} = {mQ:.4g} (√Q ≈ {math.sqrt(max(mQ,0.0)):.4g})")
 
     if args.plot:
+        import matplotlib.pyplot as plt
         mu_hat = post["mu"].mean(axis=0)
         plt.figure(figsize=(10, 4))
         plt.plot(dates_T, y, label="y_t", lw=1)
-        if "true_mu_t" in post or 'true_mu_t' in sampler.__dict__:
+        if 'true_mu_t' in sampler.__dict__ and sampler.true_mu_t is not None:
             plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
         plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
         plt.title(f"DLM harmonic: {args.level_mode}/{args.trend_mode}/{args.seasonal_mode} | K={sampler.K}, nyq={sampler.use_nyq}")
