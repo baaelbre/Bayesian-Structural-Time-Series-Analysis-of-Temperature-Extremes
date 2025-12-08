@@ -820,9 +820,9 @@ if __name__ == "__main__":
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
 
     # FS Normal priors (process SDs: s_k | σ² ~ N(0, B0_s_k σ²))
-    p.add_argument("--prior-B0-s-alpha", type=float, default=1.0)
-    p.add_argument("--prior-B0-s-beta",  type=float, default=1.0)
-    p.add_argument("--prior-B0-s-gamma", type=float, default=1.0)
+    p.add_argument("--prior-B0-s-alpha", type=float, default=1e-4)
+    p.add_argument("--prior-B0-s-beta",  type=float, default=1e-7)
+    p.add_argument("--prior-B0-s-gamma", type=float, default=1e-4)
 
     # Sampler configuration
     p.add_argument("--n-iter", type=int, default=10000)
