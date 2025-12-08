@@ -2,7 +2,17 @@ from __future__ import annotations
 
 """
 Gaussian structural time–series model with harmonic seasonality (cos/sin pairs + optional Nyquist)
-and log-normal priors on process standard deviations, fitted using FFBS within Gibbs
+and double-Gamma (Gamma-Gamma) priors on process precisions, fitted using FFBS within Gibbs.
+
+Process precisions:
+    λ_k = 1 / s_k^2 | τ_k ~ Gamma(a_λk, τ_k)
+    τ_k ~ Gamma(c_λk, d_λk)
+
+Full conditionals (shape–rate parameterisation):
+    λ_k | τ_k, w_k ~ Gamma(a_λk + n_k/2, τ_k + 0.5 * sum w_k^2)
+    τ_k | λ_k     ~ Gamma(c_λk + a_λk, d_λk + λ_k)
+
+where w_k are the centred innovations for block k (alpha, beta, gamma).
 """
 
 import json, math, os, sys, time, warnings
@@ -37,49 +47,6 @@ def _spd_solve(M: np.ndarray, B: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return np.linalg.pinv(M) @ B
 
 # =============================================================================
-# Slice sampler (univariate)
-# =============================================================================
-
-def _slice_sample(
-    logpdf, z0: float, rng: np.random.Generator,
-    w: float = 1.0, m: int = 10,
-    max_shrink: int = 1000
-) -> float:
-    """Neal (2003) style stepping-out + shrinkage slice sampler for 1D.
-    logpdf: callable(z)->log p(z) up to a constant. Must be finite near z0.
-    w: initial bracket width; m: max stepping-out steps per side (<=0 means infinite)."""
-    z0 = float(z0)
-    logy = float(logpdf(z0)) - rng.exponential(1.0)  # log of uniform slice
-
-    # Step out
-    u = rng.uniform(0.0, 1.0)
-    L = z0 - u * w
-    R = L + w
-    J = int(rng.integers(0, m + 1)) if m > 0 else 0
-    K = (m - 1 - J) if m > 0 else 0
-
-    while (J > 0) and (logpdf(L) > logy):
-        L -= w
-        J -= 1
-    while (K > 0) and (logpdf(R) > logy):
-        R += w
-        K -= 1
-
-    # Shrinkage
-    it = 0
-    while it < max_shrink:
-        z1 = rng.uniform(L, R)
-        if logpdf(z1) >= logy:
-            return float(z1)
-        if z1 < z0:
-            L = z1
-        else:
-            R = z1
-        it += 1
-    # Failsafe
-    return float(z0)
-
-# =============================================================================
 # Priors & Config
 # =============================================================================
 
@@ -88,6 +55,20 @@ class Priors:
     # σ² ~ IG(a_sigma, b_sigma) via Gamma on precision
     a_sigma: float = 2.0
     b_sigma: float = 1.0
+
+    # Double-Gamma priors for process precisions λ = 1 / s²
+    # Half-Cauchy-like behaviour when a_lambda = c_lambda = 0.5
+    a_lam_alpha: float = 0.5
+    c_lam_alpha: float = 0.5
+    d_lam_alpha: float = 1.0
+
+    a_lam_beta: float = 0.5
+    c_lam_beta: float = 0.5
+    d_lam_beta: float = 1.0
+
+    a_lam_gamma: float = 0.5
+    c_lam_gamma: float = 0.5
+    d_lam_gamma: float = 1.0
 
     # m0 priors (Normal)
     m_m0_alpha: float = 0.0
@@ -109,13 +90,6 @@ class Priors:
     a_P0_harm: float = 2.0
     b_P0_harm: float = 1.0
 
-    # Log-normal priors on process SDs:  ln s_k ~ Normal(mu, sd^2)
-    ln_s_alpha_mu: float = -5.0
-    ln_s_alpha_sd: float = 1.0
-    ln_s_beta_mu:  float = -7.0
-    ln_s_beta_sd:  float = 1.0
-    ln_s_gamma_mu: float = -6.0
-    ln_s_gamma_sd: float = 1.0
 
 @dataclass
 class SamplerConfig:
@@ -128,9 +102,6 @@ class SamplerConfig:
     # print reconstructed (sized s) dummies each N iterations (0=off)
     print_dummies_every: int = 0
 
-    # Slice parameters for log SD updates
-    slice_w: float = 1.0  # initial bracket width in z-space
-    slice_m: int = 10     # max stepping-out steps per side
 
 # =============================================================================
 # DLM Sampler – harmonic seasonality (cos/sin pairs + optional Nyquist)
@@ -147,15 +118,15 @@ class DLMGibbsHarmonic:
       y_t = (deterministic: level/trend/season pieces) + H x_t + ε_t,
       ε_t ~ N(0, σ²).
 
-    Process disturbances (NCP):
-      x_t = A x_{t-1} + u + S eta_t,    eta_t ~ N(0, I_dim),
-      S = diag(s_alpha, s_beta, s_gamma, ...).
+    Process disturbances (centred + optional NCP for diagnostics):
+      x_t = A x_{t-1} + u + w_t,    w_t ~ N(0, Q),
+      Q = diag(s_alpha², s_beta², s_gamma²,...)
 
-    • Latent block we keep is (x0, eta_{1:T}).
-    • Process SDs s_k have log-normal priors: ln s_k ~ N(μ_k, σ_k²).
-    • Updates for ln s_k use slice sampling on the **non-centred** posterior
-      p(ln s_k | x0, eta, y) ∝ p(y | x0, eta, s) p(ln s_k),
-      where x is reconstructed deterministically from (x0, eta, s).
+    Process precisions have double-Gamma priors:
+      λ_k = 1 / s_k² | τ_k ~ Gamma(a_λk, τ_k)
+      τ_k ~ Gamma(c_λk, d_λk)
+
+    Given the centred innovations w_t, we update λ_k and τ_k by conjugate Gibbs.
     """
 
     # --------------------------- Construction --------------------------- #
@@ -267,6 +238,23 @@ class DLMGibbsHarmonic:
         self.s_beta  = float(s_beta_init)  if self.idx_beta  is not None else 0.0
         self.s_gamma = float(s_gamma_init) if self.seasonal_mode == "dynamic" else 0.0
 
+        # Double-Gamma latent variables for precisions λ = 1 / s²
+        # Initialize λ from s_init and τ at prior mean c/d.
+        self.lam_alpha = (1.0 / max(self.s_alpha**2, 1e-18)) if self.idx_alpha is not None else None
+        self.tau_alpha = ((self.priors.c_lam_alpha / self.priors.d_lam_alpha)
+                          if self.idx_alpha is not None else None)
+
+        self.lam_beta = (1.0 / max(self.s_beta**2, 1e-18)) if self.idx_beta is not None else None
+        self.tau_beta = ((self.priors.c_lam_beta / self.priors.d_lam_beta)
+                         if self.idx_beta is not None else None)
+
+        if self.seasonal_mode == "dynamic":
+            self.lam_gamma = 1.0 / max(self.s_gamma**2, 1e-18)
+            self.tau_gamma = self.priors.c_lam_gamma / self.priors.d_lam_gamma
+        else:
+            self.lam_gamma = None
+            self.tau_gamma = None
+
         self.m0_alpha = float(m0_alpha_init) if self.idx_alpha is not None else 0.0
         self.P0_alpha = float(P0_alpha_init) if self.idx_alpha is not None else 0.0
         self.m0_beta  = float(m0_beta_init)  if self.idx_beta  is not None else 0.0
@@ -286,9 +274,9 @@ class DLMGibbsHarmonic:
         self.m0_nyq = (float(m0_nyq_init) if self.use_nyq else None)
         self.P0_harm = float(P0_harm_init)
 
-        # latent path (states) — will always be reconstructed from (x0, eta, s)
+        # latent path (states) — centred representation
         self.x = np.zeros((self.T + 1, self.dim), float)
-        # disturbance non-centred block: eta_t ~ N(0, I_dim)
+        # disturbance NCP block (for diagnostics / future ASIS if desired)
         self.eta = np.zeros((self.T, self.dim), float) if self.dim > 0 else np.zeros((0, 0))
         # initial state x0
         self.x0 = np.zeros(self.dim, float) if self.dim > 0 else np.zeros(0, float)
@@ -298,10 +286,10 @@ class DLMGibbsHarmonic:
             self.x0 = np.random.multivariate_normal(
                 m0_vec, np.diag(P0_diag) + 1e-12 * np.eye(self.dim)
             )
-            # start with tiny process noise + random eta
+            # start with random states consistent with initial s
+            self.x[:] = 0.0
+            self.x[0] = self.x0
             self.eta = self._rng.normal(size=(self.T, self.dim))
-            S_diag_init = self._S_diag()
-            self.x = self._x_from_eta(S_diag=S_diag_init)
 
         # storage
         self.keep: Dict[str, np.ndarray] = {}
@@ -320,12 +308,13 @@ class DLMGibbsHarmonic:
         self.true_Q = np.asarray(kwargs["Q"], float) if "Q" in kwargs and kwargs["Q"] is not None else None
         self.true_mu_t = np.asarray(kwargs["mu"], float) if "mu" in kwargs and kwargs["mu"] is not None else None
         self.true_alpha_t = np.asarray(kwargs["alpha"], float) if "alpha" in kwargs and kwargs["alpha"] is not None else None
-        self.true_beta_t = np.asarray(kwargs["beta"], float) if "beta" in kwargs and kwargs["beta"] is not None else None
+        self.true_beta_t = np.asarray(kwargs["beta"], float) if "beta" is not None and kwargs["beta"] is not None else None
         self.true_gamma_t = np.asarray(kwargs["gamma"], float) if "gamma" in kwargs and kwargs["gamma"] is not None else None
 
     def set_truth_paths(self, mu: Optional[np.ndarray] = None, **_) -> None:
         self.true_mu_t = None if mu is None else np.asarray(mu, float)
 
+    # -------------------- system matrices -------------------- #
 
     def _H(self) -> np.ndarray:
         if self.dim == 0:
@@ -369,8 +358,8 @@ class DLMGibbsHarmonic:
 
     def _Q(self) -> np.ndarray:
         """
-        Process covariance for the centred representation, used only in FFBS.
-        In the NCP view, this corresponds to w_t = S eta_t, Q = diag(S^2).
+        Process covariance for the centred representation, used in FFBS.
+        Q is diagonal with entries s_alpha², s_beta², s_gamma² (per relevant state).
         """
         if self.dim == 0:
             return np.zeros((0, 0))
@@ -388,7 +377,7 @@ class DLMGibbsHarmonic:
                 Q[self.idx_nyq, self.idx_nyq] = self.s_gamma**2
         return Q
 
-    # ---------------- disturbance NCP helpers ---------------- #
+    # ---------------- disturbance NCP helper (diagnostic only) ---------------- #
 
     def _S_diag(self) -> np.ndarray:
         """
@@ -412,6 +401,7 @@ class DLMGibbsHarmonic:
     def _x_from_eta(self, S_diag: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Reconstruct the full state path x[0:T] from (x0, eta[1:T]) and a given S_diag.
+        (Not used for updating Q under double-Gamma; kept for diagnostics / future ASIS.)
         """
         if self.dim == 0:
             return np.zeros((self.T + 1, 0), float)
@@ -427,8 +417,9 @@ class DLMGibbsHarmonic:
 
     def _update_eta_from_x(self) -> None:
         """
-        Given a state path self.x (from FFBS under Q), compute the implied disturbances
+        Given a state path self.x, compute the implied standardized disturbances
         eta_t = S^{-1}(x_t - A x_{t-1} - u) for the current SDs.
+        (Diagnostic / potential ASIS use; not required for double-Gamma updates.)
         """
         if self.dim == 0:
             return
@@ -452,39 +443,6 @@ class DLMGibbsHarmonic:
             dyn = float(H @ x[t]) if self.dim > 0 else 0.0
             mu[t - 1] = self._mu_det(t - 1) + dyn
         return mu
-
-    def _loglik_y_given_eta_s(self, s_alpha: float, s_beta: float, s_gamma: float) -> float:
-        """
-        Non-centred log-likelihood log p(y | x0, eta, s_alpha, s_beta, s_gamma, sigma2).
-        Rebuilds x from (x0, eta, s) and computes the Gaussian likelihood.
-        """
-        if self.dim == 0:
-            # purely deterministic mean
-            mu_det = np.array([self._mu_det(t) for t in range(self.T)], float)
-            e = self.y - mu_det
-            s2 = float(self.sigma2)
-            return -0.5 * (self.T * math.log(2 * math.pi * s2) + float(e @ e) / s2)
-
-        # build S_diag for these candidate SDs
-        d = np.zeros(self.dim, float)
-        if self.idx_alpha is not None:
-            d[self.idx_alpha] = s_alpha
-        if self.idx_beta is not None:
-            d[self.idx_beta] = s_beta
-        if self.seasonal_mode == "dynamic":
-            if self.K > 0:
-                for k in range(1, self.K + 1):
-                    i = self._idx_pair(k)
-                    d[i]   = s_gamma
-                    d[i+1] = s_gamma
-            if self.use_nyq:
-                d[self.idx_nyq] = s_gamma
-
-        x = self._x_from_eta(S_diag=d)
-        mu = self._mu_from_x(x)
-        e = self.y - mu
-        s2 = float(self.sigma2)
-        return -0.5 * (self.T * math.log(2 * math.pi * s2) + float(e @ e) / s2)
 
     # ---------------- deterministic mean pieces ----------------
 
@@ -523,12 +481,11 @@ class DLMGibbsHarmonic:
                 P0.append(self.P0_harm)
         return np.asarray(m0, float), np.asarray(P0, float)
 
-    # ------------------------- FFBS (Kalman + Carter–Kohn) -------------------------
+    # ------------------------- FFBS (Kalman + Carter–Kohn) ------------------------- #
 
     def _ffbs(self) -> np.ndarray:
         """
-        Centred FFBS on x using Q(s); used only as a proposal to draw x,
-        which is then mapped to eta via _update_eta_from_x().
+        Centred FFBS on x using Q(s); used to draw x | y, Q, σ².
         """
         if self.dim == 0:
             return self.x.copy()
@@ -591,71 +548,90 @@ class DLMGibbsHarmonic:
         self.sigma2 = 1.0 / max(tau, 1e-300)
 
     # =============================================================================
-    # Process SDs with log-normal priors in non-centred disturbance parametrisation
+    # Process precisions with double-Gamma priors (centred innovations)
     # =============================================================================
 
-    def _logpost_z_block(self, z: float, which: str) -> float:
+    def _update_double_gamma_block(self, block: str, sumsq: float, n: int) -> None:
         """
-        ln s_k = z, k in {alpha, beta, gamma}.
-        Posterior ∝ likelihood(y | x0, eta, s) * prior(z).
-        Other SDs kept fixed at current values.
-        """
-        z = float(z)
-        if which == "alpha":
-            s_alpha = math.exp(z)
-            s_beta  = self.s_beta
-            s_gamma = self.s_gamma
-            mu, sd = float(self.priors.ln_s_alpha_mu), float(self.priors.ln_s_alpha_sd)
-        elif which == "beta":
-            s_alpha = self.s_alpha
-            s_beta  = math.exp(z)
-            s_gamma = self.s_gamma
-            mu, sd = float(self.priors.ln_s_beta_mu), float(self.priors.ln_s_beta_sd)
-        elif which == "gamma":
-            s_alpha = self.s_alpha
-            s_beta  = self.s_beta
-            s_gamma = math.exp(z)
-            mu, sd = float(self.priors.ln_s_gamma_mu), float(self.priors.ln_s_gamma_sd)
-        else:
-            raise ValueError("which must be one of 'alpha', 'beta', 'gamma'")
-
-        ll = self._loglik_y_given_eta_s(s_alpha, s_beta, s_gamma)
-        lp = -0.5 * ((z - mu) ** 2) / (sd ** 2)
-        return ll + lp
-
-    def update_process_Q_lognormal_ncp(self) -> None:
-        """
-        Non-centred update of process SDs s_alpha, s_beta, s_gamma via slice sampling in z=ln s.
-        Uses the likelihood p(y | x0, eta, s) and normal priors on ln s.
+        Update (λ_k, τ_k) for block in {'alpha', 'beta', 'gamma'} given
+        sum of squares of centred innovations and number of innovations n.
         """
         rng = self._rng
-        w, m = float(self.cfg.slice_w), int(self.cfg.slice_m)
+        if n <= 0:
+            return
 
-        # α
+        if block == "alpha":
+            a0, c0, d0 = self.priors.a_lam_alpha, self.priors.c_lam_alpha, self.priors.d_lam_alpha
+            lam, tau = self.lam_alpha, self.tau_alpha
+        elif block == "beta":
+            a0, c0, d0 = self.priors.a_lam_beta, self.priors.c_lam_beta, self.priors.d_lam_beta
+            lam, tau = self.lam_beta, self.tau_beta
+        elif block == "gamma":
+            a0, c0, d0 = self.priors.a_lam_gamma, self.priors.c_lam_gamma, self.priors.d_lam_gamma
+            lam, tau = self.lam_gamma, self.tau_gamma
+        else:
+            raise ValueError("block must be 'alpha', 'beta' or 'gamma'")
+
+        # λ | τ, w ~ Gamma(a0 + n/2, τ + 0.5 * sumsq)
+        shape_lam = a0 + 0.5 * n
+        rate_lam = tau + 0.5 * sumsq
+        lam = rng.gamma(shape=shape_lam, scale=1.0 / max(rate_lam, 1e-300))
+
+        # τ | λ ~ Gamma(c0 + a0, d0 + λ)
+        shape_tau = c0 + a0
+        rate_tau = d0 + lam
+        tau = rng.gamma(shape=shape_tau, scale=1.0 / max(rate_tau, 1e-300))
+
+        # update λ, τ and implied s_k
+        if block == "alpha":
+            self.lam_alpha, self.tau_alpha = lam, tau
+            self.s_alpha = math.sqrt(1.0 / lam)
+        elif block == "beta":
+            self.lam_beta, self.tau_beta = lam, tau
+            self.s_beta = math.sqrt(1.0 / lam)
+        else:  # gamma
+            self.lam_gamma, self.tau_gamma = lam, tau
+            self.s_gamma = math.sqrt(1.0 / lam)
+
+    def update_process_Q_double_gamma(self) -> None:
+        """
+        Update process variances via double-Gamma priors using centred
+        state innovations w_t = x_t - (A x_{t-1} + u).
+        """
+        if self.dim == 0:
+            return
+
+        A, u = self._A(), self._u()
+        w = np.zeros((self.T, self.dim), float)
+        for t in range(1, self.T + 1):
+            w[t - 1] = self.x[t] - (A @ self.x[t - 1] + u)
+
+        # alpha block
         if self.idx_alpha is not None:
-            z0 = math.log(max(self.s_alpha, 1e-16))
-            logpdf = lambda z: self._logpost_z_block(z, which="alpha")
-            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
-            self.s_alpha = float(math.exp(z))
+            w_alpha = w[:, self.idx_alpha]
+            sumsq = float(w_alpha @ w_alpha)
+            self._update_double_gamma_block("alpha", sumsq=sumsq, n=self.T)
 
-        # β
+        # beta block
         if self.idx_beta is not None:
-            z0 = math.log(max(self.s_beta, 1e-16))
-            logpdf = lambda z: self._logpost_z_block(z, which="beta")
-            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
-            self.s_beta = float(math.exp(z))
+            w_beta = w[:, self.idx_beta]
+            sumsq = float(w_beta @ w_beta)
+            self._update_double_gamma_block("beta", sumsq=sumsq, n=self.T)
 
-        # γ
+        # gamma block (all seasonal dims share same s_gamma)
         if self.seasonal_mode == "dynamic":
-            z0 = math.log(max(self.s_gamma, 1e-16))
-            logpdf = lambda z: self._logpost_z_block(z, which="gamma")
-            z = _slice_sample(logpdf, z0, rng, w=w, m=m)
-            self.s_gamma = float(math.exp(z))
-
-        # after SD updates, rebuild x from (x0, eta, s)
-        if self.dim > 0:
-            S_diag = self._S_diag()
-            self.x = self._x_from_eta(S_diag=S_diag)
+            idxs = []
+            if self.K > 0:
+                for k in range(1, self.K + 1):
+                    i = self._idx_pair(k)
+                    idxs.extend([i, i + 1])
+            if self.use_nyq:
+                idxs.append(self.idx_nyq)
+            if idxs:
+                Wg = w[:, idxs]
+                sumsq = float(np.sum(Wg * Wg))
+                n_gamma = Wg.size
+                self._update_double_gamma_block("gamma", sumsq=sumsq, n=n_gamma)
 
     # --- m0 | P0, x0 (Normal); P0 | m0, x0 (Inv-Gamma) --- #
 
@@ -886,14 +862,14 @@ class DLMGibbsHarmonic:
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50) or 1
 
         for it in range(cfg.n_iter):
-            # 1) centred FFBS draw of x | y, theta, then map to eta (disturbances)
+            # 1) centred FFBS draw of x | y, sigma2, Q
             if self.dim > 0:
                 self.x = self._ffbs()
+                # optional diagnostic mapping to NCP
                 self._update_eta_from_x()
 
-                # 2) process SDs via NON-CENTRED log-normal priors (slice on log s)
-                self.update_process_Q_lognormal_ncp()
-            # after this, self.x has been rebuilt from (x0, eta, s)
+                # 2) process variances via double-Gamma priors (centred innovations)
+                self.update_process_Q_double_gamma()
 
             # 3) m0 and 4) P0 for dynamic coords (use x0)
             if self.dim > 0:
@@ -943,7 +919,7 @@ class DLMGibbsHarmonic:
                 keep_idx += 1
 
         return self.keep
-    
+
     # ------------------------------- Persistence ---------------------------- #
     def save_posterior(self, out_npz_path: str, extra_meta: Optional[dict] = None) -> None:
         os.makedirs(os.path.dirname(out_npz_path), exist_ok=True)
@@ -988,7 +964,6 @@ class DLMGibbsHarmonic:
         print(f"[save] Metadata  -> {meta_path}")
 
 
-
 # ------------------------- CLI / Example run ------------------------------- #
 if __name__ == "__main__":
     import argparse
@@ -1018,7 +993,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description=(
             "Gaussian DLM with harmonic seasonality (cos/sin pairs + optional Nyquist). "
-            "FFBS + conjugate Gibbs for Gaussian parts; **log-normal priors** on process SDs (slice on log SD). "
+            "FFBS + conjugate Gibbs for Gaussian parts; double-Gamma priors on process precisions "
+            "(Gamma-Gamma hierarchy, half-Cauchy as special case). "
             "Sampler does NOT accept dummies; the CLI can project full-length dummies "
             "to (cos,sin,nyq) if m0_cos_init/m0_sin_init are not supplied."
         )
@@ -1063,23 +1039,26 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=int, default=1)
     p.add_argument("--progress-every", type=int, default=1)
-    p.add_argument("--print-dummies-every", type=int, default=1, help="Print reconstructed full-length dummies every N iters (0=off)")
-
-    # Log-normal prior hyperparameters (process SDs)
-    p.add_argument("--ln-s-alpha-mu", type=float, default=-1.0)
-    p.add_argument("--ln-s-alpha-sd", type=float, default=2.0)
-    p.add_argument("--ln-s-beta-mu",  type=float, default=-2.0)
-    p.add_argument("--ln-s-beta-sd",  type=float, default=2.0)
-    p.add_argument("--ln-s-gamma-mu", type=float, default=-2.0)
-    p.add_argument("--ln-s-gamma-sd", type=float, default=2.0)
-
-    # Slice controls
-    p.add_argument("--slice-w", type=float, default=1.0)
-    p.add_argument("--slice-m", type=int, default=10)
+    p.add_argument("--print-dummies-every", type=int, default=1,
+                   help="Print reconstructed full-length dummies every N iters (0=off)")
 
     # Observation variance prior
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
     p.add_argument("--prior-b-sigma", type=float, default=1.0)
+
+    # Double-Gamma hyperparameters for process precisions
+    # (Half-Cauchy-like default: a=c=0.5, d=1.0)
+    p.add_argument("--prior-a-lam-alpha", type=float, default=0.5)
+    p.add_argument("--prior-c-lam-alpha", type=float, default=0.5)
+    p.add_argument("--prior-d-lam-alpha", type=float, default=1.0)
+
+    p.add_argument("--prior-a-lam-beta", type=float, default=0.5)
+    p.add_argument("--prior-c-lam-beta", type=float, default=0.5)
+    p.add_argument("--prior-d-lam-beta", type=float, default=1.0)
+
+    p.add_argument("--prior-a-lam-gamma", type=float, default=0.5)
+    p.add_argument("--prior-c-lam-gamma", type=float, default=0.5)
+    p.add_argument("--prior-d-lam-gamma", type=float, default=1.0)
 
     # m0 priors
     p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
@@ -1107,9 +1086,12 @@ if __name__ == "__main__":
     p.add_argument("--P0-alpha-init", type=float, default=0.25)
     p.add_argument("--P0-beta-init", type=float, default=0.05)
     p.add_argument("--P0-harm-init", type=float, default=0.25)
-    p.add_argument("--m0-cos-init", type=str, default=None, help="CSV length K (sampler init; if None and dummies given, CLI projects)")
-    p.add_argument("--m0-sin-init", type=str, default=None, help="CSV length K (sampler init; if None and dummies given, CLI projects)")
-    p.add_argument("--m0-nyq-init", type=float, default=None, help="If None and dummies given (and nyq used), CLI projects")
+    p.add_argument("--m0-cos-init", type=str, default=None,
+                   help="CSV length K (sampler init; if None and dummies given, CLI projects)")
+    p.add_argument("--m0-sin-init", type=str, default=None,
+                   help="CSV length K (sampler init; if None and dummies given, CLI projects)")
+    p.add_argument("--m0-nyq-init", type=float, default=None,
+                   help="If None and dummies given (and nyq used), CLI projects")
 
     # Output / UX
     p.add_argument("--out-dir", type=str, default="results/simulations/DLM_harm")
@@ -1123,7 +1105,7 @@ if __name__ == "__main__":
         args.harmonics = (args.period - 1) // 2
     use_nyq = bool(int(args.use_nyquist))
 
-    # ---------- (optional) parse lists ----------
+    # ---------- (optional) parse lists ---------- #
     sim_m0_cos = _parse_csv_maybe(args.sim_m0_cos)
     sim_m0_sin = _parse_csv_maybe(args.sim_m0_sin)
     pri_m_cos  = _parse_csv_maybe(args.prior_m_m0_cos)
@@ -1132,7 +1114,7 @@ if __name__ == "__main__":
     m0_sin_init = _parse_csv_maybe(args.m0_sin_init)
     season_dummies = _parse_csv_maybe(args.season_dummies)
 
-    # ---------- simulator inputs ----------
+    # ---------- simulator inputs ---------- #
     mts = Mean_Time_Series(
         sigma=args.sigma,
         period=args.period,
@@ -1159,9 +1141,18 @@ if __name__ == "__main__":
     mu_T = truth["mu_t"][1:1 + args.T]
     dates_T = truth["index"][:args.T]
 
-    # ---------- priors ----------
+    # ---------- priors ---------- #
     priors = Priors(
         a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
+        a_lam_alpha=args.prior_a_lam_alpha,
+        c_lam_alpha=args.prior_c_lam_alpha,
+        d_lam_alpha=args.prior_d_lam_alpha,
+        a_lam_beta=args.prior_a_lam_beta,
+        c_lam_beta=args.prior_c_lam_beta,
+        d_lam_beta=args.prior_d_lam_beta,
+        a_lam_gamma=args.prior_a_lam_gamma,
+        c_lam_gamma=args.prior_c_lam_gamma,
+        d_lam_gamma=args.prior_d_lam_gamma,
         m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
         m_m0_beta=args.prior_m_m0_beta,  s_m0_beta=args.prior_s_m0_beta,
         m_m0_cos=None if pri_m_cos is None else pri_m_cos,
@@ -1171,9 +1162,6 @@ if __name__ == "__main__":
         a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
         a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
         a_P0_harm=args.prior_a_P0_harm,   b_P0_harm=args.prior_b_P0_harm,
-        ln_s_alpha_mu=args.ln_s_alpha_mu, ln_s_alpha_sd=args.ln_s_alpha_sd,
-        ln_s_beta_mu=args.ln_s_beta_mu,   ln_s_beta_sd=args.ln_s_beta_sd,
-        ln_s_gamma_mu=args.ln_s_gamma_mu, ln_s_gamma_sd=args.ln_s_gamma_sd,
     )
 
     cfg = SamplerConfig(
@@ -1181,10 +1169,9 @@ if __name__ == "__main__":
         random_seed=int(args.seed), progress=bool(args.progress),
         progress_every=int(args.progress_every),
         print_dummies_every=int(args.print_dummies_every),
-        slice_w=float(args.slice_w), slice_m=int(args.slice_m),
     )
 
-    # ---------- derive sampler seasonal inits from full-length dummies if needed ----------
+    # ---------- derive sampler seasonal inits from full-length dummies if needed ---------- #
     if (m0_cos_init is None or m0_sin_init is None) and (season_dummies is not None):
         if len(season_dummies) != args.period:
             raise ValueError(f"--season-dummies must have length period={args.period}")
@@ -1203,7 +1190,7 @@ if __name__ == "__main__":
     if args.m0_nyq_init is None:
         args.m0_nyq_init = 0.0
 
-    # ---------- sampler ----------
+    # ---------- sampler ---------- #
     sampler = DLMGibbsHarmonic(
         y=y, period=args.period,
         harmonics=args.harmonics, use_nyquist=use_nyq,
@@ -1224,17 +1211,18 @@ if __name__ == "__main__":
         print(f"\nSimulated {args.T} observations (σ={mts.sigma:.3g}) with modes "
               f"{args.level_mode}/{args.trend_mode}/{args.seasonal_mode}.")
         print(f"Harmonics: K={sampler.K}, Nyquist={sampler.use_nyq}\n"
-              f"LN priors (ln s): α~N({priors.ln_s_alpha_mu:.2f},{priors.ln_s_alpha_sd:.2f}²), "
-              f"β~N({priors.ln_s_beta_mu:.2f},{priors.ln_s_beta_sd:.2f}²), "
-              f"γ~N({priors.ln_s_gamma_mu:.2f},{priors.ln_s_gamma_sd:.2f}²)")
+              f"Double-Gamma priors (λ = 1/s²):\n"
+              f"  alpha: a={priors.a_lam_alpha:.2f}, c={priors.c_lam_alpha:.2f}, d={priors.d_lam_alpha:.2f}\n"
+              f"  beta : a={priors.a_lam_beta:.2f}, c={priors.c_lam_beta:.2f}, d={priors.d_lam_beta:.2f}\n"
+              f"  gamma: a={priors.a_lam_gamma:.2f}, c={priors.c_lam_gamma:.2f}, d={priors.d_lam_gamma:.2f}")
 
-    # ---------- run ----------
+    # ---------- run ---------- #
     t0 = time.time()
     post = sampler.run()
     elapsed = time.time() - t0
     print(f"[Run completed in {elapsed:.1f}s]")
 
-    # ---------- save ----------
+    # ---------- save ---------- #
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(
         args.out_dir,
@@ -1245,18 +1233,17 @@ if __name__ == "__main__":
         out_npz_path=os.path.join(out_dir, "posterior.npz"),
         extra_meta={
             "elapsed_seconds": float(elapsed),
-            "ln_s_priors": {
-                "alpha": {"mu": priors.ln_s_alpha_mu, "sd": priors.ln_s_alpha_sd},
-                "beta":  {"mu": priors.ln_s_beta_mu,  "sd": priors.ln_s_beta_sd},
-                "gamma": {"mu": priors.ln_s_gamma_mu, "sd": priors.ln_s_gamma_sd},
+            "double_gamma_priors": {
+                "alpha": {"a": priors.a_lam_alpha, "c": priors.c_lam_alpha, "d": priors.d_lam_alpha},
+                "beta":  {"a": priors.a_lam_beta,  "c": priors.c_lam_beta,  "d": priors.d_lam_beta},
+                "gamma": {"a": priors.a_lam_gamma, "c": priors.c_lam_gamma, "d": priors.d_lam_gamma},
             },
         },
     )
 
-    # ---------- quick summary + plot ----------
+    # ---------- quick summary + plot ---------- #
     if args.print_summary:
-        print("\
---- Posterior means ---")
+        print("\n--- Posterior means ---")
         print(f"σ = {np.mean(post['sigma']):.4f}")
         for k in ["alpha", "beta", "gamma"]:
             key = f"Q_{k}"
@@ -1272,5 +1259,6 @@ if __name__ == "__main__":
         if 'true_mu_t' in sampler.__dict__ and sampler.true_mu_t is not None:
             plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
         plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
-        plt.title(f"DLM harmonic: {args.level_mode}/{args.trend_mode}/{args.seasonal_mode} | K={sampler.K}, nyq={sampler.use_nyq}")
+        plt.title(f"DLM harmonic: {args.level_mode}/{args.trend_mode}/{args.seasonal_mode} | "
+                  f"K={sampler.K}, nyq={sampler.use_nyq}")
         plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()

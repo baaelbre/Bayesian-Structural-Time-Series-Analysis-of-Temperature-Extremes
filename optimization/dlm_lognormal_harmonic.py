@@ -966,7 +966,7 @@ if __name__ == "__main__":
 
     p.add_argument("--level-mode", choices=["dynamic", "deterministic"], default="dynamic")
     p.add_argument("--trend-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
-    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="deterministic")
+    p.add_argument("--seasonal-mode", choices=["dynamic", "deterministic", "none"], default="dynamic")
 
     p.add_argument("--q-level", type=float, default=0.05)
     p.add_argument("--q-trend", type=float, default=0.000002)
@@ -991,9 +991,9 @@ if __name__ == "__main__":
     p.add_argument("--season-dummies", type=str, default='1,1,1,-3', help="CSV length=period.")
 
     # Sampler configuration
-    p.add_argument("--n-iter", type=int, default=20000)
+    p.add_argument("--n-iter", type=int, default=10000)
     p.add_argument("--burn", type=int, default=5000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=int, default=1)
     p.add_argument("--progress-every", type=int, default=1)
@@ -1001,12 +1001,11 @@ if __name__ == "__main__":
 
     # Log-normal prior hyperparameters (process SDs)
     p.add_argument("--ln-s-alpha-mu", type=float, default=-1.0)
-    p.add_argument("--ln-s-alpha-sd", type=float, default=10.0)
-    p.add_argument("--ln-s-beta-mu",  type=float, default=-1.0)
-    p.add_argument("--ln-s-beta-sd",  type=float, default=10.0)
-    p.add_argument("--ln-s-gamma-mu", type=float, default=-1.0)
-    p.add_argument("--ln-s-gamma-sd", type=float, default=10.0)
-
+    p.add_argument("--ln-s-alpha-sd", type=float, default=2.0)
+    p.add_argument("--ln-s-beta-mu",  type=float, default=-2.0)
+    p.add_argument("--ln-s-beta-sd",  type=float, default=2.0)
+    p.add_argument("--ln-s-gamma-mu", type=float, default=-2.0)
+    p.add_argument("--ln-s-gamma-sd", type=float, default=2.0)
     # Slice controls
     p.add_argument("--slice-w", type=float, default=1.0)
     p.add_argument("--slice-m", type=int, default=10)
