@@ -1,4 +1,4 @@
-# run_uccle_harmonic_monthly.py  — monthly summaries (period = 12)
+# run_uccle_dlm_double_gamma_monthly.py  — monthly summaries (period = 12)
 import os
 from pathlib import Path
 from datetime import datetime
@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ---- import the harmonic DLM with log-normal process SDs ----
-from optimization.dlm_lognormal_harmonic import (
-    DLMGibbsHarmonic,
+# ---- import the non-centred DLM with double-gamma prior and dummy seasonality ----
+from optimization.dlm_doublegamma_dummy_nc import (
+    DLMGibbsConjugate,
     Priors,
     SamplerConfig,
 )
@@ -124,7 +124,8 @@ def run_one(
     seasonal_mode: str = "dynamic",
 ) -> None:
     """
-    Run the harmonic DLM (cos/sin + optional Nyquist) on a single *monthly* series.
+    Run the non-centred DLM with dummy monthly seasonality and double-gamma
+    global–local prior on process SDs for a single *monthly* series.
 
     Parameters
     ----------
@@ -135,82 +136,83 @@ def run_one(
     out_root : Path
         Base directory (e.g., results/uccle/TX/TXm/Monthly or results/uccle/TN/TNm/Monthly).
     level_mode, trend_mode, seasonal_mode : str
-        Mode strings passed to DLMGibbsHarmonic and used in filenames.
+        Mode strings passed to DLMGibbsConjugate and used in filenames
+        (currently enforced to be "dynamic"/"dynamic"/"dynamic").
     """
     y = y_ser.to_numpy(dtype=float)
     period = 12  # 12 months per year
 
-    # ----- Priors (log-normal on process SDs + weak-normal on m0) ----- #
+    # ----- Priors: double-gamma on process SDs, weak normals on baselines ----- #
+    # m0_gamma has length period-1, newest-first seasonal baseline parameters.
+    m0_gamma_prior = [0.0] * (period - 1)
+
     pri = Priors(
         a_sigma=2.0,
         b_sigma=2.0,
-        # m0 priors (weak)
+        # m0 priors (weak, centred near 0; the data scale will dominate)
         m_m0_alpha=0.0,
         s_m0_alpha=10.0,
         m_m0_beta=0.0,
         s_m0_beta=10.0,
-        # harmonic m0 priors (cos/sin/nyq); keep mean 0, moderately vague SD
-        m_m0_nyq=0.0,
-        s_m0_harm=5.0,
-        m_m0_cos=None,  # default: zeros
-        m_m0_sin=None,  # default: zeros
-        # P0 priors (Inv-Gamma)
+        m_m0_gamma=m0_gamma_prior,
+        s_m0_gamma=5.0,
+        # P0 priors (kept for compatibility / storage; not updated in NCP scheme)
         a_P0_alpha=5.0,
         b_P0_alpha=1.0,
         a_P0_beta=5.0,
         b_P0_beta=1.0,
-        a_P0_harm=5.0,
-        b_P0_harm=1.0,
-        # log-normal priors for process SDs (ln s ~ N(mu, sd^2))
-        ln_s_alpha_mu=-3.0,
-        ln_s_alpha_sd=1.0,
-        ln_s_beta_mu=-4.0,
-        ln_s_beta_sd=1.0,
-        ln_s_gamma_mu=-4.0,
-        ln_s_gamma_sd=1.0,
+        a_P0_gamma=5.0,
+        b_P0_gamma=1.0,
+        # Double-gamma hyperparameters: relatively mild shrinkage
+        a_xi=1.0,
+        b_xi=1.0,
+        a_tau=1.0,
+        b_tau=1.0,
     )
 
     # ----- Sampler configuration ----- #
     cfg = SamplerConfig(
-        n_iter=50000,
-        burn=10000,
+        n_iter=10000,
+        burn=5000,
         thin=1,
         random_seed=42,
         progress=True,
-        progress_every=10,
-        print_dummies_every=0,  # set >0 if you want reconstructed monthly dummies printed
-        slice_w=3.0,
-        slice_m=50,
+        progress_every=1,
     )
 
     # ----- Initial values ----- #
+    # Observation variance initial guess: fraction of empirical variance
     sigma2_init = float(np.var(y) * 0.1) if len(y) > 1 else 1.0
     modes_tag = f"{level_mode}_{trend_mode}_{seasonal_mode}"
 
-    # For period=12, harmonics=None ⇒ use the sampler’s full harmonic basis.
-    sampler = DLMGibbsHarmonic(
+    # Rough initial level = mean of first year; trend = 0
+    init_level = float(np.mean(y[: min(len(y), period)])) if len(y) >= period else float(np.mean(y))
+    init_trend = 0.0
+
+    # Process SD initial guesses: small random-walk noise
+    s_alpha_init = 1e-2
+    s_beta_init = 1e-3
+    s_gamma_init = 1e-3
+
+    sampler = DLMGibbsConjugate(
         y=y,
         period=period,
-        harmonics=None,       # use full harmonic basis for monthly cycle
-        use_nyquist=None,     # let the sampler decide (True for even s when appropriate)
         level_mode=level_mode,
         trend_mode=trend_mode,
         seasonal_mode=seasonal_mode,
         # initial means/vars for dynamic level/trend
-        m0_alpha_init=float(np.mean(y[: min(len(y), period)])),  # roughly first year
+        m0_alpha_init=init_level,
         P0_alpha_init=0.25,
-        m0_beta_init=0.0,
+        m0_beta_init=init_trend,
         P0_beta_init=0.05,
-        # seasonal initialisation: defaults to zero means for harmonics
-        m0_cos_init=None,
-        m0_sin_init=None,
-        m0_nyq_init=0.0,
-        P0_harm_init=0.25,
+        # seasonal baseline initialisation: let the sampler start at zeros
+        m0_gamma_init=None,   # defaults to zeros of length period-1
+        P0_gamma_init=0.25,
         # observation variance + process SD inits
         sigma2_init=sigma2_init,
-        s_alpha_init=1e-2,
-        s_beta_init=1e-2,
-        s_gamma_init=1e-2,
+        s_alpha_init=s_alpha_init,
+        s_beta_init=s_beta_init,
+        s_gamma_init=s_gamma_init,
         priors=pri,
         cfg=cfg,
     )
@@ -225,7 +227,7 @@ def run_one(
     _ensure_dir(outdir)
 
     # ----- Run sampler ----- #
-    print(f"Running monthly harmonic DLM for {series} with modes={modes_tag} ...")
+    print(f"Running monthly non-centred DLM (double-gamma, dummies) for {series} with modes={modes_tag} ...")
     t0 = datetime.now().timestamp()
     post = sampler.run()
     elapsed = datetime.now().timestamp() - t0
@@ -248,13 +250,21 @@ def run_one(
                 "seasonal_mode": seasonal_mode,
             },
             "description": (
-                "Gaussian DLM with harmonic monthly seasonality (cos/sin + Nyquist), "
-                "dynamic level/trend/season, log-normal priors on process SDs."
+                "Gaussian DLM with dummy monthly seasonality, "
+                "dynamic level/trend/season, non-centred parametrisation, "
+                "double-gamma global-local prior on process SDs "
+                "s_k | ξ_k, τ, σ² ~ N(0, σ² / (ξ_k τ))."
             ),
             "period": period,
             "date_tag": date_tag,
             "elapsed_seconds": float(elapsed),
             "timestamp": datetime.now().isoformat(),
+            "double_gamma_priors": {
+                "a_xi": pri.a_xi,
+                "b_xi": pri.b_xi,
+                "a_tau": pri.a_tau,
+                "b_tau": pri.b_tau,
+            },
         },
     )
 
@@ -266,8 +276,8 @@ def run_one(
     plt.plot(t_index, y, label=f"{series}")
     plt.plot(t_index, mu_hat, "-.", label="μ̂_t")
     plt.title(
-        f"{series}: monthly harmonic DLM (L/T/S={modes_tag}, "
-        f"s={period}, K={sampler.K}, nyq={sampler.use_nyq})"
+        f"{series}: monthly DLM with dummy seasonality "
+        f"(L/T/S={modes_tag}, period={period})"
     )
     plt.grid(True)
     plt.legend()
@@ -296,7 +306,7 @@ def main() -> None:
     tx_root = _series_out_root("TXm")  # results/uccle/TX/TXm/Monthly
     tn_root = _series_out_root("TNm")  # results/uccle/TN/TNm/Monthly
 
-    # Modes (can edit here if you want to experiment later)
+    # Modes (for now, dynamic/dynamic/dynamic only; enforced inside DLMGibbsConjugate)
     level_mode = "dynamic"
     trend_mode = "dynamic"
     seasonal_mode = "dynamic"

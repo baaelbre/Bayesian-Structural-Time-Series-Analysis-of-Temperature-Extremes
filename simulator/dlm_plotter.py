@@ -95,7 +95,7 @@ def _maybe(a: Dict[str, Any], k: str):
 class DLMPlotter:
     """
     Generic plotter for posterior bundles from Gaussian DLM samplers
-    (including the FS-prior non-centred version and older variants).
+    (including the FS-prior non-centred version, double-gamma, and older variants).
 
     It introspects the contents of 'draws' and tries to:
 
@@ -107,6 +107,7 @@ class DLMPlotter:
       - Plot trace + hist + ACF for *signed* process SDs s_alpha, s_beta, s_gamma
         if present (FS style, ±√Q).
       - Plot state ribbons (μ, α, β, last seasonal γ) from 'x' if available.
+      - Plot correlation scatter matrices for signed SDs, m0_*, and joint m0_*–s_*.
 
     Expected keys (flexible; many are optional):
 
@@ -115,9 +116,9 @@ class DLMPlotter:
         - y: (T,)
         - x: (S, T, dim)   (optional; centred state draws)
 
-      Parameters (FS-version):
+      Parameters (FS/double-gamma version):
         - sigma: (S,)
-        - s_alpha, s_beta, s_gamma: (S,)  signed process SDs (FS)
+        - s_alpha, s_beta, s_gamma: (S,)  signed process SDs
         - Q_alpha, Q_beta, Q_gamma: (S,)
         - m0_alpha, m0_beta: (S,)
         - m0_gamma: (S, K) with K = period-1
@@ -230,7 +231,7 @@ class DLMPlotter:
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # Convenience aliases for FS-style outputs (if present)
+        # Convenience aliases for FS-style / double-gamma outputs (if present)
         self.Q_alpha = _maybe(self.scalar_params, "Q_alpha")
         self.Q_beta = _maybe(self.scalar_params, "Q_beta")
         self.Q_gamma = _maybe(self.scalar_params, "Q_gamma")
@@ -241,10 +242,16 @@ class DLMPlotter:
         self.P0_gamma = _maybe(self.scalar_params, "P0_gamma")
         self.m0_gamma = _maybe(self.vector_params, "m0_gamma")
 
-        # Signed process SDs (Fruhwirth-Schnatter style, s_k with Q_k = s_k^2)
+        # Signed process SDs (Fruhwirth-Schnatter / double-gamma style, s_k with Q_k = s_k^2)
         self.s_alpha = _maybe(self.scalar_params, "s_alpha")
         self.s_beta = _maybe(self.scalar_params, "s_beta")
         self.s_gamma = _maybe(self.scalar_params, "s_gamma")
+
+        # Double-gamma scales (if present)
+        self.xi_alpha = _maybe(self.scalar_params, "xi_alpha")
+        self.xi_beta = _maybe(self.scalar_params, "xi_beta")
+        self.xi_gamma = _maybe(self.scalar_params, "xi_gamma")
+        self.tau = _maybe(self.scalar_params, "tau")
 
         # Build unified process variance matrix Q (S, K_Q) if available
         self.Q = None
@@ -337,6 +344,72 @@ class DLMPlotter:
         if key == "gamma" and self.idx_g_end is not None:
             return self.draws["x"][:, :, self.idx_g_end]
         return None
+
+    def _scatter_matrix(
+        self,
+        data: np.ndarray,
+        labels: List[str],
+        title: str,
+        fname: str,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+    ) -> None:
+        """
+        Simple scatter-matrix:
+          - diagonal: histogram
+          - off-diagonal: scatter with Pearson ρ annotated
+        """
+        data = np.asarray(data, float)
+        n = data.shape[1]
+        if n < 2:
+            print(f"[corr] not enough variables for {title}, need at least 2.")
+            return
+
+        fig, axes = plt.subplots(n, n, figsize=(3.0 * n, 3.0 * n))
+        for i in range(n):
+            for j in range(n):
+                ax = axes[i, j]
+                x = data[:, j]
+                y = data[:, i]
+
+                if i == j:
+                    ax.hist(x, bins=40, density=True)
+                    ax.set_ylabel(labels[i])
+                else:
+                    ax.scatter(x, y, s=4, alpha=0.4)
+                    # Pearson correlation (guard against NaNs / constants)
+                    if np.std(x) > 1e-12 and np.std(y) > 1e-12:
+                        r = float(np.corrcoef(x, y)[0, 1])
+                    else:
+                        r = float("nan")
+                    ax.text(
+                        0.05,
+                        0.9,
+                        f"ρ={r:.2f}" if np.isfinite(r) else "ρ=NA",
+                        transform=ax.transAxes,
+                        ha="left",
+                        va="top",
+                        fontsize=8,
+                    )
+
+                # tidy ticks
+                if i < n - 1:
+                    ax.set_xticklabels([])
+                if j > 0:
+                    ax.set_yticklabels([])
+
+        fig.suptitle(title)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if save_dir:
+            _ensure_dir(save_dir)
+            path = os.path.join(save_dir, fname)
+            fig.savefig(path, dpi=200, bbox_inches="tight")
+            print(f"[save] {path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
 
     # ---------- figures ----------
     def figure_overview(
@@ -444,7 +517,7 @@ class DLMPlotter:
 
           - σ
           - signed process SDs s_alpha, s_beta, s_gamma (if present)
-            (Fruhwirth-Schnatter style, ±√Q)
+            (Fruhwirth-Schnatter style / double-gamma, ±√Q)
           - log10 Q for remaining Q-coordinates (for which no signed s_* exist)
           - λ_α, λ_β, λ_γ (if present)
           - any other scalar posterior array (shape (S,))
@@ -459,7 +532,7 @@ class DLMPlotter:
                 show=show,
             )
 
-        # Signed process SDs: s_alpha, s_beta, s_gamma (preferred over Q for FS)
+        # Signed process SDs: s_alpha, s_beta, s_gamma
         if self.s_alpha is not None:
             self._trace_hist_acf_panel(
                 self.s_alpha,
@@ -545,6 +618,10 @@ class DLMPlotter:
             "lambda_alpha",
             "lambda_beta",
             "lambda_gamma",
+            "xi_alpha",
+            "xi_beta",
+            "xi_gamma",
+            "tau",
         }
         for key, arr in sorted(self.scalar_params.items()):
             if key in skip_keys:
@@ -644,6 +721,129 @@ class DLMPlotter:
         else:
             plt.close(fig)
 
+    def figure_correlations(
+        self,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+        max_vars: int = 6,
+    ) -> None:
+        """
+        Correlation plots (scatter matrices) for:
+
+          1) Signed process SDs: s_alpha, s_beta, s_gamma (if >= 2 exist).
+          2) Baselines m0_*: m0_alpha, m0_beta, m0_gamma[j] (if >= 2 exist).
+          3) Joint m0_* and signed SDs (if >= 2 total).
+
+        max_vars limits the dimensionality of each scatter matrix
+        (if there are more variables, the first max_vars are used).
+        """
+        # --------- 1) Signed process SDs only ---------
+        cols_s: List[np.ndarray] = []
+        labels_s: List[str] = []
+        if self.s_alpha is not None:
+            cols_s.append(self.s_alpha)
+            labels_s.append("s_alpha")
+        if self.s_beta is not None:
+            cols_s.append(self.s_beta)
+            labels_s.append("s_beta")
+        if self.s_gamma is not None:
+            cols_s.append(self.s_gamma)
+            labels_s.append("s_gamma")
+
+        if len(cols_s) >= 2:
+            data_s = np.column_stack(cols_s)
+            if data_s.shape[1] > max_vars:
+                print(f"[corr] s_*: limiting to first {max_vars} variables.")
+                data_s = data_s[:, :max_vars]
+                labels_s = labels_s[:max_vars]
+            self._scatter_matrix(
+                data_s,
+                labels_s,
+                title="Correlation: signed process SDs",
+                fname="corr_s_scatter_matrix.png",
+                save_dir=save_dir,
+                show=show,
+            )
+        else:
+            print("[corr] fewer than 2 signed process SDs; skipping s_* correlation plot.")
+
+        # --------- 2) m0_* only ---------
+        cols_m0: List[np.ndarray] = []
+        labels_m0: List[str] = []
+        if self.m0_alpha is not None:
+            cols_m0.append(self.m0_alpha)
+            labels_m0.append("m0_alpha")
+        if self.m0_beta is not None:
+            cols_m0.append(self.m0_beta)
+            labels_m0.append("m0_beta")
+        if self.m0_gamma is not None:
+            K = self.m0_gamma.shape[1]
+            for k in range(K):
+                cols_m0.append(self.m0_gamma[:, k])
+                labels_m0.append(f"m0_gamma[{k}]")
+
+        if len(cols_m0) >= 2:
+            data_m0 = np.column_stack(cols_m0)
+            if data_m0.shape[1] > max_vars:
+                print(f"[corr] m0_*: limiting to first {max_vars} variables.")
+                data_m0 = data_m0[:, :max_vars]
+                labels_m0 = labels_m0[:max_vars]
+            self._scatter_matrix(
+                data_m0,
+                labels_m0,
+                title="Correlation: baselines m0_*",
+                fname="corr_m0_scatter_matrix.png",
+                save_dir=save_dir,
+                show=show,
+            )
+        else:
+            print("[corr] fewer than 2 m0_* variables; skipping m0 correlation plot.")
+
+        # --------- 3) Joint m0_* and signed SDs ---------
+        cols_joint: List[np.ndarray] = []
+        labels_joint: List[str] = []
+
+        # m0_* first
+        if self.m0_alpha is not None:
+            cols_joint.append(self.m0_alpha)
+            labels_joint.append("m0_alpha")
+        if self.m0_beta is not None:
+            cols_joint.append(self.m0_beta)
+            labels_joint.append("m0_beta")
+        if self.m0_gamma is not None:
+            K = self.m0_gamma.shape[1]
+            for k in range(K):
+                cols_joint.append(self.m0_gamma[:, k])
+                labels_joint.append(f"m0_gamma[{k}]")
+
+        # then signed SDs
+        if self.s_alpha is not None:
+            cols_joint.append(self.s_alpha)
+            labels_joint.append("s_alpha")
+        if self.s_beta is not None:
+            cols_joint.append(self.s_beta)
+            labels_joint.append("s_beta")
+        if self.s_gamma is not None:
+            cols_joint.append(self.s_gamma)
+            labels_joint.append("s_gamma")
+
+        if len(cols_joint) >= 2:
+            data_joint = np.column_stack(cols_joint)
+            if data_joint.shape[1] > max_vars:
+                print(f"[corr] m0_* + s_*: limiting to first {max_vars} variables.")
+                data_joint = data_joint[:, :max_vars]
+                labels_joint = labels_joint[:max_vars]
+            self._scatter_matrix(
+                data_joint,
+                labels_joint,
+                title="Correlation: m0_* and signed process SDs",
+                fname="corr_m0_s_scatter_matrix.png",
+                save_dir=save_dir,
+                show=show,
+            )
+        else:
+            print("[corr] fewer than 2 total variables; skipping joint m0_*–s_* correlation plot.")
+
     def quick_report(
         self,
         save_dir: Optional[str] = None,
@@ -709,9 +909,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "DLM plotter for Gaussian structural models (FS or legacy).\n"
+            "DLM plotter for Gaussian structural models (FS, double-gamma, or legacy).\n"
             "Loads a posterior bundle via optimization/posterior_bundle "
-            "and produces overview, scalars (trace+hist+ACF), and state plots."
+            "and produces overview, scalars (trace+hist+ACF), correlation, and state plots."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -761,6 +961,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip quick 1x3 panel.",
     )
+    parser.add_argument(
+        "--skip-corr",
+        action="store_true",
+        help="Skip correlation scatter-matrix plots (m0_*, s_* and joint).",
+    )
     args = parser.parse_args()
 
     # Resolve run path using helper
@@ -795,6 +1000,9 @@ if __name__ == "__main__":
 
     if not args.skip_states:
         plotter.figure_states(save_dir=out_dir, fname_prefix="states", show=args.show)
+
+    if not args.skip_corr:
+        plotter.figure_correlations(save_dir=out_dir, show=args.show)
 
     if not args.skip_quick:
         plotter.quick_report(save_dir=out_dir, fname_prefix="quick_report", show=args.show)

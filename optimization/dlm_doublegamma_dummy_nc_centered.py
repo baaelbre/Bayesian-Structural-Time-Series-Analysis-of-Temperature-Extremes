@@ -43,6 +43,14 @@ class Priors:
     m_m0_gamma: Optional[Sequence[float]] = None  # len p-1 (newest-first)
     s_m0_gamma: float = 5.0
 
+    # Initial-state variances P0 ~ InvGamma(a, b)  (kept for compatibility / storage)
+    a_P0_alpha: float = 2.0
+    b_P0_alpha: float = 1.0
+    a_P0_beta:  float = 2.0
+    b_P0_beta:  float = 1.0
+    a_P0_gamma: float = 2.0
+    b_P0_gamma: float = 1.0  # shared across p-1 seasonal coords
+
     # Double-gamma hyperparameters for process SDs:
     # s_k | ξ_k, τ, σ² ~ N(0, σ² / (ξ_k τ))
     # ξ_k ~ Gamma(a_xi, b_xi),  τ ~ Gamma(a_tau, b_tau)
@@ -113,6 +121,17 @@ class DLMGibbsConjugate:
         self.period = int(period)
         if self.period < 2:
             raise ValueError("period must be >= 2")
+        # Precompute time indices and their centred version for regression
+        # t = 1,...,T,  t̄ = mean(t),  t_c = t - t̄
+                # Precompute time indices and their centred version for regression
+        # t = 1,...,T,  t̄ = mean(t),  t_c = t - t̄
+        self._t_idx = np.arange(1, self.T + 1, dtype=float)
+        self._t_mean = float(self._t_idx.mean())
+        self._t_centered = self._t_idx - self._t_mean
+
+        self._t_mean = float(self._t_idx.mean())
+        self._t_centered = self._t_idx - self._t_mean
+
 
         # Enforce dynamic/dynamic/dynamic only
         if not (level_mode == trend_mode == seasonal_mode == "dynamic"):
@@ -170,7 +189,7 @@ class DLMGibbsConjugate:
                 raise ValueError("m0_gamma_init must have length p-1 (NEWEST-FIRST)")
             self.m0_gamma = g
 
-        # P0 is not updated in NCP.
+        # We keep P0_* for compatibility / storage, but do not update them in NCP.
         self.P0_alpha = float(P0_alpha_init)
         self.P0_beta = float(P0_beta_init)
         self.P0_gamma = float(P0_gamma_init)
@@ -437,7 +456,7 @@ class DLMGibbsConjugate:
         H_vec[self.idx_tilde_g_start] = self.s_gamma
         H = H_vec.reshape(1, -1)
 
-        t_idx = np.arange(1, T + 1, dtype=float)
+        t_idx = self._t_idx  # 1..T (uncentred, for the *state* model)
         S = self._season_design
 
         # Forward pass
@@ -487,15 +506,25 @@ class DLMGibbsConjugate:
     # --------------- Joint regression update for (m0_*, s_*) --------------- #
     def update_beta_fs(self) -> None:
         """
-        Gaussian regression update (FS style), but with double-gamma prior on s_k:
+        Gaussian regression update (FS style), but with double-gamma prior on s_k.
+
+        We reparametrise the static part to use *centred* time
+            t_c = t - t̄,  t = 1,...,T,  t̄ = mean(t),
+        in the regression, and then transform back to the original
+        (m0_alpha, m0_beta) parametrisation:
 
             y_t = m0_alpha + t m0_beta + S[t,:] @ m0_gamma
                   + s_alpha * tilde_alpha_t + s_beta * A_t + s_gamma * tilde_gamma1_t
                   + ε_t,
 
-        with Normal priors:
-          - (m0_alpha, m0_beta, m0_gamma) ~ N(m_prior, diag(s_m0_*^2)),
-          - s_k | ξ_k, τ, σ² ~ N(0, σ² / (ξ_k τ)).
+        But internally we regress on:
+
+            y_t = α_c + β_c * t_c + S[t,:] @ m0_gamma + ...
+                  with  α_c = m0_alpha + t̄ m0_beta,
+                       β_c = m0_beta.
+
+        Prior is specified on (m0_alpha, m0_beta) and transformed to (α_c, β_c),
+        yielding a correlated 2×2 prior block.
         """
         if self.dim_ncp == 0:
             return
@@ -505,7 +534,10 @@ class DLMGibbsConjugate:
         iA = self.idx_A
         gs = self.idx_tilde_g_start
 
-        t_idx = np.arange(1, T + 1, dtype=float)
+        # Precomputed time indices
+        t_idx = self._t_idx          # 1..T
+        t_c = self._t_centered       # centred time
+        t_bar = self._t_mean
         S = self._season_design
 
         tilde_alpha = self.z[1:, ia]
@@ -513,22 +545,34 @@ class DLMGibbsConjugate:
         tilde_gamma1 = self.z[1:, gs]
 
         # Design matrix:
-        #   X_static = [1, t, S[t,:]]  (for m0_alpha, m0_beta, m0_gamma)
+        #   X_static = [1, t_c, S[t,:]]  (for α_c, β_c, m0_gamma)
         #   X_dyn    = [tilde_alpha_t, A_t, tilde_gamma1_t] (for s_alpha, s_beta, s_gamma)
         if self.K_gamma > 0:
-            X_static = np.column_stack([np.ones(T, float), t_idx, S])
+            X_static = np.column_stack([np.ones(T, float), t_c, S])
         else:
-            X_static = np.column_stack([np.ones(T, float), t_idx])
+            X_static = np.column_stack([np.ones(T, float), t_c])
         X_dyn = np.column_stack([tilde_alpha, A_t, tilde_gamma1])
         X = np.column_stack([X_static, X_dyn])  # shape (T, 2 + K_gamma + 3)
 
         y = self.y
         d = X.shape[1]  # = 2 + K_gamma + 3
 
-        # Prior mean vector
+        # ----- Prior mean: specified on (m0_alpha, m0_beta), then transformed to (α_c, β_c) -----
+        m_alpha0 = self.priors.m_m0_alpha
+        m_beta0  = self.priors.m_m0_beta
+        s_alpha0 = self.priors.s_m0_alpha
+        s_beta0  = self.priors.s_m0_beta
+
+        # Transformation:
+        #   α_c = m0_alpha + t̄ m0_beta
+        #   β_c = m0_beta
+        m_alpha_c = m_alpha0 + t_bar * m_beta0
+        m_beta_c  = m_beta0
+
+        # Prior mean vector in centred parametrisation
         m_prior = np.zeros(d, float)
-        m_prior[0] = self.priors.m_m0_alpha
-        m_prior[1] = self.priors.m_m0_beta
+        m_prior[0] = m_alpha_c
+        m_prior[1] = m_beta_c
 
         if self.K_gamma > 0:
             if self.priors.m_m0_gamma is not None:
@@ -538,52 +582,82 @@ class DLMGibbsConjugate:
             else:
                 m_gamma_prior = np.zeros(self.K_gamma, float)
             m_prior[2 : 2 + self.K_gamma] = m_gamma_prior
+        else:
+            m_gamma_prior = np.zeros(0, float)
 
-        # Prior variances (diagonal)
-        s2_prior = np.zeros(d, float)
+        # ----- Prior covariance: transform diagonal prior on (m0_alpha, m0_beta)
+        #       to a correlated prior on (α_c, β_c) -----
         eps = 1e-12
-        # Baselines (independent of σ²)
-        s2_prior[0] = self.priors.s_m0_alpha**2
-        s2_prior[1] = self.priors.s_m0_beta**2
+        V_prior = np.zeros((d, d), float)
+
+        # Original independent prior:
+        #   m0_alpha ~ N(m_alpha0, s_alpha0^2)
+        #   m0_beta  ~ N(m_beta0,  s_beta0^2)
+        # Under α_c = m0_alpha + t̄ m0_beta, β_c = m0_beta we have:
+        #   Var(α_c) = s_alpha0^2 + t̄^2 s_beta0^2
+        #   Var(β_c) = s_beta0^2
+        #   Cov(α_c, β_c) = t̄ s_beta0^2
+        var_alpha_c = s_alpha0**2 + (t_bar**2) * s_beta0**2
+        var_beta_c  = s_beta0**2
+        cov_alpha_beta = t_bar * (s_beta0**2)
+
+        V_prior[0, 0] = max(var_alpha_c, eps)
+        V_prior[1, 1] = max(var_beta_c, eps)
+        V_prior[0, 1] = cov_alpha_beta
+        V_prior[1, 0] = cov_alpha_beta
+
+        # Seasonal baselines: independent with variance s_m0_gamma^2
         if self.K_gamma > 0:
-            s2_prior[2 : 2 + self.K_gamma] = self.priors.s_m0_gamma**2
+            for k in range(self.K_gamma):
+                idx = 2 + k
+                V_prior[idx, idx] = max(self.priors.s_m0_gamma**2, eps)
 
         # Process SDs: s_k | ξ_k, τ, σ² ~ N(0, σ² / (ξ_k τ))
         idx_s_alpha = 2 + self.K_gamma
         idx_s_beta  = 3 + self.K_gamma
         idx_s_gamma = 4 + self.K_gamma
 
-        # avoid division by zero
+        sigma2 = self.sigma2
         denom_alpha = max(self.xi_alpha * self.tau, eps)
         denom_beta  = max(self.xi_beta  * self.tau, eps)
         denom_gamma = max(self.xi_gamma * self.tau, eps)
 
-        s2_prior[idx_s_alpha] = self.sigma2 / denom_alpha
-        s2_prior[idx_s_beta]  = self.sigma2 / denom_beta
-        s2_prior[idx_s_gamma] = self.sigma2 / denom_gamma
+        V_prior[idx_s_alpha, idx_s_alpha] = max(sigma2 / denom_alpha, eps)
+        V_prior[idx_s_beta,  idx_s_beta]  = max(sigma2 / denom_beta,  eps)
+        V_prior[idx_s_gamma, idx_s_gamma] = max(sigma2 / denom_gamma, eps)
 
-        s2_prior = np.maximum(s2_prior, eps)
-        V_prior = np.diag(s2_prior)
+        # Small ridge on diagonal for numerical stability
+        V_prior += eps * np.eye(d)
 
         XtX = X.T @ X
         Xt_y = X.T @ y
-        sigma2 = self.sigma2
 
-        V_prior_inv = np.linalg.inv(V_prior)
+        V_prior_inv = _spd_solve(V_prior, np.eye(d))
         prec_post = XtX / sigma2 + V_prior_inv
         cov_post = _spd_solve(prec_post, np.eye(d))
         mean_post = cov_post @ (Xt_y / sigma2 + V_prior_inv @ m_prior)
 
         beta = np.random.multivariate_normal(mean_post, cov_post)
 
-        # Assign back to parameters
-        self.m0_alpha = float(beta[0])
-        self.m0_beta = float(beta[1])
+        # ----- Transform back: (α_c, β_c) -> (m0_alpha, m0_beta) -----
+        alpha_c_hat = beta[0]
+        beta_c_hat  = beta[1]
+
+        # Inverse transform:
+        #   m0_beta  = β_c
+        #   m0_alpha = α_c - t̄ β_c
+        self.m0_beta  = float(beta_c_hat)
+        self.m0_alpha = float(alpha_c_hat - t_bar * beta_c_hat)
+
+        # Seasonal baselines
         if self.K_gamma > 0:
             self.m0_gamma = beta[2 : 2 + self.K_gamma].copy()
+
+        # Process SDs (signed)
         self.s_alpha = float(beta[idx_s_alpha])
         self.s_beta  = float(beta[idx_s_beta])
         self.s_gamma = float(beta[idx_s_gamma])
+
 
     # --------------- Double-gamma local/global scale updates --------------- #
     def update_double_gamma_scales(self) -> None:
@@ -685,10 +759,10 @@ class DLMGibbsConjugate:
         parts.append(f"Qα={self.s_alpha**2:.4g}")
         parts.append(f"Qβ={self.s_beta**2:.4g}")
         parts.append(f"Qγ={self.s_gamma**2:.4g}")
-        parts.append(f"m0α={self.m0_alpha:.4g}")
-        parts.append(f"m0β={self.m0_beta:.4g}")
+        parts.append(f"m0α={self.m0_alpha:.4g} P0α={self.P0_alpha:.4g}")
+        parts.append(f"m0β={self.m0_beta:.4g} P0β={self.P0_beta:.4g}")
         g = self._fmt_list(self.m0_gamma, 6, ".4g")
-        parts.append(f"m0γ={g}")
+        parts.append(f"m0γ={g} P0γ={self.P0_gamma:.4g}")
         parts.append(f"τ={self.tau:.4g}")
         parts.append(
             "ξ=["
@@ -880,11 +954,11 @@ if __name__ == "__main__":
     p.add_argument("--start-date", type=str, default="2000-01-01")
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.001)
-    p.add_argument("--q-trend", type=float, default=0.00002)
+    p.add_argument("--q-trend", type=float, default=0.0000002)
     p.add_argument("--q-season", type=float, default=0.00005)
     p.add_argument("--m0-level", type=float, default=3.0)
     p.add_argument("--v0-level", type=float, default=0.05)
-    p.add_argument("--m0-trend", type=float, default=1)
+    p.add_argument("--m0-trend", type=float, default=.01)
     p.add_argument("--v0-trend", type=float, default=0.05)
     p.add_argument("--m0-season", type=str, default=None)
     p.add_argument("--v0-season", type=str, default=None)
@@ -906,15 +980,15 @@ if __name__ == "__main__":
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
 
     # Double-gamma hyperparameters
-    p.add_argument("--prior-a-xi", type=float, default=0.5)
-    p.add_argument("--prior-b-xi", type=float, default=0.5)
-    p.add_argument("--prior-a-tau", type=float, default=0.5)
-    p.add_argument("--prior-b-tau", type=float, default=0.5)
+    p.add_argument("--prior-a-xi", type=float, default=1.0)
+    p.add_argument("--prior-b-xi", type=float, default=1.0)
+    p.add_argument("--prior-a-tau", type=float, default=1.0)
+    p.add_argument("--prior-b-tau", type=float, default=1.0)
 
     # Sampler configuration
     p.add_argument("--n-iter", type=int, default=10000)
     p.add_argument("--burn", type=int, default=5000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
@@ -978,6 +1052,9 @@ if __name__ == "__main__":
         m_m0_beta=args.prior_m_m0_beta,   s_m0_beta=args.prior_s_m0_beta,
         m_m0_gamma=pri_gamma_vec,
         s_m0_gamma=args.prior_s_m0_gamma,
+        a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
+        a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
+        a_P0_gamma=args.prior_a_P0_gamma, b_P0_gamma=args.prior_b_P0_gamma,
         a_xi=args.prior_a_xi, b_xi=args.prior_b_xi,
         a_tau=args.prior_a_tau, b_tau=args.prior_b_tau,
     )

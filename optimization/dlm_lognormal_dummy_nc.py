@@ -25,7 +25,7 @@ def _spd_solve(M: np.ndarray, B: np.ndarray, eps: float = 1e-10) -> np.ndarray:
     return np.linalg.pinv(M) @ B
 
 # =============================================================================
-# Priors & Config (FS: Normal priors on process SDs)
+# Priors & Config (FS: Normal priors on m0 and process SDs)
 # =============================================================================
 
 @dataclass
@@ -34,13 +34,14 @@ class Priors:
     a_sigma: float = 2.0
     b_sigma: float = 1.0
 
-    # m0 priors (used for static level/trend/seasonal baselines)
+    # m0 priors (static level/trend/seasonal baselines):
+    #   m0_k | σ² ~ N(m_m0_k, B0_m0_k * σ²)
     m_m0_alpha: float = 0.0
-    s_m0_alpha: float = 10.0
+    B0_m0_alpha: float = 100.0  # variance factor for level baseline
     m_m0_beta: float  = 0.0
-    s_m0_beta: float  = 10.0
+    B0_m0_beta: float  = 100.0  # variance factor for trend baseline
     m_m0_gamma: Optional[Sequence[float]] = None  # len p-1 (newest-first)
-    s_m0_gamma: float = 5.0
+    B0_m0_gamma: float = 25.0   # variance factor for seasonal baselines
 
     # Initial-state variances P0 ~ InvGamma(a, b)  (kept for compatibility / storage)
     a_P0_alpha: float = 2.0
@@ -71,7 +72,7 @@ class SamplerConfig:
 
 
 # =============================================================================
-# DLM Sampler (FS Normal priors on process SDs + joint regression update)
+# DLM Sampler (FS Normal priors on m0 & process SDs + joint regression update)
 # =============================================================================
 
 class DLMGibbsConjugate:
@@ -79,7 +80,9 @@ class DLMGibbsConjugate:
     Gaussian structural DLM with:
       • Non-centred parametrisation of the latent states (tilde alpha, tilde beta, A, tilde gamma).
       • FFBS on the non-centred state with fixed transition G_tilde and unit process covariance Q_tilde.
-      • FS-style Normal priors on process SDs s_k | σ² ~ N(0, B0_s_k σ²).
+      • FS-style Normal priors:
+           m0_k | σ² ~ N(m_m0_k, B0_m0_k σ²),
+           s_k  | σ² ~ N(0,       B0_s_k  σ²).
       • Joint Gaussian regression update for (m0_alpha, m0_beta, m0_gamma, s_alpha, s_beta, s_gamma).
       • Random sign switches on (s_alpha, s_beta, s_gamma) and corresponding NCP states.
 
@@ -490,7 +493,7 @@ class DLMGibbsConjugate:
                   + ε_t,
 
         with Normal priors:
-          - (m0_alpha, m0_beta, m0_gamma) ~ N(m_prior, diag(s_m0_*^2))
+          - (m0_alpha, m0_beta, m0_gamma) | σ² ~ N(m_prior, diag(B0_m0_* σ²))
           - s_k | σ² ~ N(0, B0_s_k σ²).
         """
         if self.dim_ncp == 0:
@@ -520,6 +523,7 @@ class DLMGibbsConjugate:
 
         y = self.y
         d = X.shape[1]  # = 2 + K_gamma + 3
+        sigma2 = self.sigma2
 
         # Prior mean vector
         m_prior = np.zeros(d, float)
@@ -537,20 +541,20 @@ class DLMGibbsConjugate:
 
         # Prior variances (diagonal)
         s2_prior = np.zeros(d, float)
-        # Baselines (independent of σ²)
-        s2_prior[0] = self.priors.s_m0_alpha**2
-        s2_prior[1] = self.priors.s_m0_beta**2
+        # Baselines (scaled by σ²)
+        s2_prior[0] = self.priors.B0_m0_alpha * sigma2
+        s2_prior[1] = self.priors.B0_m0_beta * sigma2
         if self.K_gamma > 0:
-            s2_prior[2 : 2 + self.K_gamma] = self.priors.s_m0_gamma**2
+            s2_prior[2 : 2 + self.K_gamma] = self.priors.B0_m0_gamma * sigma2
 
         # Process SDs: s_k | σ² ~ N(0, B0_s_k σ²)
         idx_s_alpha = 2 + self.K_gamma
         idx_s_beta  = 3 + self.K_gamma
         idx_s_gamma = 4 + self.K_gamma
 
-        s2_prior[idx_s_alpha] = self.priors.B0_s_alpha * self.sigma2
-        s2_prior[idx_s_beta]  = self.priors.B0_s_beta  * self.sigma2
-        s2_prior[idx_s_gamma] = self.priors.B0_s_gamma * self.sigma2
+        s2_prior[idx_s_alpha] = self.priors.B0_s_alpha * sigma2
+        s2_prior[idx_s_beta]  = self.priors.B0_s_beta  * sigma2
+        s2_prior[idx_s_gamma] = self.priors.B0_s_gamma * sigma2
 
         eps = 1e-12
         s2_prior = np.maximum(s2_prior, eps)
@@ -558,7 +562,6 @@ class DLMGibbsConjugate:
 
         XtX = X.T @ X
         Xt_y = X.T @ y
-        sigma2 = self.sigma2
 
         V_prior_inv = np.linalg.inv(V_prior)
         prec_post = XtX / sigma2 + V_prior_inv
@@ -783,8 +786,9 @@ if __name__ == "__main__":
         description=(
             "Kalman FFBS + FS-style Gibbs for Gaussian DLM "
             "(dynamic/dynamic/dynamic, newest-first seasonal). "
-            "Process SDs have Normal priors s_k | σ² ~ N(0, B0_s_k σ²) and "
-            "are updated via joint regression, with random sign switches."
+            "Baselines m0_k and process SDs s_k have Normal priors "
+            "scaled by σ² and are updated via joint regression, with "
+            "random sign switches for s_k."
         )
     )
 
@@ -807,11 +811,11 @@ if __name__ == "__main__":
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
     p.add_argument("--prior-b-sigma", type=float, default=1.0)
     p.add_argument("--prior-m-m0-alpha", type=float, default=0.0)
-    p.add_argument("--prior-s-m0-alpha", type=float, default=10.0)
+    p.add_argument("--prior-B0-m0-alpha", type=float, default=100.0)
     p.add_argument("--prior-m-m0-beta",  type=float, default=0.0)
-    p.add_argument("--prior-s-m0-beta",  type=float, default=10.0)
+    p.add_argument("--prior-B0-m0-beta", type=float, default=100.0)
     p.add_argument("--prior-m-m0-gamma", type=str, default=None)
-    p.add_argument("--prior-s-m0-gamma", type=float, default=5)
+    p.add_argument("--prior-B0-m0-gamma", type=float, default=25.0)
     p.add_argument("--prior-a-P0-alpha", type=float, default=5.0)
     p.add_argument("--prior-b-P0-alpha", type=float, default=1.0)
     p.add_argument("--prior-a-P0-beta",  type=float, default=5.0)
@@ -820,14 +824,14 @@ if __name__ == "__main__":
     p.add_argument("--prior-b-P0-gamma", type=float, default=1.0)
 
     # FS Normal priors (process SDs: s_k | σ² ~ N(0, B0_s_k σ²))
-    p.add_argument("--prior-B0-s-alpha", type=float, default=1e-4)
-    p.add_argument("--prior-B0-s-beta",  type=float, default=1e-7)
-    p.add_argument("--prior-B0-s-gamma", type=float, default=1e-4)
+    p.add_argument("--prior-B0-s-alpha", type=float, default=1e-3)
+    p.add_argument("--prior-B0-s-beta",  type=float, default=1e-3)
+    p.add_argument("--prior-B0-s-gamma", type=float, default=1e-3)
 
     # Sampler configuration
     p.add_argument("--n-iter", type=int, default=10000)
     p.add_argument("--burn", type=int, default=5000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
@@ -887,10 +891,10 @@ if __name__ == "__main__":
 
     priors = Priors(
         a_sigma=args.prior_a_sigma, b_sigma=args.prior_b_sigma,
-        m_m0_alpha=args.prior_m_m0_alpha, s_m0_alpha=args.prior_s_m0_alpha,
-        m_m0_beta=args.prior_m_m0_beta,   s_m0_beta=args.prior_s_m0_beta,
+        m_m0_alpha=args.prior_m_m0_alpha, B0_m0_alpha=args.prior_B0_m0_alpha,
+        m_m0_beta=args.prior_m_m0_beta,   B0_m0_beta=args.prior_B0_m0_beta,
         m_m0_gamma=pri_gamma_vec,
-        s_m0_gamma=args.prior_s_m0_gamma,
+        B0_m0_gamma=args.prior_B0_m0_gamma,
         a_P0_alpha=args.prior_a_P0_alpha, b_P0_alpha=args.prior_b_P0_alpha,
         a_P0_beta=args.prior_a_P0_beta,   b_P0_beta=args.prior_b_P0_beta,
         a_P0_gamma=args.prior_a_P0_gamma, b_P0_gamma=args.prior_b_P0_gamma,
@@ -932,6 +936,11 @@ if __name__ == "__main__":
     if args.print_summary:
         print(f"\nSimulated {args.T} observations (σ={mts.sigma}) "
               f"with modes dynamic/dynamic/dynamic.\n")
+        print("FS-style Normal priors for baselines (m0_k | σ²):")
+        print(f"  m0_alpha: N({priors.m_m0_alpha:.3g}, {priors.B0_m0_alpha:.3g} * σ²)")
+        print(f"  m0_beta : N({priors.m_m0_beta :.3g}, {priors.B0_m0_beta :.3g} * σ²)")
+        print(f"  m0_gamma: N({0.0: .3g}, {priors.B0_m0_gamma:.3g} * σ²)  (each seasonal baseline)\n")
+
         print("FS-style Normal priors for process SDs (s_k | σ²):")
         print(f"  alpha: s_alpha ~ N(0, {priors.B0_s_alpha:.3g} * σ²)")
         print(f"  beta : s_beta  ~ N(0, {priors.B0_s_beta :.3g} * σ²)")
@@ -953,6 +962,9 @@ if __name__ == "__main__":
         extra_meta={
             "elapsed_seconds": float(elapsed),
             "fs_priors": {
+                "B0_m0_alpha": priors.B0_m0_alpha,
+                "B0_m0_beta":  priors.B0_m0_beta,
+                "B0_m0_gamma": priors.B0_m0_gamma,
                 "B0_s_alpha": priors.B0_s_alpha,
                 "B0_s_beta":  priors.B0_s_beta,
                 "B0_s_gamma": priors.B0_s_gamma,
@@ -976,5 +988,5 @@ if __name__ == "__main__":
         plt.plot(dates_T, y, label="y_t", lw=1)
         plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
         plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
-        plt.title("DLM (FS Normal priors + regression) dynamic/dynamic/dynamic")
+        plt.title("DLM (FS Normal priors + regression, scaled m0) dynamic/dynamic/dynamic")
         plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
