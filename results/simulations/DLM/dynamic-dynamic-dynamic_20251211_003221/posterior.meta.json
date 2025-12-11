@@ -1,0 +1,48 @@
+{
+  "T": 1000,
+  "dim": 5,
+  "period": 4,
+  "modes": {
+    "level_mode": "dynamic",
+    "trend_mode": "dynamic",
+    "seasonal_mode": "dynamic"
+  },
+  "layout": [
+    "alpha",
+    "beta",
+    "g1",
+    "g2",
+    "g3"
+  ],
+  "cfg": {
+    "n_iter": 10000,
+    "burn": 5000,
+    "thin": 2,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 1,
+    "slice_w": 1.0,
+    "slice_m": 20
+  },
+  "priors": {
+    "a_sigma": 2.0,
+    "b_sigma": 1.0,
+    "m0_alpha": 3.0,
+    "P0_alpha": 0.1,
+    "m0_beta": 0,
+    "P0_beta": 0.1,
+    "m0_gamma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "P0_gamma": 5,
+    "a_lambda": 0.001,
+    "b_lambda": 0.001
+  },
+  "elapsed_seconds": 2401.7435207366943,
+  "lasso_priors": {
+    "a_lambda": 0.001,
+    "b_lambda": 0.001
+  }
+}

@@ -60,6 +60,7 @@ class Priors:
     P0_beta: float  = 10.0
     m0_gamma: Optional[Sequence[float]] = None  # len p-1 (newest-first)
     P0_gamma: float = 5.0
+
     # Hierarchical Bayesian lasso hyperparameters for process SDs:
     #   s_k | τ_k, σ² ~ N(0, σ² τ_k)
     #   τ_k | λ² ~ Exp(λ²/2)
@@ -88,19 +89,30 @@ class SamplerConfig:
 class DLMGibbsConjugate:
     """
     Gaussian structural DLM with:
-      • Non-centred parametrisation of the latent states (tilde alpha, tilde beta, A, tilde gamma).
-      • FFBS on the non-centred state with fixed transition G_tilde and unit process covariance Q_tilde.
+      • Non-centred parametrisation of the latent states (tilde alpha, tilde beta, A,
+        tilde gamma).
+      • FFBS on the non-centred state with fixed transition G_tilde and unit
+        process covariance Q_tilde.
       • Hierarchical Bayesian lasso prior on process SDs s_k:
             s_k | τ_k, σ² ~ N(0, σ² τ_k),
             τ_k | λ² ~ Exp(λ² / 2),
             λ² ~ Gamma(a_lambda, b_lambda).
-      • Joint Gaussian regression update for (alpha0, beta0, gamma0, s_alpha, s_beta, s_gamma)
-        conditional on (τ_k, λ²).
-      • Random sign switches on (s_alpha, s_beta, s_gamma) and corresponding NCP states.
+      • Joint Gaussian regression update for (alpha0, beta0, gamma0, s_alpha,
+        s_beta, s_gamma) conditional on (τ_k, λ²), *implemented in a centred
+        time parametrisation*:
+            α_c, β, γ, s_α, s_β, s_γ
+        with t_c = t - mean(t), and then transformed back to:
+            α0 = α_c - t̄ β,    β0 = β.
+
+      • Random sign switches on (s_alpha, s_beta, s_gamma) and corresponding NCP
+        states.
 
     Externally:
-      - Progress lines and posterior storage are expressed in terms of the centred states x_t and Q_k = s_k^2.
-      - self.keep['x'] stores the CENTRED states x_t (alpha, beta, gamma dummy states).
+      - Progress lines and posterior storage are expressed in terms of the
+        centred states x_t and Q_k = s_k^2.
+      - self.keep['x'] stores the CENTRED states x_t (alpha, beta, gamma dummy
+        states).
+      - alpha0, beta0 keep the *original* interpretation in y_t = alpha0 + t beta0 + ...
     """
 
     # --------------------------- Construction --------------------------- #
@@ -143,6 +155,10 @@ class DLMGibbsConjugate:
         else:
             self._rng = np.random.default_rng()
 
+        # Precompute time index and its centre (used for centering in regression)
+        self._t_idx = np.arange(1, self.T + 1, dtype=float)  # 1..T
+        self._t_center = float(self._t_idx.mean())           # t̄
+
         # ------------------ CP layout (for storage / interpretation) ------------------ #
         layout: List[str] = ["alpha", "beta"]
         layout.extend([f"g{k}" for k in range(1, self.period)])
@@ -171,9 +187,11 @@ class DLMGibbsConjugate:
         self.tau_gamma = 1.0  # mixing variance for s_gamma
         self.lambda2 = 1.0    # global lasso parameter λ²
 
-        # Static baselines (alpha0, beta0, gamma0)
-        self.alpha0 = float(alpha0)  # alpha0
-        self.beta0 = float(beta0)    # beta0
+        # Static baselines (alpha0, beta0, gamma0) in the ORIGINAL parametrisation
+        # used by the state mapping and FFBS:
+        #   y_t ≈ alpha0 + beta0 * t + season + dynamic.
+        self.alpha0 = float(alpha0)
+        self.beta0 = float(beta0)
 
         if gamma0 is None:
             self.gamma0 = np.zeros(self.K_gamma, float)
@@ -182,7 +200,6 @@ class DLMGibbsConjugate:
             if g.size != self.K_gamma:
                 raise ValueError("gamma0 must have length p-1 (NEWEST-FIRST)")
             self.gamma0 = g
-
 
         # ------------------ Seasonal baseline design ------------------ #
         # S[t, :] maps gamma0 -> static seasonal effect at time t (sum-to-zero across p seasons)
@@ -500,19 +517,23 @@ class DLMGibbsConjugate:
         tau = np.random.gamma(shape=a_post, scale=1.0 / max(b_post, 1e-300))
         self.sigma2 = 1.0 / max(tau, 1e-300)
 
-
     # --------------- Joint regression update for (m0_*, s_*) --------------- #
     def update_beta_fs(self) -> None:
         """
-        Gaussian regression update (FS style), but with hierarchical lasso prior on s_k:
+        Gaussian regression update (FS style), but with hierarchical lasso prior on s_k,
+        using a *centred* time covariate for better α0–β0 mixing.
 
-            y_t = alpha0 + t beta0 + S[t,:] @ gamma0
+        Model (reparametrised):
+
+            y_t = α_c + β * (t - t̄) + S[t,:] γ0
                   + s_alpha * tilde_alpha_t + s_beta * A_t + s_gamma * tilde_gamma1_t
                   + ε_t,
 
-        with Normal priors:
-          - (alpha0, beta0, gamma0) ~ N(m_prior, P0),
-          - s_k | τ_k, σ² ~ N(0, σ² τ_k).
+        where t̄ is the mean of {1, …, T}. We sample θ_c = (α_c, β, γ0, s_α, s_β, s_γ),
+        then transform back to the ORIGINAL parametrisation used elsewhere:
+
+            alpha0 = α_c - t̄ * β
+            beta0  = β.
         """
         if self.dim_ncp == 0:
             return
@@ -522,7 +543,10 @@ class DLMGibbsConjugate:
         iA = self.idx_A
         gs = self.idx_tilde_g_start
 
-        t_idx = np.arange(1, T + 1, dtype=float)
+        t_idx = self._t_idx                    # 1..T
+        t_center = self._t_center             # t̄
+        t_c = t_idx - t_center                # centred time
+
         S = self._season_design
 
         tilde_alpha = self.z[1:, ia]
@@ -530,21 +554,26 @@ class DLMGibbsConjugate:
         tilde_gamma1 = self.z[1:, gs]
 
         # Design matrix:
-        #   X_static = [1, t, S[t,:]]  (for alpha0, beta0, gamma0)
-        #   X_dyn    = [tilde_alpha_t, A_t, tilde_gamma1_t] (for s_alpha, s_beta, s_gamma)
+        #   X_static_c = [1, (t - t̄), S[t,:]]  (for α_c, β, γ0)
+        #   X_dyn      = [tilde_alpha_t, A_t, tilde_gamma1_t] (for s_alpha, s_beta, s_gamma)
         if self.K_gamma > 0:
-            X_static = np.column_stack([np.ones(T, float), t_idx, S])
+            X_static = np.column_stack([np.ones(T, float), t_c, S])
         else:
-            X_static = np.column_stack([np.ones(T, float), t_idx])
+            X_static = np.column_stack([np.ones(T, float), t_c])
         X_dyn = np.column_stack([tilde_alpha, A_t, tilde_gamma1])
         X = np.column_stack([X_static, X_dyn])  # shape (T, 2 + K_gamma + 3)
 
         y = self.y
         d = X.shape[1]  # = 2 + K_gamma + 3
 
-        # Prior mean vector
+        # Prior mean vector for θ_c = (α_c, β, γ0, s_α, s_β, s_γ)
         m_prior = np.zeros(d, float)
-        m_prior[0] = self.priors.m0_alpha
+
+        # We have priors on (alpha0, beta0) in the original parametrisation.
+        # Rough but practical choice: let α_c prior mean correspond to the mean path
+        # implied by (m0_alpha, m0_beta) at t̄:
+        #   α_c ≈ m0_alpha + m0_beta * t̄
+        m_prior[0] = self.priors.m0_alpha + self.priors.m0_beta * t_center
         m_prior[1] = self.priors.m0_beta
 
         if self.K_gamma > 0:
@@ -559,7 +588,7 @@ class DLMGibbsConjugate:
         # Prior variances (diagonal)
         s2_prior = np.zeros(d, float)
         eps = 1e-12
-        # Baselines (independent of σ²)
+        # Baselines (here interpreted as priors on α_c and β)
         s2_prior[0] = self.priors.P0_alpha
         s2_prior[1] = self.priors.P0_beta
         if self.K_gamma > 0:
@@ -587,16 +616,23 @@ class DLMGibbsConjugate:
         cov_post = _spd_solve(prec_post, np.eye(d))
         mean_post = cov_post @ (Xt_y / sigma2 + V_prior_inv @ m_prior)
 
-        beta = np.random.multivariate_normal(mean_post, cov_post)
+        theta_c = np.random.multivariate_normal(mean_post, cov_post)
 
-        # Assign back to parameters
-        self.alpha0 = float(beta[0])
-        self.beta0 = float(beta[1])
+        # Extract α_c, β and transform back to (alpha0, beta0)
+        alpha_c = float(theta_c[0])
+        beta0 = float(theta_c[1])
+
+        self.beta0 = beta0
+        self.alpha0 = alpha_c - t_center * beta0  # ORIGINAL intercept at t=0
+
+        # Seasonal baselines
         if self.K_gamma > 0:
-            self.gamma0 = beta[2 : 2 + self.K_gamma].copy()
-        self.s_alpha = float(beta[idx_s_alpha])
-        self.s_beta  = float(beta[idx_s_beta])
-        self.s_gamma = float(beta[idx_s_gamma])
+            self.gamma0 = theta_c[2 : 2 + self.K_gamma].copy()
+
+        # Process SDs (signed)
+        self.s_alpha = float(theta_c[idx_s_alpha])
+        self.s_beta  = float(theta_c[idx_s_beta])
+        self.s_gamma = float(theta_c[idx_s_gamma])
 
     # --------------- Lasso local/global scale updates --------------- #
     def update_lasso_scales(self) -> None:
@@ -755,7 +791,7 @@ class DLMGibbsConjugate:
                 self.z = self._ffbs_ncp()
                 self._refresh_cp_from_ncp()
 
-            # 2) Regression update for (m0_*, s_*)
+            # 2) Regression update for (alpha0, beta0, gamma0, s_*)
             if self.dim_ncp > 0:
                 self.update_beta_fs()
                 self._refresh_cp_from_ncp()
@@ -841,6 +877,7 @@ class DLMGibbsConjugate:
             "layout": list(self._layout),
             "cfg": asdict(self.cfg),
             "priors": asdict(self.priors),
+            "time_center": float(self._t_center),
         }
         if extra_meta:
             meta.update(extra_meta)
@@ -849,7 +886,6 @@ class DLMGibbsConjugate:
             json.dump(meta, f, indent=2)
         print(f"[save] Posterior -> {out_npz_path}")
         print(f"[save] Metadata  -> {meta_path}")
-
 
 # ------------------------- CLI / Example run ------------------------------- #
 if __name__ == "__main__":

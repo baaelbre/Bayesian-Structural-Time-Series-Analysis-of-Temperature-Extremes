@@ -94,43 +94,28 @@ def _maybe(a: Dict[str, Any], k: str):
 # -----------------------------
 class DLMPlotter:
     """
-    Generic plotter for posterior bundles from Gaussian DLM samplers
-    (including the FS-prior non-centred version, double-gamma, and older variants).
+    Plotter for posterior bundles from the Gaussian DLM sampler
+    with non-centred states and Bayesian lasso priors on process SDs.
 
-    It introspects the contents of 'draws' and tries to:
+    Expected core keys in draws:
+      - mu: (S, T)
+      - y: (T,)
+      - x: (S, T, dim) centred state draws (optional)
 
-      - Plot μ_t ribbons (with y and true μ if present).
-      - Plot trace + hist + ACF for all scalar parameters (shape (S,)).
-      - Plot log10(Q) histograms for process variances, whether stored in:
-          * a matrix 'Q' (S, dim), or
-          * separate 'Q_alpha', 'Q_beta', 'Q_gamma' arrays.
-      - Plot trace + hist + ACF for *signed* process SDs s_alpha, s_beta, s_gamma
-        if present (FS style, ±√Q).
-      - Plot state ribbons (μ, α, β, last seasonal γ) from 'x' if available.
-      - Plot correlation scatter matrices for signed SDs, m0_*, and joint m0_*–s_*.
+    Parameters (new sampler):
+      - sigma: (S,)
+      - alpha0, beta0: (S,)
+      - gamma0: (S, K) with K = period-1
+      - s_alpha, s_beta, s_gamma: (S,) signed process SDs
+      - Q_alpha, Q_beta, Q_gamma: (S,)
+      - tau_alpha, tau_beta, tau_gamma: (S,) lasso local scales
+      - lambda2: (S,) global lasso parameter
 
-    Expected keys (flexible; many are optional):
+    Truth overlays (optional):
+      - true_mu_t, true_alpha_t, true_beta_t, true_gamma_t: (T,)
 
-      Core:
-        - mu: (S, T)
-        - y: (T,)
-        - x: (S, T, dim)   (optional; centred state draws)
-
-      Parameters (FS/double-gamma version):
-        - sigma: (S,)
-        - s_alpha, s_beta, s_gamma: (S,)  signed process SDs
-        - Q_alpha, Q_beta, Q_gamma: (S,)
-        - m0_alpha, m0_beta: (S,)
-        - m0_gamma: (S, K) with K = period-1
-        - P0_alpha, P0_beta, P0_gamma: (S,)
-
-      Optional legacy:
-        - sigma2: (S,)
-        - Q: (S, dim)
-        - lambda_alpha/beta/gamma: (S,)
-
-      Truth overlays:
-        - true_mu_t, true_alpha_t, true_beta_t, true_gamma_t: (T,)
+    The plotter is backward-compatible with older bundles that used
+    m0_alpha/m0_beta/m0_gamma instead of alpha0/beta0/gamma0.
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
@@ -210,11 +195,6 @@ class DLMPlotter:
         elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
             self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0, None))
 
-        # lambdas (legacy PC priors)
-        self.lam_a = _maybe(draws, "lambda_alpha")
-        self.lam_b = _maybe(draws, "lambda_beta")
-        self.lam_g = _maybe(draws, "lambda_gamma")
-
         # Categorise all posterior arrays into scalar / vector (per draw)
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
@@ -231,27 +211,34 @@ class DLMPlotter:
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # Convenience aliases for FS-style / double-gamma outputs (if present)
+        # Convenience aliases for process variances
         self.Q_alpha = _maybe(self.scalar_params, "Q_alpha")
         self.Q_beta = _maybe(self.scalar_params, "Q_beta")
         self.Q_gamma = _maybe(self.scalar_params, "Q_gamma")
-        self.m0_alpha = _maybe(self.scalar_params, "m0_alpha")
-        self.m0_beta = _maybe(self.scalar_params, "m0_beta")
-        self.P0_alpha = _maybe(self.scalar_params, "P0_alpha")
-        self.P0_beta = _maybe(self.scalar_params, "P0_beta")
-        self.P0_gamma = _maybe(self.scalar_params, "P0_gamma")
-        self.m0_gamma = _maybe(self.vector_params, "m0_gamma")
 
-        # Signed process SDs (Fruhwirth-Schnatter / double-gamma style, s_k with Q_k = s_k^2)
+        # Baselines: prefer new names alpha0/beta0/gamma0; fall back to m0_* if needed
+        self.alpha0 = _maybe(self.scalar_params, "alpha0")
+        if self.alpha0 is None:
+            self.alpha0 = _maybe(self.scalar_params, "m0_alpha")
+
+        self.beta0 = _maybe(self.scalar_params, "beta0")
+        if self.beta0 is None:
+            self.beta0 = _maybe(self.scalar_params, "m0_beta")
+
+        self.gamma0 = _maybe(self.vector_params, "gamma0")
+        if self.gamma0 is None:
+            self.gamma0 = _maybe(self.vector_params, "m0_gamma")
+
+        # Signed process SDs (s_k with Q_k = s_k^2)
         self.s_alpha = _maybe(self.scalar_params, "s_alpha")
         self.s_beta = _maybe(self.scalar_params, "s_beta")
         self.s_gamma = _maybe(self.scalar_params, "s_gamma")
 
-        # Double-gamma scales (if present)
-        self.xi_alpha = _maybe(self.scalar_params, "xi_alpha")
-        self.xi_beta = _maybe(self.scalar_params, "xi_beta")
-        self.xi_gamma = _maybe(self.scalar_params, "xi_gamma")
-        self.tau = _maybe(self.scalar_params, "tau")
+        # Lasso local/global scales (new sampler)
+        self.tau_alpha = _maybe(self.scalar_params, "tau_alpha")
+        self.tau_beta = _maybe(self.scalar_params, "tau_beta")
+        self.tau_gamma = _maybe(self.scalar_params, "tau_gamma")
+        self.lambda2 = _maybe(self.scalar_params, "lambda2")
 
         # Build unified process variance matrix Q (S, K_Q) if available
         self.Q = None
@@ -425,7 +412,7 @@ class DLMPlotter:
           [1] σ trace
           [2] σ histogram
           [3] log10(Q) histograms (available coords)
-          [4] m0_*, m0_gamma[0] histograms (if present)
+          [4] baselines alpha0, beta0, gamma0[0] histograms (if present)
           [5] μ_t running RMSE vs true μ (if truth available)
         """
         mu = self.mu
@@ -473,19 +460,17 @@ class DLMPlotter:
         else:
             axs[3].axis("off")
 
-        # [4] Baselines m0_* (if present)
-        any_m0 = any(
-            v is not None for v in [self.m0_alpha, self.m0_beta, self.m0_gamma]
-        )
-        if any_m0:
+        # [4] Baselines alpha0, beta0, gamma0[0] (if present)
+        any_baseline = any(v is not None for v in [self.alpha0, self.beta0, self.gamma0])
+        if any_baseline:
             ax = axs[4]
-            if self.m0_alpha is not None:
-                ax.hist(self.m0_alpha, bins=40, density=True, alpha=0.6, label="m0_alpha")
-            if self.m0_beta is not None:
-                ax.hist(self.m0_beta, bins=40, density=True, alpha=0.6, label="m0_beta")
-            if self.m0_gamma is not None and self.m0_gamma.shape[1] > 0:
-                ax.hist(self.m0_gamma[:, 0], bins=40, density=True, alpha=0.6, label="m0_gamma[0]")
-            ax.set_title("Baselines m0_*")
+            if self.alpha0 is not None:
+                ax.hist(self.alpha0, bins=40, density=True, alpha=0.6, label="alpha0")
+            if self.beta0 is not None:
+                ax.hist(self.beta0, bins=40, density=True, alpha=0.6, label="beta0")
+            if self.gamma0 is not None and self.gamma0.shape[1] > 0:
+                ax.hist(self.gamma0[:, 0], bins=40, density=True, alpha=0.6, label="gamma0[0]")
+            ax.set_title("Baselines alpha0/beta0/gamma0")
             ax.legend()
         else:
             axs[4].axis("off")
@@ -517,9 +502,8 @@ class DLMPlotter:
 
           - σ
           - signed process SDs s_alpha, s_beta, s_gamma (if present)
-            (Fruhwirth-Schnatter style / double-gamma, ±√Q)
-          - log10 Q for remaining Q-coordinates (for which no signed s_* exist)
-          - λ_α, λ_β, λ_γ (if present)
+          - log10 Q for remaining Q-coordinates (for which no signed s_ exist)
+          - lambda2, tau_alpha, tau_beta, tau_gamma (if present)
           - any other scalar posterior array (shape (S,))
         """
         # σ
@@ -564,7 +548,6 @@ class DLMPlotter:
             labels = self.Q_names if self.Q_names else [f"Q[{j}]" for j in range(Q.shape[1])]
             for j in range(Q.shape[1]):
                 name_j = labels[j]
-                # skip FS-coords if we have signed SDs for them
                 if name_j == "Q_alpha" and self.s_alpha is not None:
                     continue
                 if name_j == "Q_beta" and self.s_beta is not None:
@@ -579,29 +562,37 @@ class DLMPlotter:
                     show=show,
                 )
 
-        # lambdas (legacy PC priors)
-        if self.lam_a is not None:
+        # Explicit panels for lasso scales if present
+        if self.lambda2 is not None:
             self._trace_hist_acf_panel(
-                self.lam_a,
-                "λ_α",
+                self.lambda2,
+                "lambda2",
                 save_dir=save_dir,
-                fname="trace_hist_acf_lambda_alpha.png",
+                fname="trace_hist_acf_lambda2.png",
                 show=show,
             )
-        if self.lam_b is not None:
+        if self.tau_alpha is not None:
             self._trace_hist_acf_panel(
-                self.lam_b,
-                "λ_β",
+                self.tau_alpha,
+                "tau_alpha",
                 save_dir=save_dir,
-                fname="trace_hist_acf_lambda_beta.png",
+                fname="trace_hist_acf_tau_alpha.png",
                 show=show,
             )
-        if self.lam_g is not None:
+        if self.tau_beta is not None:
             self._trace_hist_acf_panel(
-                self.lam_g,
-                "λ_γ",
+                self.tau_beta,
+                "tau_beta",
                 save_dir=save_dir,
-                fname="trace_hist_acf_lambda_gamma.png",
+                fname="trace_hist_acf_tau_beta.png",
+                show=show,
+            )
+        if self.tau_gamma is not None:
+            self._trace_hist_acf_panel(
+                self.tau_gamma,
+                "tau_gamma",
+                save_dir=save_dir,
+                fname="trace_hist_acf_tau_gamma.png",
                 show=show,
             )
 
@@ -615,13 +606,10 @@ class DLMPlotter:
             "s_alpha",
             "s_beta",
             "s_gamma",
-            "lambda_alpha",
-            "lambda_beta",
-            "lambda_gamma",
-            "xi_alpha",
-            "xi_beta",
-            "xi_gamma",
-            "tau",
+            "lambda2",
+            "tau_alpha",
+            "tau_beta",
+            "tau_gamma",
         }
         for key, arr in sorted(self.scalar_params.items()):
             if key in skip_keys:
@@ -731,8 +719,8 @@ class DLMPlotter:
         Correlation plots (scatter matrices) for:
 
           1) Signed process SDs: s_alpha, s_beta, s_gamma (if >= 2 exist).
-          2) Baselines m0_*: m0_alpha, m0_beta, m0_gamma[j] (if >= 2 exist).
-          3) Joint m0_* and signed SDs (if >= 2 total).
+          2) Baselines: alpha0, beta0, gamma0[j] (if >= 2 exist).
+          3) Joint baselines and signed SDs (if >= 2 total).
 
         max_vars limits the dimensionality of each scatter matrix
         (if there are more variables, the first max_vars are used).
@@ -767,54 +755,54 @@ class DLMPlotter:
         else:
             print("[corr] fewer than 2 signed process SDs; skipping s_* correlation plot.")
 
-        # --------- 2) m0_* only ---------
-        cols_m0: List[np.ndarray] = []
-        labels_m0: List[str] = []
-        if self.m0_alpha is not None:
-            cols_m0.append(self.m0_alpha)
-            labels_m0.append("m0_alpha")
-        if self.m0_beta is not None:
-            cols_m0.append(self.m0_beta)
-            labels_m0.append("m0_beta")
-        if self.m0_gamma is not None:
-            K = self.m0_gamma.shape[1]
+        # --------- 2) Baselines alpha0/beta0/gamma0 only ---------
+        cols_b: List[np.ndarray] = []
+        labels_b: List[str] = []
+        if self.alpha0 is not None:
+            cols_b.append(self.alpha0)
+            labels_b.append("alpha0")
+        if self.beta0 is not None:
+            cols_b.append(self.beta0)
+            labels_b.append("beta0")
+        if self.gamma0 is not None:
+            K = self.gamma0.shape[1]
             for k in range(K):
-                cols_m0.append(self.m0_gamma[:, k])
-                labels_m0.append(f"m0_gamma[{k}]")
+                cols_b.append(self.gamma0[:, k])
+                labels_b.append(f"gamma0[{k}]")
 
-        if len(cols_m0) >= 2:
-            data_m0 = np.column_stack(cols_m0)
-            if data_m0.shape[1] > max_vars:
-                print(f"[corr] m0_*: limiting to first {max_vars} variables.")
-                data_m0 = data_m0[:, :max_vars]
-                labels_m0 = labels_m0[:max_vars]
+        if len(cols_b) >= 2:
+            data_b = np.column_stack(cols_b)
+            if data_b.shape[1] > max_vars:
+                print(f"[corr] baselines: limiting to first {max_vars} variables.")
+                data_b = data_b[:, :max_vars]
+                labels_b = labels_b[:max_vars]
             self._scatter_matrix(
-                data_m0,
-                labels_m0,
-                title="Correlation: baselines m0_*",
-                fname="corr_m0_scatter_matrix.png",
+                data_b,
+                labels_b,
+                title="Correlation: baselines alpha0/beta0/gamma0",
+                fname="corr_baselines_scatter_matrix.png",
                 save_dir=save_dir,
                 show=show,
             )
         else:
-            print("[corr] fewer than 2 m0_* variables; skipping m0 correlation plot.")
+            print("[corr] fewer than 2 baseline variables; skipping baseline correlation plot.")
 
-        # --------- 3) Joint m0_* and signed SDs ---------
+        # --------- 3) Joint baselines and signed SDs ---------
         cols_joint: List[np.ndarray] = []
         labels_joint: List[str] = []
 
-        # m0_* first
-        if self.m0_alpha is not None:
-            cols_joint.append(self.m0_alpha)
-            labels_joint.append("m0_alpha")
-        if self.m0_beta is not None:
-            cols_joint.append(self.m0_beta)
-            labels_joint.append("m0_beta")
-        if self.m0_gamma is not None:
-            K = self.m0_gamma.shape[1]
+        # baselines first
+        if self.alpha0 is not None:
+            cols_joint.append(self.alpha0)
+            labels_joint.append("alpha0")
+        if self.beta0 is not None:
+            cols_joint.append(self.beta0)
+            labels_joint.append("beta0")
+        if self.gamma0 is not None:
+            K = self.gamma0.shape[1]
             for k in range(K):
-                cols_joint.append(self.m0_gamma[:, k])
-                labels_joint.append(f"m0_gamma[{k}]")
+                cols_joint.append(self.gamma0[:, k])
+                labels_joint.append(f"gamma0[{k}]")
 
         # then signed SDs
         if self.s_alpha is not None:
@@ -830,19 +818,19 @@ class DLMPlotter:
         if len(cols_joint) >= 2:
             data_joint = np.column_stack(cols_joint)
             if data_joint.shape[1] > max_vars:
-                print(f"[corr] m0_* + s_*: limiting to first {max_vars} variables.")
+                print(f"[corr] baselines + s_*: limiting to first {max_vars} variables.")
                 data_joint = data_joint[:, :max_vars]
                 labels_joint = labels_joint[:max_vars]
             self._scatter_matrix(
                 data_joint,
                 labels_joint,
-                title="Correlation: m0_* and signed process SDs",
-                fname="corr_m0_s_scatter_matrix.png",
+                title="Correlation: baselines and signed process SDs",
+                fname="corr_baselines_s_scatter_matrix.png",
                 save_dir=save_dir,
                 show=show,
             )
         else:
-            print("[corr] fewer than 2 total variables; skipping joint m0_*–s_* correlation plot.")
+            print("[corr] fewer than 2 total variables; skipping joint baseline–s_* plot.")
 
     def quick_report(
         self,
@@ -909,7 +897,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "DLM plotter for Gaussian structural models (FS, double-gamma, or legacy).\n"
+            "DLM plotter for Gaussian structural models with non-centred states\n"
+            "and Bayesian lasso priors on process SDs.\n"
             "Loads a posterior bundle via optimization/posterior_bundle "
             "and produces overview, scalars (trace+hist+ACF), correlation, and state plots."
         ),
@@ -964,7 +953,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip-corr",
         action="store_true",
-        help="Skip correlation scatter-matrix plots (m0_*, s_* and joint).",
+        help="Skip correlation scatter-matrix plots (baselines, s_* and joint).",
     )
     args = parser.parse_args()
 
