@@ -1,37 +1,52 @@
 from __future__ import annotations
 """
-DGEV Laplace Harmonic Plotter — compact, layout-aware, truth-aware
-==================================================================
+DGEV Laplace NCP Plotter — dummy seasonality + lasso
+====================================================
 
-Designed for the Laplace–based structural DGEV sampler with harmonic seasonality
-(`DGEVApproxGibbs`):
+Designed for the Laplace–based structural DGEV sampler with seasonal dummies
+(`DGEVLaplaceNCP`):
 
-• Works with harmonic state layout: [alpha][beta][c1 s1 | ... | cK sK | nyq?].
-• Uses `meta["layout"]` to automatically locate alpha/beta/harmonic indices.
-• Handles both dynamic and deterministic seasonality outputs.
+• Works with state layout: [alpha][beta][g1 g2 ... g_{p-1}]
+  as stored in meta["layout"] by DGEVLaplaceNCP.save_posterior().
+• Uses meta["layout"] to automatically locate alpha/beta/seasonal indices.
+• Handles optional truth overlays and minimal calendar info (meta["years"]).
 • Plots:
-    - overview.png        : μ_t bands + σ, ξ, and process variances
-    - states.png          : μ_t + key state coordinates (α, β, first seasonal coord)
-    - traces_acf__*.png   : grouped trace + ACF (with ESS, Geweke) for σ, ξ, Q, m0, P0, ...
-    - posteriors__*.png   : grouped posterior histograms (with means, medians, truth markers)
-    - quick_report.png    : 3-panel diagnostic summary
-    - return_levels_N*.png: time-varying N-year return levels
-    - return_periods_u*.png: time-varying return periods for threshold u
+    - overview.png          : μ_t band + σ, ξ, and process variances
+    - states.png            : μ_t + key state coordinates (α, β, first seasonal coord)
+    - traces_acf__*.png     : grouped trace + ACF (with ESS, Geweke) for σ, ξ, Q, s, lasso, loglike
+    - posteriors__*.png     : grouped posterior histograms (with means, medians, truth markers)
+    - quick_report.png      : 3-panel diagnostic summary
+    - return_levels_N*.png  : time-varying N-year return levels
+    - return_periods_u*.png : time-varying return periods for threshold u
 
-Expected posterior keys (subset)
---------------------------------
+Expected posterior keys (subset, as produced by DGEVLaplaceNCP.save_posterior)
+-------------------------------------------------------------------------------
 Arrays (npz):
-  - mu (n_kept, T), y (T), x (n_kept, T, dim)  [x optional]
-  - sigma          : shape (n_kept,)
-  - xi             : shape (n_kept,)
-  - loglike        : shape (n_kept,) (optional but recommended)
-  - Q_alpha/Q_beta/Q_gamma  OR  s_alpha/s_beta/s_gamma  (n_kept,)
-  - m0_* / P0_* for level, trend, harmonics (shapes as in sampler)
+  - mu              : (n_kept, T)
+  - y               : (T,)
+  - x               : (n_kept, T, dim) [optional]
+  - sigma           : (n_kept,)
+  - xi              : (n_kept,)
+  - loglike         : (n_kept,)  [recommended]
+  - Q_alpha, Q_beta, Q_gamma : (n_kept,)
+  - s_alpha, s_beta, s_gamma : (n_kept,)
+  - tau_alpha, tau_beta, tau_gamma : (n_kept,)
+  - lambda2         : (n_kept,)
 
 Optional truth overlays:
   - true_mu_t, true_alpha_t, true_beta_t, true_gamma_t
   - true_sigma, true_xi
   - true_Q        : either 1D [Q_alpha, Q_beta, Q_gamma] or full covariance matrix
+
+Meta (JSON, saved next to posterior.npz):
+  - T             : length of series
+  - dim           : state dimension
+  - period        : seasonal period
+  - layout        : list of state names, e.g. ["alpha","beta","g1","g2",...]
+  - modes         : {"level_mode", "trend_mode", "seasonal_mode"}
+  - cfg, priors   : SamplerConfig / Priors dicts (not required for plotting)
+  - time_center   : centring constant used in regression step
+  - years         : optional dict {"start": <int>} for calendar mapping
 """
 
 import os
@@ -46,9 +61,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-# -----------------------------------------------------------------------------
-# Loading helpers
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# I/O helpers                                                                  #
+# -----------------------------------------------------------------------------#
 
 def _ensure_dir(p: Optional[str]) -> None:
     if p:
@@ -109,15 +124,21 @@ def load_posterior(target_or_dir: str) -> Tuple[Dict[str, Any], Dict[str, Any], 
     return arrays, meta, npz_path
 
 
-# -----------------------------------------------------------------------------
-# Stats helpers
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# Simple stats helpers                                                         #
+# -----------------------------------------------------------------------------#
 
 def _qtiles(x: np.ndarray, lvl: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute median and symmetric credible band along axis 0.
+    """
     x = np.asarray(x, float)
-    a = (1 - lvl) / 2.0
+    a = (1.0 - lvl) / 2.0
     b = 1.0 - a
-    return np.quantile(x, 0.5, 0), np.quantile(x, a, 0), np.quantile(x, b, 0)
+    med = np.quantile(x, 0.5, axis=0)
+    lo = np.quantile(x, a, axis=0)
+    hi = np.quantile(x, b, axis=0)
+    return med, lo, hi
 
 
 def _acf(x: np.ndarray, L: int = 200) -> np.ndarray:
@@ -162,26 +183,25 @@ def _uniq_legend(ax):
         ax.legend(u.values(), u.keys(), fontsize=8, loc="best")
 
 
-# -----------------------------------------------------------------------------
-# Layout & truth helpers
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# Layout & truth helpers                                                       #
+# -----------------------------------------------------------------------------#
 
 def _layout_from_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
-    lay = meta.get("layout", []) or []
+    """
+    Extract indices for alpha, beta and seasonal dummy states from meta["layout"].
+
+    layout is expected to look like:
+        ["alpha", "beta", "g1", "g2", ..., "g_{p-1}"]
+    """
+    lay: List[str] = meta.get("layout", []) or []
     idx_alpha = lay.index("alpha") if "alpha" in lay else None
     idx_beta = lay.index("beta") if "beta" in lay else None
-    # Harmonic pairs are named c1,s1,c2,s2,... and optional "nyq"
-    pairs: List[Tuple[int, int]] = []
-    k = 1
-    while f"c{k}" in lay and f"s{k}" in lay:
-        pairs.append((lay.index(f"c{k}"), lay.index(f"s{k}")))
-        k += 1
-    idx_nyq = lay.index("nyq") if "nyq" in lay else None
+    seasonal_idx: List[int] = [j for j, name in enumerate(lay) if name.startswith("g")]
     return {
         "idx_alpha": idx_alpha,
         "idx_beta": idx_beta,
-        "pairs": pairs,
-        "idx_nyq": idx_nyq,
+        "idx_seasonal": seasonal_idx,
         "layout": lay,
     }
 
@@ -206,6 +226,11 @@ def _truth_xi(d: Dict[str, Any]) -> Optional[float]:
 
 
 def _to_Q(draws: Dict[str, Any], w: str) -> Optional[np.ndarray]:
+    """
+    Return process variance draws for component w in {"alpha","beta","gamma"}.
+
+    Prefers Q_w if present; otherwise squares s_w if available.
+    """
     if f"Q_{w}" in draws:
         return np.asarray(draws[f"Q_{w}"]).ravel()
     if f"s_{w}" in draws:
@@ -215,39 +240,49 @@ def _to_Q(draws: Dict[str, Any], w: str) -> Optional[np.ndarray]:
 
 
 def _truth_Q(d: Dict[str, Any], comp: str, layout: Dict[str, Any]) -> Optional[float]:
+    """
+    Extract truth Q for component "alpha"/"beta"/"gamma" from true_Q if available.
+
+    Supports:
+      - 1D array [Q_alpha, Q_beta, Q_gamma]
+      - 2D covariance matrix (take diagonal corresponding to first relevant coord).
+    """
     QQ = _maybe(d, "true_Q")
     if QQ is None:
         return None
     QQ = np.asarray(QQ, float)
     if QQ.ndim == 1:
-        # back-compat: [Q_alpha, Q_beta, Q_gamma]
-        idx = {"alpha": 0, "beta": 1 if QQ.size > 1 else 0, "gamma": 2 if QQ.size > 2 else -1}.get(comp, -1)
-        return float(QQ[idx]) if idx >= 0 else None
-    # matrix: pull diagonal for the first relevant coord
-    if comp == "alpha":
-        j = layout.get("idx_alpha")
-    elif comp == "beta":
-        j = layout.get("idx_beta")
-    else:  # gamma: use first cosine in pairs if present, else nyq
-        pairs: List[Tuple[int, int]] = layout.get("pairs", [])
-        j = pairs[0][0] if pairs else layout.get("idx_nyq")
-    if j is None:
-        return None
-    try:
-        return float(max(0.0, QQ[j, j]))
-    except Exception:
-        return None
+        idx_map = {"alpha": 0, "beta": 1, "gamma": 2}
+        idx = idx_map.get(comp, -1)
+        if idx < 0 or idx >= QQ.size:
+            return None
+        return float(max(0.0, QQ[idx]))
+    if QQ.ndim == 2:
+        if comp == "alpha":
+            j = layout.get("idx_alpha")
+        elif comp == "beta":
+            j = layout.get("idx_beta")
+        else:  # gamma: first seasonal index if any
+            seasonal = layout.get("idx_seasonal") or []
+            j = seasonal[0] if seasonal else None
+        if j is None:
+            return None
+        try:
+            return float(max(0.0, QQ[j, j]))
+        except Exception:
+            return None
+    return None
 
 
-# -----------------------------------------------------------------------------
-# Plotter class
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# Plotter class                                                                #
+# -----------------------------------------------------------------------------#
 
 class DGEVPlotter:
     """
-    Plotter for Laplace–based structural DGEV with harmonic seasonality.
+    Plotter for Laplace–based structural DGEV with seasonal dummies and lasso.
 
-    It assumes output format produced by `DGEVApproxGibbs.save_posterior`.
+    Assumes output format produced by DGEVLaplaceNCP.save_posterior().
     """
 
     def __init__(self, draws: Dict[str, Any], meta: Dict[str, Any], level: float = 0.90):
@@ -258,7 +293,7 @@ class DGEVPlotter:
             raise ValueError("level must be in (0,1)")
         # T and basic series
         self.T = int(meta.get("T") or draws["mu"].shape[1])
-        self.period = int(meta.get("period", 12))
+        self.period = int(meta.get("period", 1))
         self.band = f"{int(round(self.level * 100))}% band"
         self.y = _maybe(draws, "y")
 
@@ -285,13 +320,16 @@ class DGEVPlotter:
         """
         Map t=0..T-1 to (year, season_index) using meta['period'] and meta['years'].
 
+        If meta['years'] is missing or incomplete, fall back to a simple mapping:
+          years = 0,0,...,1,1,... based on period.
+
         Returns
         -------
-        years : (T,) array of calendar years
+        years : (T,) array of calendar-ish years
         seasons : (T,) array with values in {0,..,period-1}
         """
-        period = int(self.period)
-        years_meta = self.meta.get("years", {})
+        period = max(1, int(self.period))
+        years_meta = self.meta.get("years", {}) or {}
         start_year = int(years_meta.get("start", 0))
         idx = np.arange(self.T)
         years = start_year + idx // period
@@ -333,16 +371,15 @@ class DGEVPlotter:
         non0 = ~near0
         if np.any(non0):
             t = 1.0 + xi[non0] * (z[non0] - mu[non0]) / sigma[non0]
-            # support handling
             valid = t > 0
-            # ξ > 0: below support ⇒ G = 0 (already default)
-            # ξ < 0: above support ⇒ G = 1
             xi_non0 = xi[non0]
-            # region with valid t
+
+            # valid t
             if np.any(valid):
                 G_non0_valid = np.zeros_like(t)
                 G_non0_valid[valid] = np.exp(-np.power(t[valid], -1.0 / xi_non0[valid]))
                 G[non0][valid] = G_non0_valid[valid]
+
             # ξ<0 and invalid t ⇒ G=1
             invalid = ~valid
             if np.any(invalid):
@@ -370,8 +407,8 @@ class DGEVPlotter:
         sigma = np.asarray(self.sigma, float)[:, None]  # (M, 1)
         xi = np.asarray(self.xi, float)[:, None]        # (M, 1)
 
-        # p = 1 - 1/N ⇒ CDF at RL
-        c = -np.log(1.0 - 1.0 / float(N))  # = -log(p) > 0
+        # p = 1 - 1/N ⇒ CDF at RL, c = -log(p) > 0
+        c = -np.log(1.0 - 1.0 / float(N))
 
         # broadcast to (M,T)
         sigma = np.broadcast_to(sigma, mu.shape)
@@ -382,11 +419,11 @@ class DGEVPlotter:
         near0 = np.abs(xi) < 1e-6
         non0 = ~near0
 
-        # Gumbel limit: z = mu - sigma * log(-log p) = mu - sigma * log(c)
+        # Gumbel limit: z = mu - sigma * log(c)
         if np.any(near0):
             z[near0] = mu[near0] - sigma[near0] * np.log(c)
 
-        # ξ != 0: z = mu + sigma/ξ * ( [-log p]^{-ξ} - 1 )
+        # ξ != 0: z = mu + sigma/ξ * (c^{-ξ} - 1)
         if np.any(non0):
             z[non0] = (
                 mu[non0]
@@ -418,7 +455,7 @@ class DGEVPlotter:
         Returns
         -------
         x_axis : np.ndarray
-            Years (if yearly=True) or years per block (if yearly=False).
+            Years (if yearly=True) or "years per block" (if yearly=False).
         med, lo, hi : np.ndarray
             Posterior median and credible band for 1 / p (return period).
         """
@@ -582,15 +619,13 @@ class DGEVPlotter:
         def _get(idx: Optional[int]) -> Optional[np.ndarray]:
             if not has_x or idx is None:
                 return None
-            return self.d["x"][:, :, idx]
+            return np.asarray(self.d["x"][:, :, idx], float)
 
         A = _get(self.layout["idx_alpha"]) if self.layout["idx_alpha"] is not None else None
         B = _get(self.layout["idx_beta"]) if self.layout["idx_beta"] is not None else None
-        # use first cosine coord if available; else Nyquist
-        if self.layout["pairs"]:
-            G = _get(self.layout["pairs"][0][0])
-        else:
-            G = _get(self.layout["idx_nyq"])
+        # use first seasonal dummy coord if available
+        seasonal_idx = self.layout.get("idx_seasonal") or []
+        G = _get(seasonal_idx[0]) if seasonal_idx else None
 
         rows = 1 + sum(v is not None for v in (A, B, G))
         fig, axes = plt.subplots(rows, 1, figsize=(12, 3.0 * rows), sharex=True)
@@ -616,7 +651,7 @@ class DGEVPlotter:
         for arr, lab, truth in (
             (A, "α", self.t_a),
             (B, "β", self.t_b),
-            (G, "season (cos1/nyq)", self.t_g),
+            (G, "season (g1)", self.t_g),
         ):
             if arr is None:
                 continue
@@ -624,11 +659,21 @@ class DGEVPlotter:
             ax = axes[r]
             ax.plot(c, lw=1.6, label=f"{lab} median")
             ax.fill_between(t, lo, hi, alpha=0.25, label=self.band)
-            if (truth is not None) and len(truth) == self.T and lab != "season (cos1/nyq)":
-                ax.plot(truth, lw=1.2, ls="--", label=f"true {lab}")
-            ax.set_title(
-                "Level α" if lab == "α" else ("Trend β" if lab == "β" else "Seasonal (loaded coord)")
-            )
+
+            if truth is not None:
+                truth_arr = np.asarray(truth, float)
+                if truth_arr.ndim == 2:   # e.g. gamma_t (T, p-1): take first column
+                    truth_arr = truth_arr[:, 0]
+                if truth_arr.size == self.T and lab != "season (g1)":
+                    ax.plot(truth_arr, lw=1.2, ls="--", label=f"true {lab}")
+
+            if lab == "α":
+                ax.set_title("Level α")
+            elif lab == "β":
+                ax.set_title("Trend β")
+            else:
+                ax.set_title("Seasonal state (first dummy coord)")
+
             _uniq_legend(ax)
             r += 1
 
@@ -648,6 +693,9 @@ class DGEVPlotter:
     # ----------- grouping helpers for traces / posteriors -----------
 
     def _families(self) -> Dict[str, List[Tuple[str, np.ndarray]]]:
+        """
+        Group parameters into families for trace/ACF and posterior plots.
+        """
         f: Dict[str, List[Tuple[str, np.ndarray]]] = {}
 
         def add(group: str, name: str, a: Any) -> None:
@@ -667,28 +715,23 @@ class DGEVPlotter:
             if Q is not None:
                 add("Q", f"Q_{tag}", Q)
 
-        # initial means
-        if "m0_alpha" in d:
-            add("m0", "m0_α", d["m0_alpha"])
-        if "m0_beta" in d:
-            add("m0", "m0_β", d["m0_beta"])
-        if "m0_cos" in d and np.ndim(d["m0_cos"]) == 2:
-            mgc = np.asarray(d["m0_cos"])
-            mgs = np.asarray(d.get("m0_sin", np.zeros_like(mgc)))
-            K = mgc.shape[1]
-            for j in range(K):
-                add("m0", f"m0_cos[{j+1}]", mgc[:, j])
-                add("m0", f"m0_sin[{j+1}]", mgs[:, j])
-        if "m0_nyq" in d and np.size(d["m0_nyq"]) > 0:
-            add("m0", "m0_nyq", d["m0_nyq"])
+        # process SDs (signed)
+        if "s_alpha" in d:
+            add("s", "s_α", d["s_alpha"])
+        if "s_beta" in d:
+            add("s", "s_β", d["s_beta"])
+        if "s_gamma" in d:
+            add("s", "s_γ", d["s_gamma"])
 
-        # initial variances
-        if "P0_alpha" in d:
-            add("P0", "P0_α", d["P0_alpha"])
-        if "P0_beta" in d:
-            add("P0", "P0_β", d["P0_beta"])
-        if "P0_harm" in d:
-            add("P0", "P0_harm", d["P0_harm"])
+        # lasso local/global scales
+        if "tau_alpha" in d:
+            add("lasso", "τ_α", d["tau_alpha"])
+        if "tau_beta" in d:
+            add("lasso", "τ_β", d["tau_beta"])
+        if "tau_gamma" in d:
+            add("lasso", "τ_γ", d["tau_gamma"])
+        if "lambda2" in d:
+            add("lasso", "λ²", d["lambda2"])
 
         # log-likelihood
         if "loglike" in d:
@@ -1025,13 +1068,13 @@ class DGEVPlotter:
         return path
 
 
-# -----------------------------------------------------------------------------
-# CLI
-# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+# CLI                                                                          #
+# -----------------------------------------------------------------------------#
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="DGEV Laplace Harmonic Plotter (compact, truth-aware)",
+        description="DGEV Laplace NCP Plotter (dummy seasonality + lasso)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -1043,7 +1086,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--root",
         type=str,
-        default="results/simulations/DGEV_harm_Gibbs",
+        default="results/simulations/DGEV_NCP_LASSO",
         help="Search root when --target omitted.",
     )
     parser.add_argument(

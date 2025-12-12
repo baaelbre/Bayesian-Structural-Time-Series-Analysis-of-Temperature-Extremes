@@ -12,7 +12,7 @@ import pandas as pd
 # Import from project root
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from optimization.dgev_lognormal_harmonic_laplace import (
+from optimization.dgev_laplace import (
     DGEVApproxGibbs,
     Priors,
     SamplerConfig,

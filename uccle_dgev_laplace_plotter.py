@@ -50,7 +50,7 @@ import sys
 import argparse
 from typing import Optional
 
-from simulator.dgev_plotter_harmonic_laplace import (  # type: ignore
+from simulator.dgev_laplace_plotter import (  # type: ignore
     DGEVPlotter,
     load_posterior,
 )

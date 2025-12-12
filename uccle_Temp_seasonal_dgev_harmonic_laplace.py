@@ -16,7 +16,7 @@ THIS_DIR = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.join(THIS_DIR, "..")
 sys.path.append(PROJECT_ROOT)
 
-from optimization.dgev_lognormal_harmonic_laplace import (  # type: ignore
+from optimization.dgev_laplace import (  # type: ignore
     DGEVApproxGibbs,
     Priors,
     SamplerConfig,
