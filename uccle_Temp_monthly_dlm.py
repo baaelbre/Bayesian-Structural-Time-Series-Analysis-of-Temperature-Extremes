@@ -1,5 +1,6 @@
-# run_uccle_dlm_double_gamma_monthly.py  — monthly summaries (period = 12)
-import os
+# run_uccle_dlm_lasso_monthly.py  — monthly summaries (period = 12)
+from __future__ import annotations
+
 from pathlib import Path
 from datetime import datetime
 
@@ -7,8 +8,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# ---- import the non-centred DLM with double-gamma prior and dummy seasonality ----
-from optimization.dlm_doublegamma_dummy_nc import (
+# ---- import the non-centred DLM with hierarchical Bayesian lasso prior ----
+from optimization.dlm import (
     DLMGibbsConjugate,
     Priors,
     SamplerConfig,
@@ -72,40 +73,91 @@ def load_series(csv_path: Path) -> pd.Series:
     Load a univariate *monthly* time series from CSV and trim to a multiple of 12
     (whole number of years).
 
-    Expected format (flexible):
-      - One date-like column (e.g. 'date', 'Date', 'time', 'year' + 'month', ...).
-      - One numeric column with the series values (e.g. 'TXm', 'TNm', 'value', ...).
+    Expected flexible formats:
+      - A single date-like column (date/time/Date/Time) parsable by pandas, OR
+      - Separate year/month columns, OR
+      - A Period-like column already.
+
+    Values:
+      - Uses 'value' column if present, otherwise first numeric column.
     """
     df = pd.read_csv(csv_path)
 
-    # pick 'value' if present, otherwise first numeric column
+    # --- values ---
     if "value" in df.columns:
-        s = pd.to_numeric(df["value"], errors="coerce")
+        vals = pd.to_numeric(df["value"], errors="coerce")
     else:
-        numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if not numcols:
-            # attempt coercion of non-numeric columns (skip the first, often an ID or date)
-            for c in df.columns[1:]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
+        # prefer explicitly named series column if present
+        preferred = [c for c in ["TXm", "TNm"] if c in df.columns]
+        if preferred:
+            vals = pd.to_numeric(df[preferred[0]], errors="coerce")
+        else:
+            # fallback: first numeric column
             numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if not numcols:
-            raise ValueError(f"No numeric columns found in {csv_path}")
-        s = df[numcols[0]]
+            if not numcols:
+                for c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="ignore")
+                numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not numcols:
+                raise ValueError(f"No numeric columns found in {csv_path}")
+            vals = pd.to_numeric(df[numcols[0]], errors="coerce")
 
-    # try to parse a date/time column if present, otherwise integer index
+    # --- index ---
     idx = None
-    for cand in ["date", "time", "Date", "Time", "year", "Year"]:
+
+    # 1) common date column
+    for cand in ["date", "time", "Date", "Time"]:
         if cand in df.columns:
-            idx = pd.to_datetime(df[cand], errors="coerce")
+            dt = pd.to_datetime(df[cand], errors="coerce")
+            idx = dt
             break
 
+    # 2) year+month columns
     if idx is None:
-        # fallback: simple integer index
-        idx = pd.RangeIndex(len(s), name="t")
+        year_col = None
+        month_col = None
+        for yc in ["year", "Year", "YYYY"]:
+            if yc in df.columns:
+                year_col = yc
+                break
+        for mc in ["month", "Month", "MM"]:
+            if mc in df.columns:
+                month_col = mc
+                break
 
-    ser = pd.Series(s.astype(float).to_numpy(), index=idx, name=csv_path.name).dropna()
+        if year_col is not None and month_col is not None:
+            yy = pd.to_numeric(df[year_col], errors="coerce")
+            mm = pd.to_numeric(df[month_col], errors="coerce")
+            ok = yy.notna() & mm.notna()
+            # PeriodIndex monthly
+            idx = pd.PeriodIndex(year=yy[ok].astype(int), month=mm[ok].astype(int), freq="M")
+            vals = vals[ok].reset_index(drop=True)
 
-    # trim length to a multiple of 12 (full years of monthly data)
+    # 3) fallback: RangeIndex
+    if idx is None:
+        idx = pd.RangeIndex(len(vals), name="t")
+
+    ser = pd.Series(np.asarray(vals, float), index=idx, name=csv_path.stem).dropna()
+
+    # If we have real dates, sort them
+    try:
+        ser = ser.sort_index()
+    except Exception:
+        pass
+
+    # Optional: ensure we start on January for monthly season dummy alignment
+    if isinstance(ser.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        month0 = int(ser.index[0].month)
+        if month0 != 1:
+            # drop leading months until January
+            if isinstance(ser.index, pd.DatetimeIndex):
+                mask = ser.index.month == 1
+            else:
+                mask = ser.index.month == 1
+            first_jan_pos = np.argmax(mask.to_numpy()) if mask.any() else 0
+            ser = ser.iloc[first_jan_pos:]
+
+    # trim to a multiple of 12 (full years)
     n = len(ser) - (len(ser) % 12)
     if n <= 0:
         raise ValueError(f"Series in {csv_path} is shorter than one full year (12 points).")
@@ -124,72 +176,49 @@ def run_one(
     seasonal_mode: str = "dynamic",
 ) -> None:
     """
-    Run the non-centred DLM with dummy monthly seasonality and double-gamma
-    global–local prior on process SDs for a single *monthly* series.
-
-    Parameters
-    ----------
-    series : {"TXm", "TNm"}
-        Short series code used in filenames ("TXm" or "TNm").
-    y_ser : pd.Series
-        Monthly time series.
-    out_root : Path
-        Base directory (e.g., results/uccle/TX/TXm/Monthly or results/uccle/TN/TNm/Monthly).
-    level_mode, trend_mode, seasonal_mode : str
-        Mode strings passed to DLMGibbsConjugate and used in filenames
-        (currently enforced to be "dynamic"/"dynamic"/"dynamic").
+    Run the non-centred DLM with dummy monthly seasonality and hierarchical Bayesian
+    lasso prior on process SDs for a single *monthly* series.
     """
     y = y_ser.to_numpy(dtype=float)
-    period = 12  # 12 months per year
+    period = 12
 
-    # ----- Priors: double-gamma on process SDs, weak normals on baselines ----- #
-    # m0_gamma has length period-1, newest-first seasonal baseline parameters.
+    # --- priors ---
+    # gamma0 prior vector must have length period-1 (newest-first convention inside model)
     m0_gamma_prior = [0.0] * (period - 1)
 
     pri = Priors(
+        # obs precision prior: tau = 1/sigma^2 ~ Gamma(a_sigma, b_sigma) (shape-rate)
         a_sigma=2.0,
         b_sigma=2.0,
-        # m0 priors (weak, centred near 0; the data scale will dominate)
-        m_m0_alpha=0.0,
-        s_m0_alpha=10.0,
-        m_m0_beta=0.0,
-        s_m0_beta=10.0,
-        m_m0_gamma=m0_gamma_prior,
-        s_m0_gamma=5.0,
-        # P0 priors (kept for compatibility / storage; not updated in NCP scheme)
-        a_P0_alpha=5.0,
-        b_P0_alpha=1.0,
-        a_P0_beta=5.0,
-        b_P0_beta=1.0,
-        a_P0_gamma=5.0,
-        b_P0_gamma=1.0,
-        # Double-gamma hyperparameters: relatively mild shrinkage
-        a_xi=1.0,
-        b_xi=1.0,
-        a_tau=1.0,
-        b_tau=1.0,
+        # baseline priors
+        m0_alpha=0.0,
+        P0_alpha=10.0,
+        m0_beta=0.0,
+        P0_beta=10.0,
+        m0_gamma=m0_gamma_prior,
+        P0_gamma=5.0,
+        # lasso hyperprior on lambda^2
+        a_lambda=0.001,
+        b_lambda=0.001,
     )
 
-    # ----- Sampler configuration ----- #
+    # --- sampler config ---
     cfg = SamplerConfig(
-        n_iter=10000,
-        burn=5000,
-        thin=1,
+        n_iter=12000,
+        burn=6000,
+        thin=2,
         random_seed=42,
         progress=True,
-        progress_every=1,
+        progress_every=50,  # keep console readable
     )
 
-    # ----- Initial values ----- #
-    # Observation variance initial guess: fraction of empirical variance
+    # --- initial values ---
     sigma2_init = float(np.var(y) * 0.1) if len(y) > 1 else 1.0
-    modes_tag = f"{level_mode}_{trend_mode}_{seasonal_mode}"
 
-    # Rough initial level = mean of first year; trend = 0
+    # reasonable starting point for baseline (gets updated quickly anyway)
     init_level = float(np.mean(y[: min(len(y), period)])) if len(y) >= period else float(np.mean(y))
     init_trend = 0.0
 
-    # Process SD initial guesses: small random-walk noise
     s_alpha_init = 1e-2
     s_beta_init = 1e-3
     s_gamma_init = 1e-3
@@ -200,15 +229,9 @@ def run_one(
         level_mode=level_mode,
         trend_mode=trend_mode,
         seasonal_mode=seasonal_mode,
-        # initial means/vars for dynamic level/trend
-        m0_alpha_init=init_level,
-        P0_alpha_init=0.25,
-        m0_beta_init=init_trend,
-        P0_beta_init=0.05,
-        # seasonal baseline initialisation: let the sampler start at zeros
-        m0_gamma_init=None,   # defaults to zeros of length period-1
-        P0_gamma_init=0.25,
-        # observation variance + process SD inits
+        alpha0=init_level,
+        beta0=init_trend,
+        gamma0=None,              # defaults to zeros length p-1
         sigma2_init=sigma2_init,
         s_alpha_init=s_alpha_init,
         s_beta_init=s_beta_init,
@@ -217,23 +240,24 @@ def run_one(
         cfg=cfg,
     )
 
-    # ----- Construct run-specific directories and filenames ----- #
+    # --- output paths ---
     idx = y_ser.index[: len(y)]
     date_tag = _date_tag_from_index(idx)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    modes_tag = f"{level_mode}_{trend_mode}_{seasonal_mode}"
     tag = f"{series}_{modes_tag}"
 
     outdir = out_root / f"{tag}_{timestamp}"
     _ensure_dir(outdir)
 
-    # ----- Run sampler ----- #
-    print(f"Running monthly non-centred DLM (double-gamma, dummies) for {series} with modes={modes_tag} ...")
+    # --- run ---
+    print(f"Running Uccle monthly DLM (Bayesian lasso) for {series} with modes={modes_tag} ...")
     t0 = datetime.now().timestamp()
     post = sampler.run()
     elapsed = datetime.now().timestamp() - t0
     print(f"{series}: run time {elapsed:.2f} seconds")
 
-    # ----- Save posterior + metadata ----- #
+    # --- save posterior ---
     npz_name = f"posterior_{series}_{date_tag}_{modes_tag}.npz"
     out_npz = outdir / npz_name
 
@@ -244,41 +268,34 @@ def run_one(
             "label": f"{series}_monthly",
             "index_type": type(idx).__name__,
             "index_values_preview": [str(ix) for ix in idx[: min(10, len(idx))]],
-            "modes": {
-                "level_mode": level_mode,
-                "trend_mode": trend_mode,
-                "seasonal_mode": seasonal_mode,
-            },
             "description": (
                 "Gaussian DLM with dummy monthly seasonality, "
                 "dynamic level/trend/season, non-centred parametrisation, "
-                "double-gamma global-local prior on process SDs "
-                "s_k | ξ_k, τ, σ² ~ N(0, σ² / (ξ_k τ))."
+                "hierarchical Bayesian lasso prior on process SDs: "
+                "s_k | τ_k, σ² ~ N(0, σ² τ_k), τ_k | λ² ~ Exp(λ²/2), "
+                "λ² ~ Gamma(a_lambda, b_lambda)."
             ),
             "period": period,
             "date_tag": date_tag,
             "elapsed_seconds": float(elapsed),
             "timestamp": datetime.now().isoformat(),
-            "double_gamma_priors": {
-                "a_xi": pri.a_xi,
-                "b_xi": pri.b_xi,
-                "a_tau": pri.a_tau,
-                "b_tau": pri.b_tau,
+            "lasso_hyperpriors": {
+                "a_lambda": pri.a_lambda,
+                "b_lambda": pri.b_lambda,
             },
         },
     )
 
-    # ----- Quick fit plot ----- #
-    mu_hat = post["mu"].mean(axis=0)
-    t_index = idx
+    # --- quick fit plot (post mean + 90% band) ---
+    mu_draws = post["mu"]
+    mu_hat = mu_draws.mean(axis=0)
+    lo, hi = np.quantile(mu_draws, [0.05, 0.95], axis=0)
 
     plt.figure(figsize=(12, 4))
-    plt.plot(t_index, y, label=f"{series}")
-    plt.plot(t_index, mu_hat, "-.", label="μ̂_t")
-    plt.title(
-        f"{series}: monthly DLM with dummy seasonality "
-        f"(L/T/S={modes_tag}, period={period})"
-    )
+    plt.plot(idx, y, lw=1, label=f"{series}")
+    plt.plot(idx, mu_hat, "-.", lw=1.5, label="μ̂_t (post mean)")
+    plt.fill_between(idx, lo, hi, alpha=0.2, label="90% CI (μ_t)")
+    plt.title(f"{series}: monthly DLM (Bayesian lasso on process SDs) — modes={modes_tag}, period={period}")
     plt.grid(True)
     plt.legend()
     plt.tight_layout()
@@ -302,11 +319,9 @@ def main() -> None:
     print("TXm head:\n", tx.head(), "\n")
     print("TNm head:\n", tn.head(), "\n")
 
-    # Base roots (with 'results/uccle' prefix)
-    tx_root = _series_out_root("TXm")  # results/uccle/TX/TXm/Monthly
-    tn_root = _series_out_root("TNm")  # results/uccle/TN/TNm/Monthly
+    tx_root = _series_out_root("TXm")
+    tn_root = _series_out_root("TNm")
 
-    # Modes (for now, dynamic/dynamic/dynamic only; enforced inside DLMGibbsConjugate)
     level_mode = "dynamic"
     trend_mode = "dynamic"
     seasonal_mode = "dynamic"

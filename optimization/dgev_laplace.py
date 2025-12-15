@@ -1106,7 +1106,7 @@ if __name__ == "__main__":
     p.add_argument("--start-date", type=str, default="2000-01-01")
 
     p.add_argument("--sigma", type=float, default=3.0)
-    p.add_argument("--xi", type=float, default=-0.1)
+    p.add_argument("--xi", type=float, default=0.1)
 
     p.add_argument("--level-mode", type=str, default="dynamic")
     p.add_argument("--trend-mode", type=str, default="dynamic")
