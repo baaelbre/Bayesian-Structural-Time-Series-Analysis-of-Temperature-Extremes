@@ -244,7 +244,7 @@ def build_argparser() -> argparse.ArgumentParser:
             "derived from --series and --agg."
         ),
     )
-    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TXn")
+    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="Precx")
     p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
     p.add_argument(
         "--root",

@@ -46,11 +46,11 @@ def _series_out_root(series: str) -> Path:
     """
     Output root for *monthly* precipitation extremes:
 
-      Precx → results/uccle/Prec/Precx/Monthly/DGEV_NCP_LASSO_LAPLACE
+      Precx → results/uccle/Prec/Precx/Monthly/Laplace
     """
     base = Path("results/uccle")
     mapping = {
-        "Precx": base / "Prec" / "Precx" / "Monthly" / "DGEV_NCP_LASSO_LAPLACE",
+        "Precx": base / "Prec" / "Precx" / "Monthly" / "Laplace",
     }
     if series not in mapping:
         raise ValueError(f"Unknown series '{series}' for output mapping.")
@@ -195,9 +195,9 @@ if __name__ == "__main__":
     p.add_argument("--period", type=int, default=12)
 
     # sampler
-    p.add_argument("--n-iter", type=int, default=20000)
-    p.add_argument("--burn", type=int, default=10000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--n-iter", type=int, default=200)
+    p.add_argument("--burn", type=int, default=100)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=bool, default=True)
     p.add_argument("--progress-every", type=int, default=10)
