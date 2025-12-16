@@ -161,7 +161,9 @@ class DLMPlotter:
             self.layout = list(self.layout)
         self.idx_alpha = None
         self.idx_beta = None
-        self.idx_g_end = None
+        self.idx_g0 = None       # seasonal contribution γ_t (the one used in μ_t = α_t + γ_t)
+        self.idx_g_end = None    # last seasonal coordinate (kept for debugging/optional use)
+
 
         if self.has_x:
             dim = draws["x"].shape[2]
@@ -172,21 +174,28 @@ class DLMPlotter:
                     self.idx_beta = self.layout.index("beta")
                 g_indices = [i for i, nm in enumerate(self.layout) if nm.startswith("g")]
                 if g_indices:
+                    self.idx_g0 = g_indices[0]
                     self.idx_g_end = g_indices[-1]
+
             else:
                 # fallback: old layout heuristic
                 i_alpha = 0 if self.level_mode == "dynamic" else None
                 i_beta = None
                 if self.trend_mode == "dynamic":
                     i_beta = (1 if i_alpha is not None else 0)
+                i_g0 = None
                 i_g_end = None
                 if self.season_mode == "dynamic":
                     start = (1 if i_alpha is not None else 0) + (1 if i_beta is not None else 0)
                     if (self.period - 1) > 0 and dim >= start + (self.period - 1):
+                        i_g0 = start
                         i_g_end = start + (self.period - 2)
+
                 self.idx_alpha = _safe(self.idx_alpha, i_alpha)
                 self.idx_beta = _safe(self.idx_beta, i_beta)
+                self.idx_g0 = _safe(self.idx_g0, i_g0)
                 self.idx_g_end = _safe(self.idx_g_end, i_g_end)
+
 
         # sigma (supports both 'sigma' and legacy 'sigma2')
         self.sigma = None
@@ -324,13 +333,23 @@ class DLMPlotter:
     def _component_draws(self, key: str) -> Optional[np.ndarray]:
         if not self.has_x:
             return None
+
         if key == "alpha" and self.idx_alpha is not None:
             return self.draws["x"][:, :, self.idx_alpha]
+
         if key == "beta" and self.idx_beta is not None:
             return self.draws["x"][:, :, self.idx_beta]
-        if key == "gamma" and self.idx_g_end is not None:
+
+        # seasonal contribution that enters mu_t (gamma_t)
+        if key in ("gamma", "seasonal", "gamma0") and self.idx_g0 is not None:
+            return self.draws["x"][:, :, self.idx_g0]
+
+        # optional: last seasonal coordinate (debug/legacy)
+        if key in ("gamma_last", "gamma_end") and self.idx_g_end is not None:
             return self.draws["x"][:, :, self.idx_g_end]
+
         return None
+
 
     def _scatter_matrix(
         self,
@@ -627,87 +646,116 @@ class DLMPlotter:
         save_dir: Optional[str] = None,
         fname_prefix: str = "states",
         show: bool = True,
+        color: str = "C0",
+        ylims: Optional[Dict[str, Tuple[float, float]]] = None,   # keys: "level","slope","seasonality"
+        yscales: Optional[Dict[str, str]] = None,                # keys: "level","slope","seasonality"
     ):
-        """
-        Stacked ribbons for:
-          - μ
-          - α (if dynamic and in x)
-          - β (if dynamic and in x)
-          - γ_last (if seasonal dynamic and in x)
-        """
-        rows = 1
-        rows += 1 if self._component_draws("alpha") is not None else 0
-        rows += 1 if self._component_draws("beta") is not None else 0
-        rows += 1 if self._component_draws("gamma") is not None else 0
 
-        fig, axes = plt.subplots(rows, 1, figsize=(12, 3.0 * rows), sharex=True)
-        if rows == 1:
-            axes = [axes]
-        r = 0
+        """
+        Separate state ribbons (no combined 'states.png').
+
+        Writes up to three files (depending on what exists in the posterior):
+        - <prefix>_level.png        : α_t
+        - <prefix>_slope.png        : β_t
+        - <prefix>_seasonality.png  : γ_t  (seasonal contribution entering μ_t)
+
+        Color is standard matplotlib blue (C0). Series-specific coloring can be done
+        in a thin wrapper (e.g. uccle plotter).
+        """
+        if not self.has_x:
+            print("[states] no centred state draws 'x' found; skipping separate state plots.")
+            return
+
         t = np.arange(self.T)
+        color = "C0"  # standard blue
 
-        # μ
-        mu = self.mu
-        ctr, lo, hi = self._summarize_ribbon(mu)
-        ax = axes[r]
-        if self.y is not None and len(self.y) == self.T:
-            ax.plot(self.y, lw=1.0, alpha=0.6, label="y")
-        ax.plot(ctr, lw=1.6, label="μ median")
-        ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-        if self.true_mu is not None and len(self.true_mu) == self.T:
-            ax.plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        ax.set_title("Posterior μ_t")
-        ax.legend()
-        r += 1
+        def _plot_one(
+            arr2d: np.ndarray,
+            title: str,
+            ylabel: str,
+            truth: Optional[np.ndarray],
+            out_name: str,
+            zero_line: bool,
+            ylim: Optional[Tuple[float, float]] = None,
+            yscale: Optional[str] = None,
+        ):
+            ctr, lo, hi = self._summarize_ribbon(arr2d)
+            fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
 
-        # α
+            ax.plot(t, ctr, lw=1.6, color=color, label="median")
+            ax.fill_between(t, lo, hi, alpha=0.25, color=color, label=self.band_label)
+
+            if truth is not None and len(truth) == self.T:
+                ax.plot(t, truth, lw=1.2, ls="--", color="k", alpha=0.8, label="truth")
+
+            if zero_line:
+                ax.axhline(0.0, lw=0.8, color="k", alpha=0.25)
+
+            if yscale is not None:
+                ax.set_yscale(yscale)          # e.g. "linear", "log", "symlog"
+
+            if ylim is not None:
+                ax.set_ylim(ylim[0], ylim[1])  # hard limits
+
+            ax.set_title(title)
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.25)
+            ax.legend(loc="best")
+
+            plt.tight_layout()
+            if save_dir:
+                _ensure_dir(save_dir)
+                out = os.path.join(save_dir, out_name)
+                fig.savefig(out, dpi=200, bbox_inches="tight")
+                print(f"[save] {out}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+
+        # Level α_t
         A = self._component_draws("alpha")
         if A is not None:
-            c, lo, hi = self._summarize_ribbon(A)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="α median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_alpha is not None and len(self.true_alpha) == self.T:
-                ax.plot(self.true_alpha, lw=1.2, ls="--", label="true α")
-            ax.set_title("Level α_t")
-            ax.legend()
-            r += 1
+            _plot_one(
+                A,
+                title="Level α_t",
+                ylabel="α_t",
+                truth=self.true_alpha,
+                out_name=f"{fname_prefix}_level.png",
+                zero_line=False,
+                ylim=(ylims or {}).get("level"),
+                yscale=(yscales or {}).get("level"),
+            )
 
-        # β
+        # Slope β_t
         B = self._component_draws("beta")
         if B is not None:
-            c, lo, hi = self._summarize_ribbon(B)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="β median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_beta is not None and len(self.true_beta) == self.T:
-                ax.plot(self.true_beta, lw=1.2, ls="--", label="true β")
-            ax.set_title("Trend β_t")
-            ax.legend()
-            r += 1
+            _plot_one(
+                B,
+                title="Slope β_t",
+                ylabel="β_t",
+                truth=self.true_beta,
+                out_name=f"{fname_prefix}_slope.png",
+                zero_line=True,
+                ylim=(ylims or {}).get("slope"),
+                yscale=(yscales or {}).get("slope"),
+            )
 
-        # γ(last)
+        # Seasonality γ_t
         G = self._component_draws("gamma")
         if G is not None:
-            c, lo, hi = self._summarize_ribbon(G)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="γ(last) median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_gamma is not None and len(self.true_gamma) == self.T:
-                ax.plot(self.true_gamma, lw=1.2, ls="--", label="true γ")
-            ax.set_title("Seasonal last coordinate γ_t")
-            ax.legend()
+            _plot_one(
+                G,
+                title="Seasonality γ_t (contribution)",
+                ylabel="γ_t",
+                truth=self.true_gamma,
+                out_name=f"{fname_prefix}_seasonality.png",
+                zero_line=True,
+                ylim=(ylims or {}).get("seasonality"),
+                yscale=(yscales or {}).get("seasonality"),
+            )
 
-        plt.tight_layout()
-        if save_dir:
-            _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
-            fig.savefig(out, dpi=200, bbox_inches="tight")
-            print(f"[save] {out}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+
 
     def figure_correlations(
         self,
@@ -988,7 +1036,16 @@ if __name__ == "__main__":
         plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show)
 
     if not args.skip_states:
-        plotter.figure_states(save_dir=out_dir, fname_prefix="states", show=args.show)
+        plotter.figure_states(
+            save_dir=out_dir,
+            color="C0",
+            ylims={
+                "level": (5, 15),
+                "slope": (-0.05, 0.05),
+                "seasonality": (-3, 3),
+            },
+        )
+
 
     if not args.skip_corr:
         plotter.figure_correlations(save_dir=out_dir, show=args.show)

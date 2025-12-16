@@ -3,53 +3,57 @@ from __future__ import annotations
 Uccle DLM Plotter (TXm, TNm, Precm; Seasonal / Monthly)
 ======================================================
 
-Wrapper around the generic Gaussian DLM plotter:
+Thin wrapper around the generic Gaussian DLM plotter:
 
     simulator/dlm_plotter.DLMPlotter
 
-It works for:
-  * The new non-centred DLM with dummy monthly seasonality and
-    double-gamma global-local priors (DLMGibbsConjugate),
-  * Older FS-style / harmonic runs, as long as they save a standard
-    posterior bundle via optimization.posterior_bundle.
+Supports:
+  - Non-centred DLM with dummy seasonality + shrinkage priors (double-gamma, lasso, ...)
+  - Older FS / harmonic runs, as long as they save a posterior bundle readable by
+    optimization.posterior_bundle.load_posterior
+
+Robust run discovery:
+  - First tries optimization.posterior_bundle.find_latest_run (expects posterior.npz)
+  - If that fails, recursively searches for posterior*.npz under the root and picks
+    the most recent run (by YYYYMMDD_HHMMSS in the path, else by file mtime).
 
 Default Uccle roots:
-  TXm, Seasonal  → results/uccle/TX/TXm/Seasonal
-  TXm, Monthly   → results/uccle/TX/TXm/Monthly
-  TNm, Seasonal  → results/uccle/TN/TNm/Seasonal
-  TNm, Monthly   → results/uccle/TN/TNm/Monthly
-  Precm, Seasonal→ results/uccle/Prec/Precm/Seasonal
-  Precm, Monthly → results/uccle/Prec/Precm/Monthly
+  TXm, Seasonal   → results/uccle/TX/TXm/Seasonal
+  TXm, Monthly    → results/uccle/TX/TXm/Monthly
+  TNm, Seasonal   → results/uccle/TN/TNm/Seasonal
+  TNm, Monthly    → results/uccle/TN/TNm/Monthly
+  Precm, Seasonal → results/uccle/Prec/Precm/Seasonal
+  Precm, Monthly  → results/uccle/Prec/Precm/Monthly
 
 Examples
 --------
-# Latest TXm / Monthly (double-gamma DLM with dummies):
+# Latest TXm / Monthly
 python uccle_dlm_plotter.py --series TXm --freq Monthly
 
-# Latest TNm / Monthly:
-python uccle_dlm_plotter.py --series TNm --freq Monthly
-
-# Seasonal roots (works for any posterior bundle):
+# Latest TXm / Seasonal
 python uccle_dlm_plotter.py --series TXm --freq Seasonal
 
-# Explicit run directory or posterior.npz:
+# Explicit run directory or posterior file
 python uccle_dlm_plotter.py --target path/to/run_or_posterior.npz
 
-# With extra post-hoc burn-in and thinning:
+# Post-hoc burn & thinning
 python uccle_dlm_plotter.py --series TNm --freq Monthly --burn 1000 --thin 5
 """
 
 import os
 import sys
+import re
 import math
 import argparse
+from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt  # noqa: F401  (used by DLMPlotter internally)
 
 # ---------------------------------------------------------------------
-# Make parent dir importable: optimization/, simulator/, etc.
+# Make project root importable: optimization/, simulator/, etc.
 # ---------------------------------------------------------------------
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -58,28 +62,14 @@ from simulator.dlm_plotter import DLMPlotter  # type: ignore
 
 
 # ---------------------------------------------------------------------
-# Small helpers
+# Paths / discovery
 # ---------------------------------------------------------------------
-def _ensure_dir(path: Optional[str]) -> None:
+def ensure_dir(path: Optional[str]) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
 
 
-def _default_root(series: str, freq: str) -> str:
-    """
-    Default root for given series & frequency.
-
-    series in {TXm, TNm, Precm}
-    freq   in {Seasonal, Monthly}
-
-    Layout:
-      TXm, Seasonal  → results/uccle/TX/TXm/Seasonal
-      TXm, Monthly   → results/uccle/TX/TXm/Monthly
-      TNm, Seasonal  → results/uccle/TN/TNm/Seasonal
-      TNm, Monthly   → results/uccle/TN/TNm/Monthly
-      Precm, Seasonal→ results/uccle/Prec/Precm/Seasonal
-      Precm, Monthly → results/uccle/Prec/Precm/Monthly
-    """
+def default_root(series: str, freq: str) -> str:
     base = "results/uccle"
     freq = str(freq)
     if series == "TXm":
@@ -89,6 +79,80 @@ def _default_root(series: str, freq: str) -> str:
     if series == "Precm":
         return os.path.join(base, "Prec", "Precm", freq)
     raise ValueError(f"Unknown series {series!r} for default root.")
+
+
+def _extract_ts_from_path(path_str: str) -> Optional[float]:
+    """
+    Extract timestamp YYYYMMDD_HHMMSS from a path string and return epoch seconds.
+    Returns None if not found / not parsable.
+    """
+    m = re.search(r"(\d{8})_(\d{6})", path_str)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def find_latest_posterior_npz(root: str) -> Optional[str]:
+    """
+    Recursively find latest posterior*.npz under root.
+
+    Preference:
+      1) largest YYYYMMDD_HHMMSS timestamp found in the *path*
+      2) fallback: largest file modification time
+
+    Returns a path string or None.
+    """
+    root_p = Path(root)
+    if not root_p.exists():
+        return None
+
+    cands = list(root_p.rglob("posterior*.npz"))
+    if not cands:
+        return None
+
+    def key(p: Path) -> Tuple[int, float]:
+        ts = _extract_ts_from_path(str(p))
+        if ts is not None:
+            return (1, ts)
+        return (0, p.stat().st_mtime)
+
+    best = max(cands, key=key)
+    return str(best)
+
+
+def resolve_bundle(target: Optional[str], series: str, freq: str, root: Optional[str]) -> Any:
+    """
+    Resolve a posterior bundle either from explicit --target or via searching.
+    Returns the Bundle object from optimization.posterior_bundle.load_posterior.
+    """
+    if target:
+        return load_posterior(target)
+
+    search_root = root or default_root(series, freq)
+    print(f"[info] searching latest posterior run under: {search_root!r}")
+
+    # First try the "official" finder (usually expects posterior.npz in run dirs)
+    run_path = find_latest_run(root=search_root)
+    if run_path is not None:
+        print(f"[info] using latest run: {run_path}")
+        return load_posterior(run_path)
+
+    # Fallback: accept posterior_*.npz etc.
+    npz_path = find_latest_posterior_npz(search_root)
+    if npz_path is None:
+        print(
+            f"[error] No posterior runs found under {search_root!r}.\n"
+            f"  → Tried find_latest_run() (posterior.npz) and recursive search (posterior*.npz).\n"
+            f"  → Either run the sampler first, or provide --target."
+        )
+        raise SystemExit(1)
+
+    print(f"[info] find_latest_run found nothing; using latest npz: {npz_path}")
+    return load_posterior(npz_path)
 
 
 # ---------------------------------------------------------------------
@@ -101,10 +165,10 @@ def apply_burn_thin(
     thin: int = 1,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Apply *extra* burn-in and thinning to all arrays whose first dimension
-    matches the sample size (inferred from draws["mu"]).
+    Apply *extra* burn-in and thinning to all arrays whose first dimension equals
+    the sample size inferred from draws["mu"].
 
-    burn : number of *initial* draws to discard (>=0)
+    burn : discard first `burn` draws (>=0)
     thin : keep every `thin`-th draw after burn (>=1)
     """
     if "mu" not in draws:
@@ -131,8 +195,7 @@ def apply_burn_thin(
     n_used = math.ceil((n_samp - burn) / thin)
 
     print(
-        f"[info] post-processing chains: raw n={n_samp}, burn={burn}, "
-        f"thin={thin} → used n={n_used}"
+        f"[info] post-processing chains: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}"
     )
 
     for k, v in list(draws.items()):
@@ -142,13 +205,12 @@ def apply_burn_thin(
         if arr.ndim >= 1 and arr.shape[0] == n_samp:
             draws[k] = arr[idx, ...]
 
-    # Book-keeping in meta
     postproc = meta.get("postproc", {})
     postproc.update(
         {
-            "extra_burn": burn,
-            "thin": thin,
-            "n_samples_raw": n_samp,
+            "extra_burn": int(burn),
+            "thin": int(thin),
+            "n_samples_raw": int(n_samp),
             "n_samples_used": int(np.asarray(draws["mu"]).shape[0]),
         }
     )
@@ -159,7 +221,7 @@ def apply_burn_thin(
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
-if __name__ == "__main__":
+def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Uccle DLM Plotter (TXm/TNm/Precm; Seasonal/Monthly)\n"
@@ -168,14 +230,13 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # How to find the posterior bundle
+    # Posterior selection
     p.add_argument(
         "--target",
         type=str,
         default=None,
         help=(
-            "Run directory or posterior.npz. "
-            "If provided, overrides --series/--freq/--root and uses that run directly."
+            "Run directory or posterior .npz. If provided, overrides --series/--freq/--root."
         ),
     )
     p.add_argument(
@@ -196,20 +257,12 @@ if __name__ == "__main__":
         "--root",
         type=str,
         default=None,
-        help=(
-            "Search root when --target is omitted. "
-            "If not given, a default root is built from --series and --freq."
-        ),
+        help="Search root when --target is omitted (defaults to Uccle layout).",
     )
 
-    # Plot / posterior settings
+    # Plot options
     p.add_argument("--level", type=float, default=0.90, help="Credible band level.")
-    p.add_argument(
-        "--show",
-        action="store_true",
-        default=False,
-        help="Show figures interactively in addition to saving them.",
-    )
+    p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument(
         "--out",
         type=str,
@@ -217,72 +270,45 @@ if __name__ == "__main__":
         help="Directory to save figures (default: <run>/figures).",
     )
 
-    # Skip toggles (match simulator/dlm_plotterCLI)
+    # Skips (match simulator/dlm_plotter CLI)
     p.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
     p.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
     p.add_argument("--skip-states", action="store_true", help="Skip state ribbons.")
     p.add_argument("--skip-corr", action="store_true", help="Skip correlation scatter matrices.")
     p.add_argument("--skip-quick", action="store_true", help="Skip quick 1x3 report.")
 
-    # Extra post-hoc burn-in and thinning
-    p.add_argument(
-        "--burn",
-        type=int,
-        default=0,
-        help="Extra burn-in draws to discard from the front (post-hoc).",
+    # Post-hoc chain processing
+    p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
+    p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
+
+    return p
+
+
+def main() -> None:
+    args = build_argparser().parse_args()
+
+    # Resolve posterior bundle
+    bundle = resolve_bundle(
+        target=args.target,
+        series=args.series,
+        freq=args.freq,
+        root=args.root,
     )
-    p.add_argument(
-        "--thin",
-        type=int,
-        default=1,
-        help="Extra thinning factor k: keep every k-th draw after burn-in (post-hoc).",
-    )
-
-    args = p.parse_args()
-
-    # -----------------------------------------------------------------
-    # Resolve which run to use
-    # -----------------------------------------------------------------
-    if args.target:
-        # Explicit run directory or posterior.npz
-        bundle = load_posterior(args.target)
-    else:
-        # Use default Uccle roots or user-supplied root
-        if args.root:
-            search_root = args.root
-        else:
-            search_root = _default_root(args.series, args.freq)
-
-        print(f"[info] searching latest posterior run under: {search_root!r}")
-        run_path = find_latest_run(root=search_root)
-        if run_path is None:
-            print(
-                f"[error] No posterior runs found under {search_root!r}.\n"
-                f"  → Either run the DLM sampler first, or provide --target."
-            )
-            sys.exit(1)
-        print(f"[info] using latest run: {run_path}")
-        bundle = load_posterior(run_path)
 
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    # -----------------------------------------------------------------
-    # Apply extra burn/thin (post-hoc)
-    # -----------------------------------------------------------------
+    # Post-hoc burn/thin
     if args.burn > 0 or args.thin > 1:
         draws, meta = apply_burn_thin(draws, meta, burn=args.burn, thin=args.thin)
 
-    # -----------------------------------------------------------------
     # Output directory
-    # -----------------------------------------------------------------
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "figures")
-    _ensure_dir(out_dir)
+    ensure_dir(out_dir)
+
     print(f"[info] using posterior: {npz_path}")
     print(f"[info] saving plots to: {out_dir}")
 
-    # -----------------------------------------------------------------
-    # Plot via generic DLMPlotter
-    # -----------------------------------------------------------------
+    # Plot
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
     if not args.skip_overview:
@@ -301,3 +327,7 @@ if __name__ == "__main__":
         plotter.quick_report(save_dir=out_dir, fname_prefix="quick_report", show=args.show)
 
     print("[done] plots written.")
+
+
+if __name__ == "__main__":
+    main()

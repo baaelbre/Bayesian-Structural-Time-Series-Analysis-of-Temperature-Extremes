@@ -191,12 +191,12 @@ def run_one(
         a_sigma=2.0,
         b_sigma=2.0,
         # baseline priors
-        m0_alpha=0.0,
-        P0_alpha=10.0,
-        m0_beta=0.0,
-        P0_beta=10.0,
+        m0_alpha=10.0,
+        P0_alpha=5.0,
+        m0_beta=-0.005,
+        P0_beta=1,
         m0_gamma=m0_gamma_prior,
-        P0_gamma=5.0,
+        P0_gamma=10.0,
         # lasso hyperprior on lambda^2
         a_lambda=0.001,
         b_lambda=0.001,
@@ -204,12 +204,12 @@ def run_one(
 
     # --- sampler config ---
     cfg = SamplerConfig(
-        n_iter=12000,
-        burn=6000,
-        thin=2,
+        n_iter=20000,
+        burn=10000,
+        thin=1,
         random_seed=42,
         progress=True,
-        progress_every=50,  # keep console readable
+        progress_every=10,  # keep console readable
     )
 
     # --- initial values ---
@@ -326,7 +326,7 @@ def main() -> None:
     trend_mode = "dynamic"
     seasonal_mode = "dynamic"
 
-    run_one("TXm", tx, tx_root, level_mode, trend_mode, seasonal_mode)
+    #run_one("TXm", tx, tx_root, level_mode, trend_mode, seasonal_mode)
     run_one("TNm", tn, tn_root, level_mode, trend_mode, seasonal_mode)
 
     print("Saved monthly results under:")
