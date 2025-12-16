@@ -1,7 +1,9 @@
-# %% simulator/dgev_plotter.py
+# %% simulator/dgev_laplace_plotter.py
 from __future__ import annotations
 
-import os, math, sys
+import os
+import sys
+import math
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -22,20 +24,33 @@ except Exception as e:
     ) from e
 
 
-# ---------------------------------------------------------------------
-# Small utils (mirrors simulator/dlm_plotter.py)
-# ---------------------------------------------------------------------
+# =============================================================================
+# Small utils (mirrors dlm_plotter.py)
+# =============================================================================
 def _ensure_dir(path: str) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
 
 
-def _safe(x, default=None):
-    return default if x is None else x
+def _mad(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan")
+    med = float(np.median(x))
+    return float(np.median(np.abs(x - med)))
+
+
+def _robust_sd_from_mad(mad: float) -> float:
+    # For Normal: MAD ≈ 0.6745 * sd  => sd ≈ MAD/0.6745
+    if not np.isfinite(mad) or mad <= 0:
+        return 0.0
+    return float(mad) / 0.6745
 
 
 def _acf(x: np.ndarray, max_lag: int = 200) -> np.ndarray:
     x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
     n = x.size
     if n <= 1:
         return np.array([1.0 if n == 1 else np.nan])
@@ -49,9 +64,15 @@ def _acf(x: np.ndarray, max_lag: int = 200) -> np.ndarray:
 
 
 def _ess(x: np.ndarray, max_lag: int = 200) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size <= 1:
+        return float(max(1, x.size))
+
     ac = _acf(x, max_lag=max_lag)
     if not np.all(np.isfinite(ac)) or ac.size <= 1:
         return float(len(x))
+
     s = 0.0
     for k in range(1, ac.size):
         if ac[k] <= 0:
@@ -63,12 +84,13 @@ def _ess(x: np.ndarray, max_lag: int = 200) -> float:
 
 def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) -> float:
     x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
     n = x.size
     if n < 8:
-        return np.nan
+        return float("nan")
     a = max(2, int(np.floor(first_frac * n)))
     b = max(2, int(np.floor(last_frac * n)))
-    xa, xb = x[:a], x[n - b :]
+    xa, xb = x[:a], x[n - b:]
     ma, mb = float(np.mean(xa)), float(np.mean(xb))
     va = float(np.var(xa, ddof=1)) / max(1, xa.size)
     vb = float(np.var(xb, ddof=1)) / max(1, xb.size)
@@ -76,140 +98,60 @@ def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) ->
     return (ma - mb) / denom
 
 
-def _qtiles(arr: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    lo = (1 - level) / 2.0
-    hi = 1.0 - lo
-    return (
-        np.quantile(arr, 0.5, axis=0),
-        np.quantile(arr, lo, axis=0),
-        np.quantile(arr, hi, axis=0),
-    )
+def _maybe(draws: Dict[str, Any], key: str) -> Optional[np.ndarray]:
+    v = draws.get(key, None)
+    return None if v is None else np.asarray(v)
 
 
-def _maybe(a: Dict[str, Any], k: str):
-    return a[k] if (k in a and a[k] is not None) else None
+def _normalize_center(center: str) -> str:
+    c = str(center).strip().lower()
+    if c in ("median", "q50", "q0.5", "quantile", "quantile50"):
+        return "median"
+    if c in ("mean", "avg", "average", "expectation"):
+        return "mean"
+    raise ValueError("center must be one of {'median','mean'} (aliases allowed: q50/avg/...).")
 
 
-# ---------------------------------------------------------------------
-# GEV helpers
-# ---------------------------------------------------------------------
-def _gev_cdf(x: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray) -> np.ndarray:
-    """
-    GEV CDF with broadcasting, safe for small |xi|.
-    """
-    x = np.asarray(x, float)
-    mu = np.asarray(mu, float)
-    sigma = np.asarray(sigma, float)
-    xi = np.asarray(xi, float)
-
-    z = (x - mu) / np.clip(sigma, 1e-12, None)
-    tol = 1e-8
-    out = np.empty_like(z)
-
-    mask0 = np.abs(xi) < tol
-    mask1 = ~mask0
-
-    if np.any(mask0):
-        out[mask0] = np.exp(-np.exp(-z[mask0]))
-    if np.any(mask1):
-        t = 1.0 + xi[mask1] * z[mask1]
-        t = np.clip(t, 1e-12, None)
-        out[mask1] = np.exp(-t ** (-1.0 / xi[mask1]))
-
-    return out
+def _center_label(center: str) -> str:
+    c = _normalize_center(center)
+    return "mean" if c == "mean" else "median"
 
 
-def _gev_return_level_block(mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray, N: float) -> np.ndarray:
-    """
-    Block return level z_N such that P(X <= z_N) = 1 - 1/N.
-    """
-    mu = np.asarray(mu, float)
-    sigma = np.asarray(sigma, float)
-    xi = np.asarray(xi, float)
-    N = np.asarray(N, float)
-
-    p = 1.0 - 1.0 / np.clip(N, 1.0 + 1e-9, None)
-    p = np.clip(p, 1e-12, 1.0 - 1e-12)
-    tol = 1e-8
-
-    z = np.empty_like(mu)
-    g = -np.log(-np.log(p))
-
-    mask0 = np.abs(xi) < tol
-    mask1 = ~mask0
-
-    if np.any(mask0):
-        z[mask0] = mu[mask0] + sigma[mask0] * g[mask0]
-    if np.any(mask1):
-        z[mask1] = mu[mask1] + (sigma[mask1] / xi[mask1]) * (np.power(-np.log(p[mask1]), -xi[mask1]) - 1.0)
-
-    return z
-
-
-# ---------------------------------------------------------------------
-# Plotter
-# ---------------------------------------------------------------------
+# =============================================================================
+# DGEV Plotter (mirrors DLMPlotter, with σ and ξ)
+# =============================================================================
 class DGEVPlotter:
     """
-    Plotter for posterior bundles from the DGEV Laplace-based sampler
-    with non-centred structural states and Bayesian lasso priors on
-    signed process SDs.
+    Plotter for posterior bundles from the Laplace-based structural GEV model
+    (non-centred states, Bayesian lasso on process SDs).
 
-    Expected core keys in draws:
-      - mu: (S, T)
-      - y: (T,)
-      - x: (S, T, dim)
-      - sigma: (S,)
-      - xi: (S,)
+    Differences with DLMPlotter:
+      - GEV scale parameter σ and shape parameter ξ.
+      - Trace/hist/ACF panels explicitly include both σ and ξ.
+      - Quick report shows μ, σ, ξ.
 
-    Optional:
-      - alpha0, beta0: (S,)
-      - gamma0: (S, K_gamma)
-      - s_alpha, s_beta, s_gamma: (S,)
-      - Q_alpha, Q_beta, Q_gamma: (S,)
-      - tau_alpha, tau_beta, tau_gamma, lambda2: (S,)
-      - layout, modes in meta (as in DLMPlotter).
+    Everything else mirrors DLMPlotter:
+      - Same overview layout (μ, σ, Q, baselines, RMSE).
+      - Same separate state plots (level, slope, seasonality).
+      - Same clipping / zooming logic for traces and histograms.
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
         self.draws = draws
         self.meta = meta
         self.level = float(level)
-        if not (0 < self.level < 1):
+        if not (0.0 < self.level < 1.0):
             raise ValueError("level must be in (0,1)")
 
-        # --- core ---
         if "mu" not in draws:
-            raise ValueError("draws must contain 'mu' (S, T).")
+            raise ValueError("draws must contain 'mu' of shape (S, T).")
+
         self.mu = np.asarray(draws["mu"], float)
+        if self.mu.ndim != 2:
+            raise ValueError("'mu' must be a 2D array (S, T).")
+
         self.S, self.T = self.mu.shape
-
-        # GEV params
-        self.sigma = None
-        if "sigma" in draws and np.asarray(draws["sigma"]).shape[0] == self.S:
-            self.sigma = np.asarray(draws["sigma"], float)
-        elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
-            self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0, None))
-
-        self.xi = None
-        if "xi" in draws and np.asarray(draws["xi"]).shape[0] == self.S:
-            self.xi = np.asarray(draws["xi"], float)
-
-        # period (blocks per "year")
-        self.period = int(meta.get("period", 1))
-
-        # modes (same handling as DLMPlotter)
-        modes = meta.get("modes")
-        if isinstance(modes, str):
-            toks = modes.split("-")
-            self.level_mode = toks[0] if len(toks) > 0 else "dynamic"
-            self.trend_mode = toks[1] if len(toks) > 1 else "none"
-            self.season_mode = toks[2] if len(toks) > 2 else "none"
-        else:
-            mm = modes if isinstance(modes, dict) else {}
-            self.level_mode = mm.get("level_mode", "dynamic")
-            self.trend_mode = mm.get("trend_mode", "none")
-            self.season_mode = mm.get("seasonal_mode", "none")
+        self.period = int(meta.get("period", 12))
 
         # optional data & truths
         self.y = _maybe(draws, "y")
@@ -218,330 +160,407 @@ class DGEVPlotter:
         self.true_beta = _maybe(draws, "true_beta_t")
         self.true_gamma = _maybe(draws, "true_gamma_t")
 
-        # layout + state indexing
-        self.has_x = ("x" in draws) and draws["x"].ndim == 3
-        self.layout = meta.get("layout")
-        if self.layout is not None:
-            self.layout = list(self.layout)
+        # GEV scale σ
+        self.sigma: Optional[np.ndarray] = None
+        if "sigma" in draws and np.asarray(draws["sigma"]).shape[0] == self.S:
+            self.sigma = np.asarray(draws["sigma"], float)
+        elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
+            self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0.0, None))
 
-        self.idx_alpha: Optional[int] = None
-        self.idx_beta: Optional[int] = None
-        self.idx_g_end: Optional[int] = None
+        # GEV shape ξ
+        self.xi: Optional[np.ndarray] = None
+        if "xi" in draws and np.asarray(draws["xi"]).shape[0] == self.S:
+            self.xi = np.asarray(draws["xi"], float)
 
-        if self.has_x:
-            dim = draws["x"].shape[2]
-            if self.layout:
-                if "alpha" in self.layout:
-                    self.idx_alpha = self.layout.index("alpha")
-                if "beta" in self.layout:
-                    self.idx_beta = self.layout.index("beta")
-                g_indices = [i for i, nm in enumerate(self.layout) if nm.startswith("g")]
-                if g_indices:
-                    self.idx_g_end = g_indices[-1]
-            else:
-                # fallback heuristic (same style as DLMPlotter)
-                i_alpha = 0 if self.level_mode == "dynamic" else None
-                i_beta = None
-                if self.trend_mode == "dynamic":
-                    i_beta = (1 if i_alpha is not None else 0)
-                i_g_end = None
-                if self.season_mode == "dynamic":
-                    start = (1 if i_alpha is not None else 0) + (1 if i_beta is not None else 0)
-                    if (self.period - 1) > 0 and dim >= start + (self.period - 1):
-                        i_g_end = start + (self.period - 2)
-                self.idx_alpha = _safe(self.idx_alpha, i_alpha)
-                self.idx_beta = _safe(self.idx_beta, i_beta)
-                self.idx_g_end = _safe(self.idx_g_end, i_g_end)
-
-        # ---- classify posterior arrays (scalar / vector) ----
+        # scalar & vector params
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
-
         for k, v in draws.items():
-            arr = np.asarray(v)
-            # skip time-path-like arrays & truths
-            if k in ["y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"]:
+            if k in {"y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"}:
                 continue
+            arr = np.asarray(v)
             if arr.ndim == 1 and arr.shape[0] == self.S:
                 self.scalar_params[k] = arr.astype(float)
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # process variances
-        self.Q_alpha = _maybe(self.scalar_params, "Q_alpha")
-        self.Q_beta = _maybe(self.scalar_params, "Q_beta")
-        self.Q_gamma = _maybe(self.scalar_params, "Q_gamma")
+        # baselines
+        self.alpha0 = np.asarray(draws["alpha0"], float) if "alpha0" in draws else _maybe(draws, "m0_alpha")
+        self.beta0 = np.asarray(draws["beta0"], float) if "beta0" in draws else _maybe(draws, "m0_beta")
+        self.gamma0 = np.asarray(draws["gamma0"], float) if "gamma0" in draws else _maybe(draws, "m0_gamma")
 
-        # baselines (alpha0/beta0/gamma0) – allow legacy m0_* naming
-        self.alpha0 = _maybe(self.scalar_params, "alpha0")
-        if self.alpha0 is None:
-            self.alpha0 = _maybe(self.scalar_params, "m0_alpha")
+        # signed SDs (for structural components, not GEV)
+        self.s_alpha = self.scalar_params.get("s_alpha", None)
+        self.s_beta = self.scalar_params.get("s_beta", None)
+        self.s_gamma = self.scalar_params.get("s_gamma", None)
 
-        self.beta0 = _maybe(self.scalar_params, "beta0")
-        if self.beta0 is None:
-            self.beta0 = _maybe(self.scalar_params, "m0_beta")
-
-        self.gamma0 = _maybe(self.vector_params, "gamma0")
-        if self.gamma0 is None:
-            self.gamma0 = _maybe(self.vector_params, "m0_gamma")
-
-        # signed process SDs
-        self.s_alpha = _maybe(self.scalar_params, "s_alpha")
-        self.s_beta = _maybe(self.scalar_params, "s_beta")
-        self.s_gamma = _maybe(self.scalar_params, "s_gamma")
-
-        # lasso scales
-        self.tau_alpha = _maybe(self.scalar_params, "tau_alpha")
-        self.tau_beta = _maybe(self.scalar_params, "tau_beta")
-        self.tau_gamma = _maybe(self.scalar_params, "tau_gamma")
-        self.lambda2 = _maybe(self.scalar_params, "lambda2")
-
-        # unified Q matrix (S, K_Q) and names (mirrors DLMPlotter)
-        self.Q = None
+        # Process variances Q
+        self.Q: Optional[np.ndarray] = None
         self.Q_names: List[str] = []
-
         if "Q" in draws:
             Qmat = np.asarray(draws["Q"], float)
             if Qmat.ndim == 2 and Qmat.shape[0] == self.S:
                 self.Q = Qmat
-                if self.layout and len(self.layout) == Qmat.shape[1]:
-                    self.Q_names = [f"Q[{nm}]" for nm in self.layout]
+                layout = meta.get("layout")
+                if isinstance(layout, (list, tuple)) and len(layout) == Qmat.shape[1]:
+                    self.Q_names = [rf"$Q_{{{nm}}}$" for nm in layout]
                 else:
-                    self.Q_names = [f"Q[{j}]" for j in range(Qmat.shape[1])]
+                    self.Q_names = [rf"$Q_{{{j}}}$" for j in range(Qmat.shape[1])]
         else:
-            cols = []
-            names = []
-            if self.Q_alpha is not None:
-                cols.append(self.Q_alpha.reshape(self.S, 1))
-                names.append("Q_alpha")
-            if self.Q_beta is not None:
-                cols.append(self.Q_beta.reshape(self.S, 1))
-                names.append("Q_beta")
-            if self.Q_gamma is not None:
-                cols.append(self.Q_gamma.reshape(self.S, 1))
-                names.append("Q_gamma")
+            cols, names = [], []
+            for nm, lab in (("Q_alpha", r"$Q_\alpha$"), ("Q_beta", r"$Q_\beta$"), ("Q_gamma", r"$Q_\gamma$")):
+                if nm in self.scalar_params:
+                    cols.append(self.scalar_params[nm].reshape(self.S, 1))
+                    names.append(lab)
             if cols:
                 self.Q = np.concatenate(cols, axis=1)
                 self.Q_names = names
 
-        # quantile endpoints
-        self.lo_q = (1 - self.level) / 2.0
-        self.hi_q = 1.0 - self.lo_q
-        self.band_label = f"{int(round(self.level * 100))}% band"
+        # state layout indexing
+        self.has_x = ("x" in draws) and (np.asarray(draws["x"]).ndim == 3)
+        self.idx_alpha: Optional[int] = None
+        self.idx_beta: Optional[int] = None
+        self.idx_g0: Optional[int] = None
 
-    # ---------- helpers ----------
-    def _summarize_ribbon(self, arr_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return _qtiles(np.asarray(arr_2d, float), self.level)
+        if self.has_x:
+            x = np.asarray(draws["x"])
+            dim = x.shape[2]
+            layout = meta.get("layout")
+            layout_list = list(layout) if isinstance(layout, (list, tuple)) else None
 
+            if layout_list:
+                if "alpha" in layout_list:
+                    self.idx_alpha = layout_list.index("alpha")
+                if "beta" in layout_list:
+                    self.idx_beta = layout_list.index("beta")
+                g_indices = [i for i, nm in enumerate(layout_list) if str(nm).startswith("g")]
+                if g_indices:
+                    self.idx_g0 = g_indices[0]
+            else:
+                self.idx_alpha = 0 if dim >= 1 else None
+                self.idx_beta = 1 if dim >= 2 else None
+                i = 2
+                if self.period > 1 and dim >= i + (self.period - 1):
+                    self.idx_g0 = i
+
+        self.band_label_default = rf"{int(round(self.level * 100))}% band"
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
+    def _summarize_ribbon(
+        self,
+        arr_2d: np.ndarray,
+        *,
+        center: str = "median",
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns (center_line, lo, hi) where lo/hi are quantiles at the chosen level,
+        and center_line is either posterior median or posterior mean.
+        """
+        arr_2d = np.asarray(arr_2d, float)
+        c = _normalize_center(center)
+
+        lo_q = (1.0 - self.level) / 2.0
+        hi_q = 1.0 - lo_q
+
+        lo = np.quantile(arr_2d, lo_q, axis=0)
+        hi = np.quantile(arr_2d, hi_q, axis=0)
+
+        if c == "mean":
+            ctr = np.mean(arr_2d, axis=0)
+        else:
+            ctr = np.quantile(arr_2d, 0.5, axis=0)
+
+        return ctr, lo, hi
+
+    def _component_draws(self, which: str) -> Optional[np.ndarray]:
+        if not self.has_x:
+            return None
+        x = np.asarray(self.draws["x"])
+        if which == "alpha" and self.idx_alpha is not None:
+            return x[:, :, self.idx_alpha]
+        if which == "beta" and self.idx_beta is not None:
+            return x[:, :, self.idx_beta]
+        if which in ("gamma", "seasonal") and self.idx_g0 is not None:
+            return x[:, :, self.idx_g0]
+        return None
+
+    # ------------------------------------------------------------------
+    # Trace/Hist/ACF panel (copied from DLMPlotter)
+    # ------------------------------------------------------------------
     def _trace_hist_acf_panel(
         self,
         series: np.ndarray,
         name: str,
+        *,
+        title_trace: Optional[str] = None,
+        title_hist: Optional[str] = None,
+        title_acf: Optional[str] = None,
+        xlabel_trace: str = "iteration",
+        xlabel_acf: str = "lag",
         max_lag: int = 200,
         save_dir: Optional[str] = None,
         fname: Optional[str] = None,
         show: bool = True,
-    ):
-        s = np.asarray(series, float).ravel()
-        ac = _acf(s, max_lag=max_lag)
-        ess = _ess(s, max_lag=max_lag)
-        gz = _geweke_z(s)
+        trace_ylim: Optional[Tuple[float, float]] = None,
+        hist_xlim: Optional[Tuple[float, float]] = None,
+        plot_policy: str = "none",    # "none" | "clip" | "drop"
+        diag_policy: str = "clean",   # "raw" | "clipped" | "clean"
+        drop_nonfinite: bool = True,
+        clip_q: Optional[Tuple[float, float]] = None,
+        clip_nmad: Optional[float] = None,
+        max_abs: Optional[float] = None,
+        hist_bins: int = 40,
+        auto_zoom_if_clipped: bool = True,
+    ) -> None:
+        s_raw = np.asarray(series, float).ravel()
+        finite_mask = np.isfinite(s_raw)
+        n_nonfinite = int(np.sum(~finite_mask))
+        s_finite = s_raw[finite_mask] if drop_nonfinite else s_raw.copy()
+
+        if s_finite.size == 0:
+            fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+            for ax in axs:
+                ax.axis("off")
+            fig.suptitle(rf"{name}: no finite samples")
+            plt.tight_layout()
+            if save_dir and fname:
+                _ensure_dir(save_dir)
+                out = os.path.join(save_dir, fname)
+                fig.savefig(out, dpi=200, bbox_inches="tight")
+                print(f"[save] {out}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+            return
+
+        plot_policy = str(plot_policy).lower()
+        diag_policy = str(diag_policy).lower()
+        if plot_policy not in ("none", "clip", "drop"):
+            raise ValueError("plot_policy must be one of: 'none', 'clip', 'drop'")
+        if diag_policy not in ("raw", "clipped", "clean"):
+            raise ValueError("diag_policy must be one of: 'raw', 'clipped', 'clean'")
+
+        lo_bound, hi_bound = -np.inf, np.inf
+
+        if max_abs is not None:
+            a = float(abs(max_abs))
+            lo_bound = max(lo_bound, -a)
+            hi_bound = min(hi_bound, +a)
+
+        if clip_q is not None:
+            ql, qh = float(clip_q[0]), float(clip_q[1])
+            ql = max(0.0, min(1.0, ql))
+            qh = max(0.0, min(1.0, qh))
+            if qh <= ql:
+                raise ValueError(f"clip_q must satisfy q_high > q_low, got {clip_q}")
+            qlo = float(np.quantile(s_finite, ql))
+            qhi = float(np.quantile(s_finite, qh))
+            lo_bound = max(lo_bound, qlo)
+            hi_bound = min(hi_bound, qhi)
+
+        if clip_nmad is not None:
+            k = float(clip_nmad)
+            med = float(np.median(s_finite))
+            mad = _mad(s_finite)
+            rsd = _robust_sd_from_mad(mad)
+            if rsd > 0:
+                lo_bound = max(lo_bound, med - k * rsd)
+                hi_bound = min(hi_bound, med + k * rsd)
+
+        use_bounds = np.isfinite(lo_bound) or np.isfinite(hi_bound)
+        if not use_bounds:
+            lo_bound, hi_bound = -np.inf, np.inf
+
+        if use_bounds:
+            out_mask_finite = (s_finite < lo_bound) | (s_finite > hi_bound)
+        else:
+            out_mask_finite = np.zeros_like(s_finite, dtype=bool)
+        n_out = int(np.sum(out_mask_finite))
+
+        s_plot = s_raw.copy()
+        s_plot[~finite_mask] = np.nan
+
+        if use_bounds and plot_policy == "clip":
+            s_plot = np.clip(s_plot, lo_bound, hi_bound)
+        elif use_bounds and plot_policy == "drop":
+            out_mask_raw = np.zeros_like(s_raw, dtype=bool)
+            out_mask_raw[finite_mask] = out_mask_finite
+            s_plot[out_mask_raw] = np.nan
+
+        s_hist = s_finite.copy()
+        if use_bounds and plot_policy == "clip":
+            s_hist = np.clip(s_hist, lo_bound, hi_bound)
+        elif use_bounds and plot_policy == "drop":
+            s_hist = s_hist[~out_mask_finite]
+
+        if diag_policy == "raw":
+            s_diag = s_finite.copy()
+        elif diag_policy == "clipped":
+            s_diag = np.clip(s_finite, lo_bound, hi_bound) if use_bounds else s_finite.copy()
+        else:
+            s_diag = s_finite[~out_mask_finite] if use_bounds else s_finite.copy()
+
+        ac = _acf(s_diag, max_lag=max_lag)
+        ess = _ess(s_diag, max_lag=max_lag)
+        gz = _geweke_z(s_diag)
+
+        extra = []
+        if drop_nonfinite and n_nonfinite > 0:
+            extra.append(f"nonfinite={n_nonfinite}")
+        if use_bounds and n_out > 0:
+            extra.append(f"outliers={n_out}")
+        extra_txt = f" ({', '.join(extra)})" if extra else ""
 
         fig, axs = plt.subplots(1, 3, figsize=(15, 4))
-        # trace
-        axs[0].plot(s, lw=1)
-        axs[0].set_title(f"trace: {name}")
-        axs[0].set_xlabel("iteration")
 
-        # hist
-        axs[1].hist(s, bins=40, density=True)
-        axs[1].set_title(f"hist: {name}")
+        axs[0].plot(s_plot, lw=1)
+        axs[0].set_title(title_trace or rf"trace: {name}{extra_txt}")
+        axs[0].set_xlabel(xlabel_trace)
+        if trace_ylim is not None:
+            axs[0].set_ylim(*trace_ylim)
+        elif auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop") and np.isfinite(lo_bound) and np.isfinite(hi_bound):
+            axs[0].set_ylim(lo_bound, hi_bound)
 
-        # ACF
+        hist_range = None
+        if hist_xlim is not None:
+            hist_range = (float(hist_xlim[0]), float(hist_xlim[1]))
+        elif auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop") and np.isfinite(lo_bound) and np.isfinite(hi_bound):
+            hist_range = (float(lo_bound), float(hi_bound))
+
+        axs[1].hist(s_hist, bins=int(hist_bins), density=True, range=hist_range)
+        axs[1].set_title(title_hist or rf"hist: {name}{extra_txt}")
+        if hist_xlim is not None:
+            axs[1].set_xlim(*hist_xlim)
+
         axs[2].bar(np.arange(ac.size), ac, width=0.9)
         axs[2].set_xlim(-0.5, ac.size - 0.5)
-        axs[2].set_title(f"ACF: {name} (ESS≈{ess:.0f}, z≈{gz:.2f})")
-        axs[2].set_xlabel("lag")
+        axs[2].set_title(title_acf or rf"ACF: {name} (ESS$\approx${ess:.0f}, z$\approx${gz:.2f})")
+        axs[2].set_xlabel(xlabel_acf)
 
         plt.tight_layout()
         if save_dir and fname:
             _ensure_dir(save_dir)
-            path = os.path.join(save_dir, fname)
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            print(f"[save] {path}")
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
         if show:
             plt.show()
         else:
             plt.close(fig)
 
-    def _component_draws(self, key: str) -> Optional[np.ndarray]:
-        if not self.has_x:
-            return None
-        if key == "alpha" and self.idx_alpha is not None:
-            return self.draws["x"][:, :, self.idx_alpha]
-        if key == "beta" and self.idx_beta is not None:
-            return self.draws["x"][:, :, self.idx_beta]
-        if key == "gamma" and self.idx_g_end is not None:
-            return self.draws["x"][:, :, self.idx_g_end]
-        return None
-
-    def _scatter_matrix(
-        self,
-        data: np.ndarray,
-        labels: List[str],
-        title: str,
-        fname: str,
-        save_dir: Optional[str] = None,
-        show: bool = True,
-    ) -> None:
-        data = np.asarray(data, float)
-        n = data.shape[1]
-        if n < 2:
-            print(f"[corr] not enough variables for {title}, need at least 2.")
-            return
-
-        fig, axes = plt.subplots(n, n, figsize=(3.0 * n, 3.0 * n))
-        for i in range(n):
-            for j in range(n):
-                ax = axes[i, j]
-                x = data[:, j]
-                y = data[:, i]
-
-                if i == j:
-                    ax.hist(x, bins=40, density=True)
-                    ax.set_ylabel(labels[i])
-                else:
-                    ax.scatter(x, y, s=4, alpha=0.4)
-                    if np.std(x) > 1e-12 and np.std(y) > 1e-12:
-                        r = float(np.corrcoef(x, y)[0, 1])
-                    else:
-                        r = float("nan")
-                    ax.text(
-                        0.05,
-                        0.9,
-                        f"ρ={r:.2f}" if np.isfinite(r) else "ρ=NA",
-                        transform=ax.transAxes,
-                        ha="left",
-                        va="top",
-                        fontsize=8,
-                    )
-
-                if i < n - 1:
-                    ax.set_xticklabels([])
-                if j > 0:
-                    ax.set_yticklabels([])
-
-        fig.suptitle(title)
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-        if save_dir:
-            _ensure_dir(save_dir)
-            path = os.path.join(save_dir, fname)
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            print(f"[save] {path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    # ---------- figures ----------
+    # ------------------------------------------------------------------
+    # Figures
+    # ------------------------------------------------------------------
     def figure_overview(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "overview",
+        fname: str = "overview.png",
         show: bool = True,
-    ):
+        color: str = "C0",
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        center: str = "median",
+        title_mu: str = r"Posterior $\mu_t$",
+        title_sigma_trace: str = r"trace: $\sigma$",
+        title_sigma_hist: Optional[str] = None,
+        title_Q: str = r"Process variances (log$_{10}$ scale)",
+        title_baselines: str = r"Baselines",
+        title_rmse: str = r"running RMSE($\mu$) vs truth",
+        xlabel_time: str = r"$t$",
+        ylabel_mu: str = r"$\mu_t$",
+        ylims_mu: Optional[Tuple[float, float]] = None,
+        yscale_mu: Optional[str] = None,
+    ) -> None:
         """
-        Overview (2x3) mirroring DLMPlotter, adapted for GEV:
-
-          [0] μ_t ribbon (with y and true μ)
-          [1] σ trace (if present)
-          [2] ξ trace (if present; otherwise σ histogram)
-          [3] log10(Q) histograms
-          [4] baselines alpha0, beta0, gamma0[0] histograms
-          [5] μ_t running RMSE vs true μ (if truth available)
+        Overview identical in layout to DLMPlotter, but interpreted for GEV:
+          - μ_t ribbon with band.
+          - σ trace + σ histogram.
+          - log10(Q) histograms.
+          - baselines (alpha0, beta0, gamma0).
+          - running RMSE if true μ is present.
         """
-        mu = self.mu
-        m_ctr, m_lo, m_hi = self._summarize_ribbon(mu)
+        band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
         fig, axs = plt.subplots(2, 3, figsize=(13, 8))
         axs = axs.ravel()
-        t = np.arange(self.T)
 
-        # [0] μ ribbon
-        axs[0].plot(m_ctr, lw=1.6, label="μ median")
-        axs[0].fill_between(t, m_lo, m_hi, alpha=0.25, label=self.band_label)
+        t = np.arange(self.T)
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.y is not None and len(self.y) == self.T:
-            axs[0].plot(self.y, lw=1.0, alpha=0.6, label="y")
+            axs[0].plot(t, self.y, lw=1.0, alpha=0.6, label=r"$y_t$")
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            axs[0].plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        axs[0].set_title("Posterior μ_t")
+            axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
+        axs[0].set_title(title_mu)
+        axs[0].set_xlabel(xlabel_time)
+        axs[0].set_ylabel(ylabel_mu)
+        if yscale_mu is not None:
+            axs[0].set_yscale(yscale_mu)
+        if ylims_mu is not None:
+            axs[0].set_ylim(*ylims_mu)
         axs[0].legend(loc="upper left")
 
-        # [1] σ trace
         if self.sigma is not None:
             axs[1].plot(self.sigma, lw=1)
-            axs[1].set_title("trace: σ")
-            axs[1].set_xlabel("kept draw")
+            axs[1].set_title(title_sigma_trace)
+            axs[1].set_xlabel(r"kept draw")
+
+            axs[2].hist(self.sigma, bins=40, density=True)
+            if title_sigma_hist is None:
+                es = _ess(self.sigma)
+                gz = _geweke_z(self.sigma)
+                axs[2].set_title(rf"posterior: $\sigma$  (ESS$\approx${es:.0f}, z$\approx${gz:.2f})")
+            else:
+                axs[2].set_title(title_sigma_hist)
         else:
             axs[1].axis("off")
-
-        # [2] ξ trace or σ histogram
-        if self.xi is not None:
-            axs[2].plot(self.xi, lw=1)
-            axs[2].set_title("trace: ξ")
-            axs[2].set_xlabel("kept draw")
-        elif self.sigma is not None:
-            axs[2].hist(self.sigma, bins=40, density=True)
-            es = _ess(self.sigma)
-            gz = _geweke_z(self.sigma)
-            axs[2].set_title(f"posterior: σ  (ESS≈{es:.0f}, z≈{gz:.2f})")
-        else:
             axs[2].axis("off")
 
-        # [3] log10(Q)
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
             logQ = np.log10(np.clip(Q, 1e-20, None))
             ax = axs[3]
-            n_cols = logQ.shape[1]
-            labels = self.Q_names if self.Q_names else [f"Q[{j}]" for j in range(n_cols)]
-            for j in range(n_cols):
-                ax.hist(logQ[:, j], bins=40, density=True, alpha=0.55, label=f"log10 {labels[j]}")
-            ax.set_title("Process variances (log10 scale)")
+            labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(logQ.shape[1])]
+            for j in range(logQ.shape[1]):
+                ax.hist(logQ[:, j], bins=40, density=True, alpha=0.55, label=rf"$\log_{{10}}$ {labels[j]}")
+            ax.set_title(title_Q)
             ax.legend()
         else:
             axs[3].axis("off")
 
-        # [4] baselines
-        any_baseline = any(v is not None for v in [self.alpha0, self.beta0, self.gamma0])
+        any_baseline = (self.alpha0 is not None) or (self.beta0 is not None) or (self.gamma0 is not None)
         if any_baseline:
             ax = axs[4]
             if self.alpha0 is not None:
-                ax.hist(self.alpha0, bins=40, density=True, alpha=0.6, label="alpha0")
+                ax.hist(np.asarray(self.alpha0).ravel(), bins=40, density=True, alpha=0.6, label=r"$\alpha_0$")
             if self.beta0 is not None:
-                ax.hist(self.beta0, bins=40, density=True, alpha=0.6, label="beta0")
-            if self.gamma0 is not None and self.gamma0.shape[1] > 0:
-                ax.hist(self.gamma0[:, 0], bins=40, density=True, alpha=0.6, label="gamma0[0]")
-            ax.set_title("Baselines alpha0/beta0/gamma0")
+                ax.hist(np.asarray(self.beta0).ravel(), bins=40, density=True, alpha=0.6, label=r"$\beta_0$")
+            if self.gamma0 is not None and np.asarray(self.gamma0).ndim == 2 and np.asarray(self.gamma0).shape[1] > 0:
+                ax.hist(np.asarray(self.gamma0)[:, 0], bins=40, density=True, alpha=0.6, label=r"$\gamma_0[0]$")
+            ax.set_title(title_baselines)
             ax.legend()
         else:
             axs[4].axis("off")
 
-        # [5] running RMSE(μ) vs truth
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            err = np.mean((mu - self.true_mu.reshape(1, -1)) ** 2, axis=1) ** 0.5
+            err = np.mean((self.mu - self.true_mu.reshape(1, -1)) ** 2, axis=1) ** 0.5
             running = np.cumsum(err) / np.arange(1, err.size + 1)
             axs[5].plot(running, lw=1.2)
-            axs[5].set_title("running RMSE(μ) vs truth")
-            axs[5].set_xlabel("kept draw")
+            axs[5].set_title(title_rmse)
+            axs[5].set_xlabel(r"kept draw")
         else:
             axs[5].axis("off")
 
         plt.tight_layout()
         if save_dir:
             _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
+            out = os.path.join(save_dir, fname)
             fig.savefig(out, dpi=200, bbox_inches="tight")
             print(f"[save] {out}")
         if show:
@@ -549,498 +568,292 @@ class DGEVPlotter:
         else:
             plt.close(fig)
 
-    def figure_trace_acf_core(self, save_dir: Optional[str] = None, show: bool = True):
+    def figure_trace_acf_core(
+        self,
+        *,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+        max_lag: int = 200,
+        name_sigma: str = r"$\sigma$",
+        name_xi: str = r"$\xi$",
+        name_s_alpha: str = r"$s_\alpha$",
+        name_s_beta: str = r"$s_\beta$",
+        name_s_gamma: str = r"$s_\gamma$",
+        plot_other_scalars: bool = True,
+        trace_ylim: Optional[Tuple[float, float]] = None,
+        hist_xlim: Optional[Tuple[float, float]] = None,
+        plot_policy: str = "none",
+        diag_policy: str = "clean",
+        drop_nonfinite: bool = True,
+        clip_q: Optional[Tuple[float, float]] = None,
+        clip_nmad: Optional[float] = None,
+        max_abs: Optional[float] = None,
+        hist_bins: int = 40,
+        auto_zoom_if_clipped: bool = True,
+    ) -> None:
         """
-        Trace + hist + ACF panels for key scalars and ALL remaining scalar parameters:
-
+        Trace + hist + ACF panels for:
           - σ
           - ξ
-          - signed process SDs s_alpha, s_beta, s_gamma (if present)
-          - log10 Q for remaining Q-coordinates (for which no signed s_* exist)
-          - lambda2, tau_alpha, tau_beta, tau_gamma (if present)
-          - any other scalar posterior array (shape (S,))
+          - signed process SDs s_alpha, s_beta, s_gamma
+          - log10 Q-coordinates without signed SDs
+          - other scalar parameters (excluding σ/ξ and tau's)
         """
+        def _panel(series: np.ndarray, nm: str, fname: str) -> None:
+            self._trace_hist_acf_panel(
+                series,
+                nm,
+                max_lag=max_lag,
+                save_dir=save_dir,
+                fname=fname,
+                show=show,
+                trace_ylim=trace_ylim,
+                hist_xlim=hist_xlim,
+                plot_policy=plot_policy,
+                diag_policy=diag_policy,
+                drop_nonfinite=drop_nonfinite,
+                clip_q=clip_q,
+                clip_nmad=clip_nmad,
+                max_abs=max_abs,
+                hist_bins=hist_bins,
+                auto_zoom_if_clipped=auto_zoom_if_clipped,
+            )
+
         # σ
         if self.sigma is not None:
-            self._trace_hist_acf_panel(
-                self.sigma,
-                "σ",
-                save_dir=save_dir,
-                fname="trace_hist_acf_sigma.png",
-                show=show,
-            )
+            _panel(self.sigma, name_sigma, "trace_hist_acf_sigma.png")
 
         # ξ
         if self.xi is not None:
-            self._trace_hist_acf_panel(
-                self.xi,
-                "ξ",
-                save_dir=save_dir,
-                fname="trace_hist_acf_xi.png",
-                show=show,
-            )
+            _panel(self.xi, name_xi, "trace_hist_acf_xi.png")
 
         # signed process SDs
         if self.s_alpha is not None:
-            self._trace_hist_acf_panel(
-                self.s_alpha,
-                "s_alpha (±√Q_alpha)",
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_alpha.png",
-                show=show,
-            )
+            _panel(self.s_alpha, name_s_alpha, "trace_hist_acf_s_alpha.png")
         if self.s_beta is not None:
-            self._trace_hist_acf_panel(
-                self.s_beta,
-                "s_beta (±√Q_beta)",
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_beta.png",
-                show=show,
-            )
+            _panel(self.s_beta, name_s_beta, "trace_hist_acf_s_beta.png")
         if self.s_gamma is not None:
-            self._trace_hist_acf_panel(
-                self.s_gamma,
-                "s_gamma (±√Q_gamma)",
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_gamma.png",
-                show=show,
-            )
+            _panel(self.s_gamma, name_s_gamma, "trace_hist_acf_s_gamma.png")
 
-        # Q's (log10 scale) only for those coordinates that do NOT have a signed s_*
+        # Q's (log10 scale) only for coords without signed SDs
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
-            labels = self.Q_names if self.Q_names else [f"Q[{j}]" for j in range(Q.shape[1])]
+            labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(Q.shape[1])]
             for j in range(Q.shape[1]):
-                name_j = labels[j]
-                if name_j == "Q_alpha" and self.s_alpha is not None:
+                nm = labels[j]
+                if (nm in (r"$Q_\alpha$", "Q_alpha")) and self.s_alpha is not None:
                     continue
-                if name_j == "Q_beta" and self.s_beta is not None:
+                if (nm in (r"$Q_\beta$", "Q_beta")) and self.s_beta is not None:
                     continue
-                if name_j == "Q_gamma" and self.s_gamma is not None:
+                if (nm in (r"$Q_\gamma$", "Q_gamma")) and self.s_gamma is not None:
                     continue
-                self._trace_hist_acf_panel(
-                    np.log10(np.clip(Q[:, j], 1e-20, None)),
-                    f"log10 {name_j}",
-                    save_dir=save_dir,
-                    fname=f"trace_hist_acf_log10Q_{j}.png",
-                    show=show,
-                )
-
-        # Explicit panels for lasso scales if present
-        if self.lambda2 is not None:
-            self._trace_hist_acf_panel(
-                self.lambda2,
-                "lambda2",
-                save_dir=save_dir,
-                fname="trace_hist_acf_lambda2.png",
-                show=show,
-            )
-        if self.tau_alpha is not None:
-            self._trace_hist_acf_panel(
-                self.tau_alpha,
-                "tau_alpha",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_alpha.png",
-                show=show,
-            )
-        if self.tau_beta is not None:
-            self._trace_hist_acf_panel(
-                self.tau_beta,
-                "tau_beta",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_beta.png",
-                show=show,
-            )
-        if self.tau_gamma is not None:
-            self._trace_hist_acf_panel(
-                self.tau_gamma,
-                "tau_gamma",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_gamma.png",
-                show=show,
-            )
+                series = np.log10(np.clip(Q[:, j], 1e-20, None))
+                _panel(series, rf"$\log_{{10}}({nm})$", f"trace_hist_acf_log10Q_{j}.png")
 
         # All other scalar parameters
-        skip_keys = {
-            "sigma",
-            "sigma2",
-            "xi",
-            "Q_alpha",
-            "Q_beta",
-            "Q_gamma",
-            "s_alpha",
-            "s_beta",
-            "s_gamma",
-            "lambda2",
-            "tau_alpha",
-            "tau_beta",
-            "tau_gamma",
-        }
-        for key, arr in sorted(self.scalar_params.items()):
-            if key in skip_keys:
-                continue
-            self._trace_hist_acf_panel(
-                arr,
-                key,
-                save_dir=save_dir,
-                fname=f"trace_hist_acf_{key}.png",
-                show=show,
-            )
+        if plot_other_scalars:
+            skip = {
+                "sigma", "sigma2", "xi",
+                "s_alpha", "s_beta", "s_gamma",
+                "Q_alpha", "Q_beta", "Q_gamma",
+                "lambda2", "tau_alpha", "tau_beta", "tau_gamma",
+            }
+            for k, arr in sorted(self.scalar_params.items()):
+                if k in skip:
+                    continue
+                if k.startswith("tau_"):
+                    continue
+                _panel(arr, k, f"trace_hist_acf_{k}.png")
 
-    def figure_states(
+    def figure_states_separate(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "states",
+        fname_prefix: str = "state",
         show: bool = True,
-    ):
-        """
-        Stacked ribbons for:
-          - μ
-          - α (if dynamic and in x)
-          - β (if dynamic and in x)
-          - γ(last) (if seasonal dynamic and in x)
-        """
-        rows = 1
-        rows += 1 if self._component_draws("alpha") is not None else 0
-        rows += 1 if self._component_draws("beta") is not None else 0
-        rows += 1 if self._component_draws("gamma") is not None else 0
-
-        fig, axes = plt.subplots(rows, 1, figsize=(12, 3.0 * rows), sharex=True)
-        if rows == 1:
-            axes = [axes]
-        r = 0
-        t = np.arange(self.T)
-
-        # μ
-        mu = self.mu
-        ctr, lo, hi = self._summarize_ribbon(mu)
-        ax = axes[r]
-        if self.y is not None and len(self.y) == self.T:
-            ax.plot(self.y, lw=1.0, alpha=0.6, label="y")
-        ax.plot(ctr, lw=1.6, label="μ median")
-        ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-        if self.true_mu is not None and len(self.true_mu) == self.T:
-            ax.plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        ax.set_title("Posterior μ_t")
-        ax.legend()
-        r += 1
-
-        # α
-        A = self._component_draws("alpha")
-        if A is not None:
-            c, lo, hi = self._summarize_ribbon(A)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="α median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_alpha is not None and len(self.true_alpha) == self.T:
-                ax.plot(self.true_alpha, lw=1.2, ls="--", label="true α")
-            ax.set_title("Level α_t")
-            ax.legend()
-            r += 1
-
-        # β
-        B = self._component_draws("beta")
-        if B is not None:
-            c, lo, hi = self._summarize_ribbon(B)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="β median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_beta is not None and len(self.true_beta) == self.T:
-                ax.plot(self.true_beta, lw=1.2, ls="--", label="true β")
-            ax.set_title("Trend β_t")
-            ax.legend()
-            r += 1
-
-        # γ(last)
-        G = self._component_draws("gamma")
-        if G is not None:
-            c, lo, hi = self._summarize_ribbon(G)
-            ax = axes[r]
-            ax.plot(c, lw=1.6, label="γ(last) median")
-            ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-            if self.true_gamma is not None and len(self.true_gamma) == self.T:
-                ax.plot(self.true_gamma, lw=1.2, ls="--", label="true γ")
-            ax.set_title("Seasonal last coordinate γ_t")
-            ax.legend()
-
-        plt.tight_layout()
-        if save_dir:
-            _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
-            fig.savefig(out, dpi=200, bbox_inches="tight")
-            print(f"[save] {out}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    def figure_correlations(
-        self,
-        save_dir: Optional[str] = None,
-        show: bool = True,
-        max_vars: int = 6,
+        color: str = "C0",
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        center: str = "median",
+        xlabel_time: str = r"$t$",
+        title_level: str = r"Level $\alpha_t$",
+        ylabel_level: str = r"$\alpha_t$",
+        title_slope: str = r"Slope $\beta_t$",
+        ylabel_slope: str = r"$\beta_t$",
+        title_seasonality: str = r"Seasonality $\gamma_t$ (contribution)",
+        ylabel_seasonality: str = r"$\gamma_t$",
+        slope_scale: float = 1.0,
+        ylims: Optional[Dict[str, Tuple[float, float]]] = None,
+        yscales: Optional[Dict[str, str]] = None,
+        zero_line_slope: bool = True,
+        zero_line_seasonality: bool = True,
     ) -> None:
         """
-        Correlation plots (scatter matrices) for:
-
-          1) Signed process SDs: s_alpha, s_beta, s_gamma (if >= 2 exist).
-          2) Baselines: alpha0, beta0, gamma0[j] (if >= 2 exist).
-          3) Joint baselines and signed SDs (if >= 2 total).
+        Separate ribbons for level, slope and seasonality, exactly like in DLMPlotter.
         """
-        # --------- 1) Signed process SDs only ---------
-        cols_s: List[np.ndarray] = []
-        labels_s: List[str] = []
-        if self.s_alpha is not None:
-            cols_s.append(self.s_alpha)
-            labels_s.append("s_alpha")
-        if self.s_beta is not None:
-            cols_s.append(self.s_beta)
-            labels_s.append("s_beta")
-        if self.s_gamma is not None:
-            cols_s.append(self.s_gamma)
-            labels_s.append("s_gamma")
+        band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
-        if len(cols_s) >= 2:
-            data_s = np.column_stack(cols_s)
-            if data_s.shape[1] > max_vars:
-                print(f"[corr] s_*: limiting to first {max_vars} variables.")
-                data_s = data_s[:, :max_vars]
-                labels_s = labels_s[:max_vars]
-            self._scatter_matrix(
-                data_s,
-                labels_s,
-                title="Correlation: signed process SDs",
-                fname="corr_s_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 signed process SDs; skipping s_* correlation plot.")
+        if not self.has_x:
+            print("[states] no centred state draws 'x' found; skipping.")
+            return
 
-        # --------- 2) Baselines alpha0/beta0/gamma0 only ---------
-        cols_b: List[np.ndarray] = []
-        labels_b: List[str] = []
-        if self.alpha0 is not None:
-            cols_b.append(self.alpha0)
-            labels_b.append("alpha0")
-        if self.beta0 is not None:
-            cols_b.append(self.beta0)
-            labels_b.append("beta0")
-        if self.gamma0 is not None:
-            K = self.gamma0.shape[1]
-            for k in range(K):
-                cols_b.append(self.gamma0[:, k])
-                labels_b.append(f"gamma0[{k}]")
-
-        if len(cols_b) >= 2:
-            data_b = np.column_stack(cols_b)
-            if data_b.shape[1] > max_vars:
-                print(f"[corr] baselines: limiting to first {max_vars} variables.")
-                data_b = data_b[:, :max_vars]
-                labels_b = labels_b[:max_vars]
-            self._scatter_matrix(
-                data_b,
-                labels_b,
-                title="Correlation: baselines alpha0/beta0/gamma0",
-                fname="corr_baselines_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 baseline variables; skipping baseline correlation plot.")
-
-        # --------- 3) Joint baselines and signed SDs ---------
-        cols_joint: List[np.ndarray] = []
-        labels_joint: List[str] = []
-
-        # baselines first
-        if self.alpha0 is not None:
-            cols_joint.append(self.alpha0)
-            labels_joint.append("alpha0")
-        if self.beta0 is not None:
-            cols_joint.append(self.beta0)
-            labels_joint.append("beta0")
-        if self.gamma0 is not None:
-            K = self.gamma0.shape[1]
-            for k in range(K):
-                cols_joint.append(self.gamma0[:, k])
-                labels_joint.append(f"gamma0[{k}]")
-
-        # then signed SDs
-        if self.s_alpha is not None:
-            cols_joint.append(self.s_alpha)
-            labels_joint.append("s_alpha")
-        if self.s_beta is not None:
-            cols_joint.append(self.s_beta)
-            labels_joint.append("s_beta")
-        if self.s_gamma is not None:
-            cols_joint.append(self.s_gamma)
-            labels_joint.append("s_gamma")
-
-        if len(cols_joint) >= 2:
-            data_joint = np.column_stack(cols_joint)
-            if data_joint.shape[1] > max_vars:
-                print(f"[corr] baselines + s_*: limiting to first {max_vars} variables.")
-                data_joint = data_joint[:, :max_vars]
-                labels_joint = labels_joint[:max_vars]
-            self._scatter_matrix(
-                data_joint,
-                labels_joint,
-                title="Correlation: baselines and signed process SDs",
-                fname="corr_baselines_s_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 total variables; skipping joint baseline–s_* plot.")
-
-    # ------------------------------------------------------------------
-    # Simple return-level / return-period summaries (GEV specific)
-    # ------------------------------------------------------------------
-    def _mu_sigma_xi_at_t(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Returns (mu, sigma, xi) expanded to (S, T) for plotting
-        return levels / periods. Assumes sigma, xi are constant over t.
-        """
-        mu = self.mu
-        if self.sigma is None or self.xi is None:
-            raise ValueError("sigma and xi must be present for return-level plots.")
-        sigma = np.repeat(self.sigma[:, None], self.T, axis=1)
-        xi = np.repeat(self.xi[:, None], self.T, axis=1)
-        return mu, sigma, xi
-
-    def figure_return_levels(
-        self,
-        N: float = 50.0,
-        save_dir: Optional[str] = None,
-        fname_prefix: str = "return_levels",
-        show: bool = True,
-    ):
-        """
-        Ribbon of block-N return levels over time, using posterior draw-wise
-        mu/sigma/xi. N is in blocks (e.g. years if each block is a year).
-        """
-        mu, sigma, xi = self._mu_sigma_xi_at_t()
-        zN = _gev_return_level_block(mu, sigma, xi, N=N)  # (S, T)
-        ctr, lo, hi = self._summarize_ribbon(zN)
         t = np.arange(self.T)
+        ylims = ylims or {}
+        yscales = yscales or {}
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-        ax.plot(ctr, lw=1.6, label=f"median z_{N}")
-        ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-        ax.set_title(f"Block return level z_N (N={N:g})")
-        ax.set_xlabel("time index")
-        ax.set_ylabel("return level")
+        def _plot_component(
+            arr2d: np.ndarray,
+            *,
+            out_name: str,
+            title: str,
+            ylabel: str,
+            truth: Optional[np.ndarray],
+            zero_line: bool,
+            ylim: Optional[Tuple[float, float]],
+            yscale: Optional[str],
+        ) -> None:
+            ctr, lo, hi = self._summarize_ribbon(arr2d, center=center)
 
-        if self.y is not None and len(self.y) == self.T:
-            ax.plot(self.y, lw=1.0, alpha=0.5, label="y")
+            fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
+            ax.plot(t, ctr, lw=1.6, color=color, label=c_lab)
+            ax.fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
 
-        ax.legend()
-        plt.tight_layout()
-        if save_dir:
-            _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}_N{int(round(N))}.png")
-            fig.savefig(out, dpi=200, bbox_inches="tight")
-            print(f"[save] {out}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+            if truth is not None and len(truth) == self.T:
+                ax.plot(t, truth, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
 
-    def figure_return_periods_for_threshold(
-        self,
-        u: float,
-        save_dir: Optional[str] = None,
-        fname_prefix: str = "return_periods",
-        show: bool = True,
-    ):
-        """
-        For a fixed threshold u, plot posterior median & credible band of
-        block return period N_t(u) = 1 / (1 - F_t(u)), where F_t is the
-        time-varying GEV CDF.
-        """
-        mu, sigma, xi = self._mu_sigma_xi_at_t()
-        u_arr = np.repeat(np.asarray(u, float)[None, None], self.S, axis=0)
-        u_arr = np.repeat(u_arr, self.T, axis=1)
-        F_u = _gev_cdf(u_arr, mu, sigma, xi)
-        p_exc = np.clip(1.0 - F_u, 1e-12, 1.0)
-        N_t = 1.0 / p_exc  # (S, T)
-        ctr, lo, hi = self._summarize_ribbon(N_t)
-        t = np.arange(self.T)
+            if zero_line:
+                ax.axhline(0.0, lw=0.8, color="k", alpha=0.25)
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-        ax.plot(ctr, lw=1.6, label="median return period")
-        ax.fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
-        ax.set_yscale("log")
-        ax.set_xlabel("time index")
-        ax.set_ylabel("return period (blocks)")
-        ax.set_title(f"Return period N_t(u) for threshold u={u:g}")
-        ax.legend()
+            ax.set_title(title)
+            ax.set_xlabel(xlabel_time)
+            ax.set_ylabel(ylabel)
+            ax.grid(True, alpha=0.25)
+            ax.legend(loc="best")
 
-        plt.tight_layout()
-        if save_dir:
-            _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}_u{u:g}.png")
-            fig.savefig(out, dpi=200, bbox_inches="tight")
-            print(f"[save] {out}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
+            if yscale is not None:
+                ax.set_yscale(yscale)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
+
+            plt.tight_layout()
+            if save_dir:
+                _ensure_dir(save_dir)
+                out = os.path.join(save_dir, out_name)
+                fig.savefig(out, dpi=200, bbox_inches="tight")
+                print(f"[save] {out}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+
+        A = self._component_draws("alpha")
+        if A is not None:
+            _plot_component(
+                A,
+                out_name=f"{fname_prefix}_level.png",
+                title=title_level,
+                ylabel=ylabel_level,
+                truth=self.true_alpha,
+                zero_line=False,
+                ylim=ylims.get("level"),
+                yscale=yscales.get("level"),
+            )
+
+        B = self._component_draws("beta")
+        if B is not None:
+            sc = float(slope_scale)
+            Bp = B * sc
+            tb = self.true_beta * sc if (self.true_beta is not None and len(self.true_beta) == self.T) else None
+            _plot_component(
+                Bp,
+                out_name=f"{fname_prefix}_slope.png",
+                title=title_slope,
+                ylabel=ylabel_slope,
+                truth=tb,
+                zero_line=zero_line_slope,
+                ylim=ylims.get("slope"),
+                yscale=yscales.get("slope"),
+            )
+
+        G = self._component_draws("gamma")
+        if G is not None:
+            _plot_component(
+                G,
+                out_name=f"{fname_prefix}_seasonality.png",
+                title=title_seasonality,
+                ylabel=ylabel_seasonality,
+                truth=self.true_gamma,
+                zero_line=zero_line_seasonality,
+                ylim=ylims.get("seasonality"),
+                yscale=yscales.get("seasonality"),
+            )
 
     def quick_report(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "quick_report",
+        fname: str = "quick_report.png",
         show: bool = True,
-    ):
+        color: str = "C0",
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        center: str = "median",
+        title_mu: str = r"$\mu_t$",
+        title_sigma: str = r"$\sigma \mid y$",
+        title_xi: str = r"$\xi \mid y$",
+        xlabel_time: str = r"$t$",
+        ylabel_mu: str = r"$\mu_t$",
+    ) -> None:
         """
-        1x3 compact panel, DLM-style but with ξ:
+        Compact 1x3 summary:
+          - μ_t ribbon.
+          - σ posterior histogram.
+          - ξ posterior histogram (or process scale if ξ missing).
+        """
+        band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
-          - μ ribbon
-          - σ posterior
-          - ξ posterior (or process scale if ξ missing)
-        """
-        mu = self.mu
-        ctr, lo, hi = self._summarize_ribbon(mu)
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
         t = np.arange(self.T)
 
         fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
         # μ
-        axs[0].plot(ctr, lw=1.6, label="μ median")
-        axs[0].fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            axs[0].plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        axs[0].set_title("μ_t")
+            axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
+        axs[0].set_title(title_mu)
+        axs[0].set_xlabel(xlabel_time)
+        axs[0].set_ylabel(ylabel_mu)
         axs[0].legend()
 
         # σ
         if self.sigma is not None:
             axs[1].hist(self.sigma, bins=40, density=True)
-            axs[1].set_title("σ | y")
+            axs[1].set_title(title_sigma)
         else:
             axs[1].axis("off")
 
-        # ξ or process scale
+        # ξ or process scale as fallback
         if self.xi is not None:
             axs[2].hist(self.xi, bins=40, density=True)
-            axs[2].set_title("ξ | y")
+            axs[2].set_title(title_xi)
         elif self.s_alpha is not None:
             axs[2].hist(self.s_alpha, bins=40, density=True)
-            axs[2].set_title("s_alpha (±√Q_alpha) | y")
+            axs[2].set_title(r"process scale")
         elif self.Q is not None and self.Q.size:
             logQ = np.log10(np.clip(self.Q[:, 0], 1e-20, None))
-            label = self.Q_names[0] if self.Q_names else "Q[0]"
             axs[2].hist(logQ, bins=40, density=True)
-            axs[2].set_title(f"log10 {label} | y")
+            axs[2].set_title(r"process scale")
         else:
             axs[2].axis("off")
 
         plt.tight_layout()
         if save_dir:
             _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
+            out = os.path.join(save_dir, fname)
             fig.savefig(out, dpi=200, bbox_inches="tight")
             print(f"[save] {out}")
         if show:
@@ -1049,130 +862,142 @@ class DGEVPlotter:
             plt.close(fig)
 
 
-# ---------------------------------------------------------------------
-# CLI: load and plot via posterior_bundle
-# ---------------------------------------------------------------------
+# =============================================================================
+# CLI
+# =============================================================================
 if __name__ == "__main__":
     import argparse
+    import ast
+
+    def _parse_value(raw: str):
+        s = raw.strip()
+        low = s.lower()
+        if low in ("none", "null"):
+            return None
+        if low in ("true", "false"):
+            return low == "true"
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return s
+
+    def _set_nested(d: dict, key: str, value):
+        parts = [p for p in key.split(".") if p]
+        cur = d
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = value
+
+    def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for it in items:
+            if "=" not in it:
+                raise ValueError(f"Expected K=V, got: {it!r}")
+            k, v = it.split("=", 1)
+            k = k.strip()
+            val = _parse_value(v)
+            if "." in k:
+                _set_nested(out, k, val)
+            else:
+                out[k] = val
+        return out
 
     parser = argparse.ArgumentParser(
         description=(
-            "DGEV plotter for Laplace-based structural GEV models with non-centred states\n"
-            "and Bayesian lasso priors on process SDs.\n"
-            "Loads a posterior bundle via optimization/posterior_bundle "
-            "and produces overview, scalars (trace+hist+ACF), correlation, state, "
-            "and simple return-level/return-period plots."
+            "DGEV plotter for Laplace-based structural GEV models (non-centred state bundles).\n"
+            "Produces overview, scalar trace/hist/ACF, separate state component plots, and a quick report.\n"
+            "Use --<section>-kw K=V (repeatable) to override kwargs.\n"
+            "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1).\n\n"
+            "Ribbon center (use via --overview-kw/--states-kw/--quick-kw):\n"
+            "  center='median' (default) or center='mean'\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+
     parser.add_argument(
         "--target",
         type=str,
         default=None,
-        help="Path to a run directory or directly to posterior.npz. "
-             "If omitted, searches under --root.",
+        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.",
     )
     parser.add_argument(
         "--root",
         type=str,
         default="results/simulations/DGEV_NCP_LASSO",
-        help="Search root when --target is omitted.",
+        help="Search root if --target is omitted.",
+    )
+    parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
+    parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
+    parser.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
+
+    parser.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
+    parser.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
+    parser.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
+    parser.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
+
+    parser.add_argument(
+        "--overview-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
+    )
+    parser.add_argument(
+        "--traceacf-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
+    )
+    parser.add_argument(
+        "--states-kw",
+        action="append",
+        default=["slope_scale=120", "center=mean"],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
+    )
+    parser.add_argument(
+        "--quick-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
     )
 
-    parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
-    parser.add_argument(
-        "--show",
-        action="store_true",
-        default=False,
-        help="Show figures interactively.",
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Directory to save figures. Default: <run>/figures",
-    )
-    parser.add_argument(
-        "--skip-traceacf",
-        action="store_true",
-        help="Skip trace+hist+ACF panels for scalar parameters.",
-    )
-    parser.add_argument(
-        "--skip-states",
-        action="store_true",
-        help="Skip state ribbons.",
-    )
-    parser.add_argument(
-        "--skip-overview",
-        action="store_true",
-        help="Skip overview figure.",
-    )
-    parser.add_argument(
-        "--skip-quick",
-        action="store_true",
-        help="Skip quick 1x3 panel.",
-    )
-    parser.add_argument(
-        "--skip-corr",
-        action="store_true",
-        help="Skip correlation scatter-matrix plots (baselines, s_* and joint).",
-    )
-    parser.add_argument(
-        "--rl-N",
-        type=float,
-        default=None,
-        help="If set, produce a ribbon of block-N return levels over time.",
-    )
-    parser.add_argument(
-        "--rp-u",
-        type=float,
-        default=None,
-        help="If set, produce a ribbon of return periods for a fixed threshold u.",
-    )
     args = parser.parse_args()
 
-    # Resolve run path using helper (mirrors DLMPlotter CLI)
     run_path = args.target
     if run_path is None:
-        print(
-            f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ..."
-        )
+        print(f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ...")
         run_path = find_latest_run(root=args.root)
         if run_path is None:
             print(f"[error] No 'posterior.npz' found under {args.root!r}. Provide --target or change --root.")
             sys.exit(1)
         print(f"[info] Using latest run: {run_path}")
 
-    bundle = load_posterior(run_path)  # PosteriorBundle(draws, meta, npz_path, meta_path)
+    bundle = load_posterior(run_path)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    # Save dir
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "figures")
     _ensure_dir(out_dir)
     print(f"[info] saving figures to: {out_dir}")
 
-    # Plot
     plotter = DGEVPlotter(draws=draws, meta=meta, level=float(args.level))
 
+    overview_kw = _parse_kv_list(args.overview_kw)
+    traceacf_kw = _parse_kv_list(args.traceacf_kw)
+    states_kw = _parse_kv_list(args.states_kw)
+    quick_kw = _parse_kv_list(args.quick_kw)
+
     if not args.skip_overview:
-        plotter.figure_overview(save_dir=out_dir, fname_prefix="overview", show=args.show)
-
+        plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
     if not args.skip_traceacf:
-        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show)
-
+        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
     if not args.skip_states:
-        plotter.figure_states(save_dir=out_dir, fname_prefix="states", show=args.show)
-
-    if not args.skip_corr:
-        plotter.figure_correlations(save_dir=out_dir, show=args.show)
-
+        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
     if not args.skip_quick:
-        plotter.quick_report(save_dir=out_dir, fname_prefix="quick_report", show=args.show)
-
-    if args.rl_N is not None:
-        plotter.figure_return_levels(N=float(args.rl_N), save_dir=out_dir, show=args.show)
-
-    if args.rp_u is not None:
-        plotter.figure_return_periods_for_threshold(u=float(args.rp_u), save_dir=out_dir, show=args.show)
+        plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
     print("[done] plots written.")

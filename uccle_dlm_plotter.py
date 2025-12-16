@@ -1,3 +1,4 @@
+# %% simulator/uccle_dlm_plotter.py
 from __future__ import annotations
 """
 Uccle DLM Plotter (TXm, TNm, Precm; Seasonal / Monthly)
@@ -9,13 +10,13 @@ Thin wrapper around the generic Gaussian DLM plotter:
 
 Supports:
   - Non-centred DLM with dummy seasonality + shrinkage priors (double-gamma, lasso, ...)
-  - Older FS / harmonic runs, as long as they save a posterior bundle readable by
+  - Older runs as long as they save a posterior bundle readable by
     optimization.posterior_bundle.load_posterior
 
 Robust run discovery:
-  - First tries optimization.posterior_bundle.find_latest_run (expects posterior.npz)
-  - If that fails, recursively searches for posterior*.npz under the root and picks
-    the most recent run (by YYYYMMDD_HHMMSS in the path, else by file mtime).
+  1) optimization.posterior_bundle.find_latest_run (expects posterior.npz in run dirs)
+  2) fallback: recursively search for posterior*.npz under the root and pick the most recent
+     (by YYYYMMDD_HHMMSS in the path, else by file mtime).
 
 Default Uccle roots:
   TXm, Seasonal   → results/uccle/TX/TXm/Seasonal
@@ -25,19 +26,31 @@ Default Uccle roots:
   Precm, Seasonal → results/uccle/Prec/Precm/Seasonal
   Precm, Monthly  → results/uccle/Prec/Precm/Monthly
 
+Kwarg overrides (repeatable):
+  --overview-kw K=V
+  --traceacf-kw K=V
+  --states-kw   K=V
+  --quick-kw    K=V
+
+Nested dict kwargs: use dot-notation, e.g.
+  --states-kw ylims.slope=(-2,2)
+  --overview-kw ylims_mu=(0,30)
+
 Examples
 --------
 # Latest TXm / Monthly
 python uccle_dlm_plotter.py --series TXm --freq Monthly
-
-# Latest TXm / Seasonal
-python uccle_dlm_plotter.py --series TXm --freq Seasonal
 
 # Explicit run directory or posterior file
 python uccle_dlm_plotter.py --target path/to/run_or_posterior.npz
 
 # Post-hoc burn & thinning
 python uccle_dlm_plotter.py --series TNm --freq Monthly --burn 1000 --thin 5
+
+# Override titles/labels
+python uccle_dlm_plotter.py --series TXm --freq Monthly ^
+  --overview-kw title_mu="Posterior $\\mu_t$ (TXm)" ^
+  --states-kw title_slope="Trend $\\beta_t$" --states-kw slope_scale=120
 """
 
 import os
@@ -45,12 +58,13 @@ import sys
 import re
 import math
 import argparse
+import ast
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
-import matplotlib.pyplot as plt  # noqa: F401  (used by DLMPlotter internally)
+import matplotlib.pyplot as plt  # noqa: F401 (used by DLMPlotter internally)
 
 # ---------------------------------------------------------------------
 # Make project root importable: optimization/, simulator/, etc.
@@ -64,7 +78,7 @@ from simulator.dlm_plotter import DLMPlotter  # type: ignore
 # ---------------------------------------------------------------------
 # Paths / discovery
 # ---------------------------------------------------------------------
-def ensure_dir(path: Optional[str]) -> None:
+def _ensure_dir(path: Optional[str]) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
 
@@ -82,10 +96,7 @@ def default_root(series: str, freq: str) -> str:
 
 
 def _extract_ts_from_path(path_str: str) -> Optional[float]:
-    """
-    Extract timestamp YYYYMMDD_HHMMSS from a path string and return epoch seconds.
-    Returns None if not found / not parsable.
-    """
+    """Extract YYYYMMDD_HHMMSS from a path string and return epoch seconds, else None."""
     m = re.search(r"(\d{8})_(\d{6})", path_str)
     if not m:
         return None
@@ -103,8 +114,6 @@ def find_latest_posterior_npz(root: str) -> Optional[str]:
     Preference:
       1) largest YYYYMMDD_HHMMSS timestamp found in the *path*
       2) fallback: largest file modification time
-
-    Returns a path string or None.
     """
     root_p = Path(root)
     if not root_p.exists():
@@ -124,7 +133,13 @@ def find_latest_posterior_npz(root: str) -> Optional[str]:
     return str(best)
 
 
-def resolve_bundle(target: Optional[str], series: str, freq: str, root: Optional[str]) -> Any:
+def resolve_bundle(
+    *,
+    target: Optional[str],
+    series: str,
+    freq: str,
+    root: Optional[str],
+) -> Any:
     """
     Resolve a posterior bundle either from explicit --target or via searching.
     Returns the Bundle object from optimization.posterior_bundle.load_posterior.
@@ -135,7 +150,7 @@ def resolve_bundle(target: Optional[str], series: str, freq: str, root: Optional
     search_root = root or default_root(series, freq)
     print(f"[info] searching latest posterior run under: {search_root!r}")
 
-    # First try the "official" finder (usually expects posterior.npz in run dirs)
+    # First try the official finder
     run_path = find_latest_run(root=search_root)
     if run_path is not None:
         print(f"[info] using latest run: {run_path}")
@@ -161,6 +176,7 @@ def resolve_bundle(target: Optional[str], series: str, freq: str, root: Optional
 def apply_burn_thin(
     draws: Dict[str, Any],
     meta: Dict[str, Any],
+    *,
     burn: int = 0,
     thin: int = 1,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -192,11 +208,9 @@ def apply_burn_thin(
         raise ValueError(f"--burn={burn} ≥ number of saved samples ({n_samp}).")
 
     idx = slice(burn, None, thin)
-    n_used = math.ceil((n_samp - burn) / thin)
+    n_used = int(math.ceil((n_samp - burn) / thin))
 
-    print(
-        f"[info] post-processing chains: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}"
-    )
+    print(f"[info] post-processing chains: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}")
 
     for k, v in list(draws.items()):
         if not isinstance(v, np.ndarray):
@@ -219,13 +233,55 @@ def apply_burn_thin(
 
 
 # ---------------------------------------------------------------------
+# CLI kwarg overrides (same style as simulator/dlm_plotter.py)
+# ---------------------------------------------------------------------
+def _parse_value(raw: str):
+    s = raw.strip()
+    low = s.lower()
+    if low in ("none", "null"):
+        return None
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return s
+
+
+def _set_nested(d: dict, key: str, value):
+    parts = [p for p in key.split(".") if p]
+    cur = d
+    for p in parts[:-1]:
+        if p not in cur or not isinstance(cur[p], dict):
+            cur[p] = {}
+        cur = cur[p]
+    cur[parts[-1]] = value
+
+
+def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for it in items:
+        if "=" not in it:
+            raise ValueError(f"Expected K=V, got: {it!r}")
+        k, v = it.split("=", 1)
+        k = k.strip()
+        val = _parse_value(v)
+        if "." in k:
+            _set_nested(out, k, val)
+        else:
+            out[k] = val
+    return out
+
+
+# ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Uccle DLM Plotter (TXm/TNm/Precm; Seasonal/Monthly)\n"
-            "Uses the generic Gaussian DLMPlotter (non-centred, double-gamma, FS, etc.)."
+            "Uses the generic Gaussian DLMPlotter (non-centred, double-gamma, lasso, FS, etc.).\n"
+            "Use --<section>-kw K=V (repeatable) to override ANY plot kwargs.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -235,15 +291,13 @@ def build_argparser() -> argparse.ArgumentParser:
         "--target",
         type=str,
         default=None,
-        help=(
-            "Run directory or posterior .npz. If provided, overrides --series/--freq/--root."
-        ),
+        help="Run directory or posterior .npz. If provided, overrides --series/--freq/--root.",
     )
     p.add_argument(
         "--series",
         type=str,
         choices=["TXm", "TNm", "Precm"],
-        default="TNm",
+        default="Precm",
         help="Series code when searching by default roots (ignored if --target is given).",
     )
     p.add_argument(
@@ -263,23 +317,47 @@ def build_argparser() -> argparse.ArgumentParser:
     # Plot options
     p.add_argument("--level", type=float, default=0.90, help="Credible band level.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
-    p.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Directory to save figures (default: <run>/figures).",
-    )
+    p.add_argument("--out", type=str, default=None, help="Directory to save figures (default: <run>/figures).")
 
-    # Skips (match simulator/dlm_plotter CLI)
+    # Skips (match simulator/dlm_plotter.py)
     p.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
     p.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
-    p.add_argument("--skip-states", action="store_true", help="Skip state ribbons.")
-    p.add_argument("--skip-corr", action="store_true", help="Skip correlation scatter matrices.")
+    p.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
     p.add_argument("--skip-quick", action="store_true", help="Skip quick 1x3 report.")
 
     # Post-hoc chain processing
     p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
     p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
+
+    # Per-figure kwargs (repeatable)
+    p.add_argument(
+        "--overview-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--traceacf-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--states-kw",
+        action="append",
+        default=["slope_scale=120"],  
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--quick-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
+    )
 
     return p
 
@@ -288,13 +366,7 @@ def main() -> None:
     args = build_argparser().parse_args()
 
     # Resolve posterior bundle
-    bundle = resolve_bundle(
-        target=args.target,
-        series=args.series,
-        freq=args.freq,
-        root=args.root,
-    )
-
+    bundle = resolve_bundle(target=args.target, series=args.series, freq=args.freq, root=args.root)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
     # Post-hoc burn/thin
@@ -303,28 +375,32 @@ def main() -> None:
 
     # Output directory
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "figures")
-    ensure_dir(out_dir)
+    _ensure_dir(out_dir)
 
     print(f"[info] using posterior: {npz_path}")
     print(f"[info] saving plots to: {out_dir}")
 
-    # Plot
+    # Plotter
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
+    # Parse per-figure kw overrides
+    overview_kw = _parse_kv_list(args.overview_kw)
+    traceacf_kw = _parse_kv_list(args.traceacf_kw)
+    states_kw = _parse_kv_list(args.states_kw)
+    quick_kw = _parse_kv_list(args.quick_kw)
+
+    # Generate figures (filenames default to the generic plotter, unless you override via *-kw fname=...)
     if not args.skip_overview:
-        plotter.figure_overview(save_dir=out_dir, fname_prefix="overview", show=args.show)
+        plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
 
     if not args.skip_traceacf:
-        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show)
+        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
 
     if not args.skip_states:
-        plotter.figure_states(save_dir=out_dir, fname_prefix="states", show=args.show)
-
-    if not args.skip_corr:
-        plotter.figure_correlations(save_dir=out_dir, show=args.show)
+        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
 
     if not args.skip_quick:
-        plotter.quick_report(save_dir=out_dir, fname_prefix="quick_report", show=args.show)
+        plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
     print("[done] plots written.")
 

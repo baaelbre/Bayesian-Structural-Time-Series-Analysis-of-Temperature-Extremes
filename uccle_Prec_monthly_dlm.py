@@ -30,6 +30,12 @@ DATA_DIR = Path("data")
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
+def _idx_for_matplotlib(idx: pd.Index):
+    # Matplotlib cannot plot Period objects; convert to timestamps
+    if isinstance(idx, pd.PeriodIndex):
+        return idx.to_timestamp()  # DatetimeIndex
+    return idx
+
 
 def _series_out_root(series: str) -> Path:
     """
@@ -39,8 +45,9 @@ def _series_out_root(series: str) -> Path:
     """
     base = Path("results/uccle")
     mapping = {
-        "Precm": base / "Prec" / "Precm" / "Monthly" / "NCP_LASSO",
+        "Precm": base / "Prec" / "Precm" / "Monthly",
     }
+
     if series not in mapping:
         raise ValueError(f"Unknown series '{series}' for output mapping.")
     return mapping[series]
@@ -338,10 +345,12 @@ def run_one(
     mu_hat = mu_draws.mean(axis=0)
     lo, hi = np.quantile(mu_draws, [0.05, 0.95], axis=0)
 
+    idx_plot = _idx_for_matplotlib(idx)
+
     plt.figure(figsize=(12, 4))
-    plt.plot(idx, y, lw=1, label=series)
-    plt.plot(idx, mu_hat, "-.", lw=1.5, label=r"$\hat{\mu}_t$ (post. mean)")
-    plt.fill_between(idx, lo, hi, alpha=0.2, label=r"90% CI for $\mu_t$")
+    plt.plot(idx_plot, y, lw=1, label=series)
+    plt.plot(idx_plot, mu_hat, "-.", lw=1.5, label=r"$\hat{\mu}_t$ (post. mean)")
+    plt.fill_between(idx_plot, lo, hi, alpha=0.2, label=r"90% CI for $\mu_t$")
     plt.title(f"{series}: monthly DLM (Bayesian lasso on process SDs) — modes={modes_tag}, period={period}")
     plt.grid(True)
     plt.legend()
@@ -350,6 +359,7 @@ def run_one(
     fit_name = f"fit_{series}_{date_tag}_{modes_tag}.png"
     plt.savefig(outdir / fit_name, dpi=150)
     plt.close()
+
 
     print(f"Saved posterior to {out_npz}")
     print(f"Saved fit plot to {outdir / fit_name}\n")

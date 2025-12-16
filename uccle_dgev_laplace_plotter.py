@@ -11,8 +11,7 @@ Uccle wrapper around the generic Laplace DGEV plotter:
 
 Key features
 ------------
-- Same figures as the generic plotter (overview, states, traces/ACF, posteriors, quick report,
-  return levels, return periods).
+- Same figures as the generic DGEV plotter (overview, trace/hist/ACF, states, quick report).
 - Uccle-specific default roots for Laplace runs.
 - Robust "latest run" discovery even if files are named posterior_*.npz (not necessarily posterior.npz).
 - Works with load_posterior returning a PosteriorBundle object (NOT a tuple).
@@ -38,7 +37,7 @@ python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal --show
 
 # monthly TNn, only quick report
 python -u uccle_dgev_laplace_plotter.py --series TNn --agg Monthly \
-  --skip-overview --skip-states --skip-traces --skip-posteriors --show
+  --skip-overview --skip-states --skip-traces --show
 
 # explicit run directory or posterior .npz
 python -u uccle_dgev_laplace_plotter.py --target path/to/run_or_posterior.npz
@@ -180,7 +179,8 @@ def apply_burn_thin(
     thin: int = 1,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Post-hoc burn-in + thinning for arrays whose first dim matches n_samp inferred from draws["mu"].
+    Post-hoc burn-in + thinning for arrays whose first dim matches n_samp
+    inferred from draws['mu'].
     """
     if "mu" not in draws:
         print("[warn] 'mu' not in draws; skipping post-hoc burn/thin.")
@@ -227,7 +227,7 @@ def apply_burn_thin(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main / CLI
 # ---------------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -261,7 +261,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--skip-overview", action="store_true", default=False)
     p.add_argument("--skip-states", action="store_true", default=False)
     p.add_argument("--skip-traces", action="store_true", default=False)
-    p.add_argument("--skip-posteriors", action="store_true", default=False)
     p.add_argument("--skip-quick", action="store_true", default=False)
 
     p.add_argument("--max-lag", type=int, default=200, help="ACF / ESS max lag for trace plots.")
@@ -269,43 +268,6 @@ def build_argparser() -> argparse.ArgumentParser:
     # Post-hoc chain processing
     p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
     p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
-
-    # Return levels / return periods (off by default)
-    p.add_argument(
-        "--rl-N",
-        dest="rl_N",
-        type=float,
-        default=None,
-        help="If set, plot N-block return level time series (N in block units).",
-    )
-    p.add_argument(
-        "--rl-season",
-        dest="rl_season",
-        type=int,
-        default=None,
-        help="Season index (0..period-1) for return levels; default all blocks.",
-    )
-    p.add_argument(
-        "--rp-u",
-        dest="rp_u",
-        type=float,
-        default=None,
-        help="If set, plot time-varying return periods for threshold u (data units).",
-    )
-    p.add_argument(
-        "--rp-yearly",
-        dest="rp_yearly",
-        action="store_true",
-        default=False,
-        help="If set, compute yearly return periods (at least one exceedance per year).",
-    )
-    p.add_argument(
-        "--rp-season",
-        dest="rp_season",
-        type=int,
-        default=None,
-        help="Season index for block-wise return periods (ignored if --rp-yearly).",
-    )
 
     return p
 
@@ -335,40 +297,31 @@ def main() -> None:
 
     pl = DGEVPlotter(draws=draws, meta=meta, level=float(args.level))
 
+    # Overview
     if not args.skip_overview:
-        pl.figure_overview(out_dir, args.show)
+        pl.figure_overview(save_dir=out_dir, show=args.show)
 
+    # Trace + hist + ACF (σ, ξ, process scales, other scalars)
+    if not args.skip_traces:
+        pl.figure_trace_acf_core(
+            save_dir=out_dir,
+            show=args.show,
+            max_lag=int(args.max_lag),
+        )
+
+    # Separate states (level, slope, seasonality)
     if not args.skip_states:
-        pl.figure_states(out_dir, args.show)
+        # Keep same default slope scaling as in DLM plotter (120 months ~ 10 years)
+        pl.figure_states_separate(
+            save_dir=out_dir,
+            show=args.show,
+            slope_scale=120.0,
+            center="mean",
+        )
 
-
-    if not args.skip_posteriors:
-        # keep backwards compatibility if older plotter lacks it
-        if hasattr(pl, "figure_posteriors_grouped_all"):
-            pl.figure_posteriors_grouped_all(out_dir, args.show)  # type: ignore[attr-defined]
-        else:
-            print("[warn] plotter has no figure_posteriors_grouped_all(); skipping posteriors.")
-
+    # Quick report
     if not args.skip_quick:
-        pl.quick_report(out_dir, args.show)
-
-    # Return levels / return periods
-    if args.rl_N is not None:
-        pl.figure_return_levels(
-            N=float(args.rl_N),
-            season=args.rl_season,
-            save_dir=out_dir,
-            show=args.show,
-        )
-
-    if args.rp_u is not None:
-        pl.figure_return_periods(
-            u=float(args.rp_u),
-            yearly=bool(args.rp_yearly),
-            season=None if args.rp_yearly else args.rp_season,
-            save_dir=out_dir,
-            show=args.show,
-        )
+        pl.quick_report(save_dir=out_dir, show=args.show)
 
     print("[done] Uccle DGEV Laplace plots written.")
 

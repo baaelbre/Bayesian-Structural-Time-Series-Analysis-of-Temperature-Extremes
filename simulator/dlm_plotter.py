@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import os
-import math
 import sys
+import math
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -31,8 +31,25 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
+def _mad(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan")
+    med = float(np.median(x))
+    return float(np.median(np.abs(x - med)))
+
+
+def _robust_sd_from_mad(mad: float) -> float:
+    # For Normal: MAD ≈ 0.6745 * sd  => sd ≈ MAD/0.6745
+    if not np.isfinite(mad) or mad <= 0:
+        return 0.0
+    return float(mad) / 0.6745
+
+
 def _acf(x: np.ndarray, max_lag: int = 200) -> np.ndarray:
     x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
     n = x.size
     if n <= 1:
         return np.array([1.0 if n == 1 else np.nan])
@@ -46,9 +63,15 @@ def _acf(x: np.ndarray, max_lag: int = 200) -> np.ndarray:
 
 
 def _ess(x: np.ndarray, max_lag: int = 200) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size <= 1:
+        return float(max(1, x.size))
+
     ac = _acf(x, max_lag=max_lag)
     if not np.all(np.isfinite(ac)) or ac.size <= 1:
         return float(len(x))
+
     s = 0.0
     for k in range(1, ac.size):
         if ac[k] <= 0:
@@ -60,9 +83,10 @@ def _ess(x: np.ndarray, max_lag: int = 200) -> float:
 
 def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) -> float:
     x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
     n = x.size
     if n < 8:
-        return np.nan
+        return float("nan")
     a = max(2, int(np.floor(first_frac * n)))
     b = max(2, int(np.floor(last_frac * n)))
     xa, xb = x[:a], x[n - b :]
@@ -73,19 +97,23 @@ def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) ->
     return (ma - mb) / denom
 
 
-def _qtiles(arr_2d: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    lo = (1 - level) / 2.0
-    hi = 1.0 - lo
-    return (
-        np.quantile(arr_2d, 0.5, axis=0),
-        np.quantile(arr_2d, lo, axis=0),
-        np.quantile(arr_2d, hi, axis=0),
-    )
-
-
 def _maybe(draws: Dict[str, Any], key: str) -> Optional[np.ndarray]:
     v = draws.get(key, None)
     return None if v is None else np.asarray(v)
+
+
+def _normalize_center(center: str) -> str:
+    c = str(center).strip().lower()
+    if c in ("median", "q50", "q0.5", "quantile", "quantile50"):
+        return "median"
+    if c in ("mean", "avg", "average", "expectation"):
+        return "mean"
+    raise ValueError("center must be one of {'median','mean'} (aliases allowed: q50/avg/...).")
+
+
+def _center_label(center: str) -> str:
+    c = _normalize_center(center)
+    return "mean" if c == "mean" else "median"
 
 
 # =============================================================================
@@ -106,18 +134,25 @@ class DLMPlotter:
       - s_alpha, s_beta, s_gamma
       - Q_alpha, Q_beta, Q_gamma or Q (S, K)
 
-    Notes:
-      - No correlation plots in this version.
-      - No trace/hist/ACF for lambda2 or tau_* in this version.
-      - Separate component plots only (no combined states.png).
-      - Slope rescaling is applied to the plotted values ONLY, and is never shown in any label/title.
+    New (trace/hist handling):
+      - You can zoom traces/hists (trace_ylim, hist_xlim)
+      - Or handle outliers for plotting/diagnostics:
+          plot_policy: "none" | "clip" | "drop"
+          diag_policy: "raw" | "clipped" | "clean"
+          clip_q=(qlo,qhi)   quantile bounds
+          clip_nmad=k        bounds = median ± k * MAD/0.6745
+          max_abs=a          bounds = [-a, +a]
+
+    New (ribbon center):
+      - center: "median" (default) or "mean"
+        Used for the central line only; the band remains quantile-based.
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
         self.draws = draws
         self.meta = meta
         self.level = float(level)
-        if not (0 < self.level < 1):
+        if not (0.0 < self.level < 1.0):
             raise ValueError("level must be in (0,1)")
 
         if "mu" not in draws:
@@ -138,16 +173,15 @@ class DLMPlotter:
         self.true_gamma = _maybe(draws, "true_gamma_t")
 
         # sigma
-        self.sigma = None
+        self.sigma: Optional[np.ndarray] = None
         if "sigma" in draws and np.asarray(draws["sigma"]).shape[0] == self.S:
             self.sigma = np.asarray(draws["sigma"], float)
         elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
-            self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0, None))
+            self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0.0, None))
 
-        # ---- scalar & vector params (per draw) ----
+        # scalar & vector params
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
-
         for k, v in draws.items():
             if k in {"y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"}:
                 continue
@@ -157,7 +191,7 @@ class DLMPlotter:
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # baselines (alpha0 exists in your runs)
+        # baselines
         self.alpha0 = np.asarray(draws["alpha0"], float) if "alpha0" in draws else _maybe(draws, "m0_alpha")
         self.beta0 = np.asarray(draws["beta0"], float) if "beta0" in draws else _maybe(draws, "m0_beta")
         self.gamma0 = np.asarray(draws["gamma0"], float) if "gamma0" in draws else _maybe(draws, "m0_gamma")
@@ -168,7 +202,7 @@ class DLMPlotter:
         self.s_gamma = self.scalar_params.get("s_gamma", None)
 
         # Q matrix
-        self.Q = None
+        self.Q: Optional[np.ndarray] = None
         self.Q_names: List[str] = []
         if "Q" in draws:
             Qmat = np.asarray(draws["Q"], float)
@@ -180,8 +214,7 @@ class DLMPlotter:
                 else:
                     self.Q_names = [rf"$Q_{{{j}}}$" for j in range(Qmat.shape[1])]
         else:
-            cols = []
-            names = []
+            cols, names = [], []
             for nm, lab in (("Q_alpha", r"$Q_\alpha$"), ("Q_beta", r"$Q_\beta$"), ("Q_gamma", r"$Q_\gamma$")):
                 if nm in self.scalar_params:
                     cols.append(self.scalar_params[nm].reshape(self.S, 1))
@@ -190,11 +223,11 @@ class DLMPlotter:
                 self.Q = np.concatenate(cols, axis=1)
                 self.Q_names = names
 
-        # ---- state layout indexing ----
+        # state layout indexing
         self.has_x = ("x" in draws) and (np.asarray(draws["x"]).ndim == 3)
-        self.idx_alpha = None
-        self.idx_beta = None
-        self.idx_g0 = None
+        self.idx_alpha: Optional[int] = None
+        self.idx_beta: Optional[int] = None
+        self.idx_g0: Optional[int] = None
 
         if self.has_x:
             x = np.asarray(draws["x"])
@@ -211,65 +244,42 @@ class DLMPlotter:
                 if g_indices:
                     self.idx_g0 = g_indices[0]
             else:
-                # heuristic fallback: alpha, beta, then seasonal block
                 self.idx_alpha = 0 if dim >= 1 else None
                 self.idx_beta = 1 if dim >= 2 else None
                 i = 2
                 if self.period > 1 and dim >= i + (self.period - 1):
                     self.idx_g0 = i
 
-        self.band_label_default = rf"{int(round(self.level * 100))}\% band"
+        self.band_label_default = rf"{int(round(self.level * 100))}% band"
 
     # ------------------------------------------------------------------
     # Core helpers
     # ------------------------------------------------------------------
-    def _summarize_ribbon(self, arr_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        return _qtiles(np.asarray(arr_2d, float), self.level)
-
-    def _trace_hist_acf_panel(
+    def _summarize_ribbon(
         self,
-        series: np.ndarray,
-        name: str,
+        arr_2d: np.ndarray,
         *,
-        title_trace: Optional[str] = None,
-        title_hist: Optional[str] = None,
-        title_acf: Optional[str] = None,
-        xlabel_trace: str = "iteration",
-        xlabel_acf: str = "lag",
-        max_lag: int = 200,
-        save_dir: Optional[str] = None,
-        fname: Optional[str] = None,
-        show: bool = True,
-    ) -> None:
-        s = np.asarray(series, float).ravel()
-        ac = _acf(s, max_lag=max_lag)
-        ess = _ess(s, max_lag=max_lag)
-        gz = _geweke_z(s)
+        center: str = "median",
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns (center_line, lo, hi) where lo/hi are quantiles at the chosen level,
+        and center_line is either posterior median or posterior mean.
+        """
+        arr_2d = np.asarray(arr_2d, float)
+        c = _normalize_center(center)
 
-        fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+        lo_q = (1.0 - self.level) / 2.0
+        hi_q = 1.0 - lo_q
 
-        axs[0].plot(s, lw=1)
-        axs[0].set_title(title_trace or rf"trace: {name}")
-        axs[0].set_xlabel(xlabel_trace)
+        lo = np.quantile(arr_2d, lo_q, axis=0)
+        hi = np.quantile(arr_2d, hi_q, axis=0)
 
-        axs[1].hist(s, bins=40, density=True)
-        axs[1].set_title(title_hist or rf"hist: {name}")
-
-        axs[2].bar(np.arange(ac.size), ac, width=0.9)
-        axs[2].set_xlim(-0.5, ac.size - 0.5)
-        axs[2].set_title(title_acf or rf"ACF: {name} (ESS$\approx${ess:.0f}, z$\approx${gz:.2f})")
-        axs[2].set_xlabel(xlabel_acf)
-
-        plt.tight_layout()
-        if save_dir and fname:
-            _ensure_dir(save_dir)
-            path = os.path.join(save_dir, fname)
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            print(f"[save] {path}")
-        if show:
-            plt.show()
+        if c == "mean":
+            ctr = np.mean(arr_2d, axis=0)
         else:
-            plt.close(fig)
+            ctr = np.quantile(arr_2d, 0.5, axis=0)
+
+        return ctr, lo, hi
 
     def _component_draws(self, which: str) -> Optional[np.ndarray]:
         if not self.has_x:
@@ -284,6 +294,171 @@ class DLMPlotter:
         return None
 
     # ------------------------------------------------------------------
+    # Trace/Hist/ACF panel (unchanged)
+    # ------------------------------------------------------------------
+    def _trace_hist_acf_panel(
+        self,
+        series: np.ndarray,
+        name: str,
+        *,
+        title_trace: Optional[str] = None,
+        title_hist: Optional[str] = None,
+        title_acf: Optional[str] = None,
+        xlabel_trace: str = "iteration",
+        xlabel_acf: str = "lag",
+        max_lag: int = 200,
+        save_dir: Optional[str] = None,
+        fname: Optional[str] = None,
+        show: bool = True,
+        trace_ylim: Optional[Tuple[float, float]] = None,
+        hist_xlim: Optional[Tuple[float, float]] = None,
+        plot_policy: str = "none",    # "none" | "clip" | "drop"
+        diag_policy: str = "clean",   # "raw" | "clipped" | "clean"
+        drop_nonfinite: bool = True,
+        clip_q: Optional[Tuple[float, float]] = None,
+        clip_nmad: Optional[float] = None,
+        max_abs: Optional[float] = None,
+        hist_bins: int = 40,
+        auto_zoom_if_clipped: bool = True,
+    ) -> None:
+        s_raw = np.asarray(series, float).ravel()
+        finite_mask = np.isfinite(s_raw)
+        n_nonfinite = int(np.sum(~finite_mask))
+        s_finite = s_raw[finite_mask] if drop_nonfinite else s_raw.copy()
+
+        if s_finite.size == 0:
+            fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+            for ax in axs:
+                ax.axis("off")
+            fig.suptitle(rf"{name}: no finite samples")
+            plt.tight_layout()
+            if save_dir and fname:
+                _ensure_dir(save_dir)
+                out = os.path.join(save_dir, fname)
+                fig.savefig(out, dpi=200, bbox_inches="tight")
+                print(f"[save] {out}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
+            return
+
+        plot_policy = str(plot_policy).lower()
+        diag_policy = str(diag_policy).lower()
+        if plot_policy not in ("none", "clip", "drop"):
+            raise ValueError("plot_policy must be one of: 'none', 'clip', 'drop'")
+        if diag_policy not in ("raw", "clipped", "clean"):
+            raise ValueError("diag_policy must be one of: 'raw', 'clipped', 'clean'")
+
+        lo_bound, hi_bound = -np.inf, np.inf
+
+        if max_abs is not None:
+            a = float(abs(max_abs))
+            lo_bound = max(lo_bound, -a)
+            hi_bound = min(hi_bound, +a)
+
+        if clip_q is not None:
+            ql, qh = float(clip_q[0]), float(clip_q[1])
+            ql = max(0.0, min(1.0, ql))
+            qh = max(0.0, min(1.0, qh))
+            if qh <= ql:
+                raise ValueError(f"clip_q must satisfy q_high > q_low, got {clip_q}")
+            qlo = float(np.quantile(s_finite, ql))
+            qhi = float(np.quantile(s_finite, qh))
+            lo_bound = max(lo_bound, qlo)
+            hi_bound = min(hi_bound, qhi)
+
+        if clip_nmad is not None:
+            k = float(clip_nmad)
+            med = float(np.median(s_finite))
+            mad = _mad(s_finite)
+            rsd = _robust_sd_from_mad(mad)
+            if rsd > 0:
+                lo_bound = max(lo_bound, med - k * rsd)
+                hi_bound = min(hi_bound, med + k * rsd)
+
+        use_bounds = np.isfinite(lo_bound) or np.isfinite(hi_bound)
+        if not use_bounds:
+            lo_bound, hi_bound = -np.inf, np.inf
+
+        if use_bounds:
+            out_mask_finite = (s_finite < lo_bound) | (s_finite > hi_bound)
+        else:
+            out_mask_finite = np.zeros_like(s_finite, dtype=bool)
+        n_out = int(np.sum(out_mask_finite))
+
+        s_plot = s_raw.copy()
+        s_plot[~finite_mask] = np.nan
+
+        if use_bounds and plot_policy == "clip":
+            s_plot = np.clip(s_plot, lo_bound, hi_bound)
+        elif use_bounds and plot_policy == "drop":
+            out_mask_raw = np.zeros_like(s_raw, dtype=bool)
+            out_mask_raw[finite_mask] = out_mask_finite
+            s_plot[out_mask_raw] = np.nan
+
+        s_hist = s_finite.copy()
+        if use_bounds and plot_policy == "clip":
+            s_hist = np.clip(s_hist, lo_bound, hi_bound)
+        elif use_bounds and plot_policy == "drop":
+            s_hist = s_hist[~out_mask_finite]
+
+        if diag_policy == "raw":
+            s_diag = s_finite.copy()
+        elif diag_policy == "clipped":
+            s_diag = np.clip(s_finite, lo_bound, hi_bound) if use_bounds else s_finite.copy()
+        else:
+            s_diag = s_finite[~out_mask_finite] if use_bounds else s_finite.copy()
+
+        ac = _acf(s_diag, max_lag=max_lag)
+        ess = _ess(s_diag, max_lag=max_lag)
+        gz = _geweke_z(s_diag)
+
+        extra = []
+        if drop_nonfinite and n_nonfinite > 0:
+            extra.append(f"nonfinite={n_nonfinite}")
+        if use_bounds and n_out > 0:
+            extra.append(f"outliers={n_out}")
+        extra_txt = f" ({', '.join(extra)})" if extra else ""
+
+        fig, axs = plt.subplots(1, 3, figsize=(15, 4))
+
+        axs[0].plot(s_plot, lw=1)
+        axs[0].set_title(title_trace or rf"trace: {name}{extra_txt}")
+        axs[0].set_xlabel(xlabel_trace)
+        if trace_ylim is not None:
+            axs[0].set_ylim(*trace_ylim)
+        elif auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop") and np.isfinite(lo_bound) and np.isfinite(hi_bound):
+            axs[0].set_ylim(lo_bound, hi_bound)
+
+        hist_range = None
+        if hist_xlim is not None:
+            hist_range = (float(hist_xlim[0]), float(hist_xlim[1]))
+        elif auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop") and np.isfinite(lo_bound) and np.isfinite(hi_bound):
+            hist_range = (float(lo_bound), float(hi_bound))
+
+        axs[1].hist(s_hist, bins=int(hist_bins), density=True, range=hist_range)
+        axs[1].set_title(title_hist or rf"hist: {name}{extra_txt}")
+        if hist_xlim is not None:
+            axs[1].set_xlim(*hist_xlim)
+
+        axs[2].bar(np.arange(ac.size), ac, width=0.9)
+        axs[2].set_xlim(-0.5, ac.size - 0.5)
+        axs[2].set_title(title_acf or rf"ACF: {name} (ESS$\approx${ess:.0f}, z$\approx${gz:.2f})")
+        axs[2].set_xlabel(xlabel_acf)
+
+        plt.tight_layout()
+        if save_dir and fname:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    # ------------------------------------------------------------------
     # Figures
     # ------------------------------------------------------------------
     def figure_overview(
@@ -295,7 +470,7 @@ class DLMPlotter:
         color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
-        # ---- text ----
+        center: str = "median",
         title_mu: str = r"Posterior $\mu_t$",
         title_sigma_trace: str = r"trace: $\sigma$",
         title_sigma_hist: Optional[str] = None,
@@ -304,19 +479,18 @@ class DLMPlotter:
         title_rmse: str = r"running RMSE($\mu$) vs truth",
         xlabel_time: str = r"$t$",
         ylabel_mu: str = r"$\mu_t$",
-        # ---- axis tweaks ----
         ylims_mu: Optional[Tuple[float, float]] = None,
         yscale_mu: Optional[str] = None,
     ) -> None:
         band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
         fig, axs = plt.subplots(2, 3, figsize=(13, 8))
         axs = axs.ravel()
 
-        # [0] mu ribbon
         t = np.arange(self.T)
-        ctr, lo, hi = self._summarize_ribbon(self.mu)
-        axs[0].plot(t, ctr, lw=1.6, color=color, label=r"median")
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
         axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.y is not None and len(self.y) == self.T:
             axs[0].plot(t, self.y, lw=1.0, alpha=0.6, label=r"$y_t$")
@@ -331,7 +505,6 @@ class DLMPlotter:
             axs[0].set_ylim(*ylims_mu)
         axs[0].legend(loc="upper left")
 
-        # [1],[2] sigma
         if self.sigma is not None:
             axs[1].plot(self.sigma, lw=1)
             axs[1].set_title(title_sigma_trace)
@@ -348,7 +521,6 @@ class DLMPlotter:
             axs[1].axis("off")
             axs[2].axis("off")
 
-        # [3] log10(Q)
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
             logQ = np.log10(np.clip(Q, 1e-20, None))
@@ -361,7 +533,6 @@ class DLMPlotter:
         else:
             axs[3].axis("off")
 
-        # [4] baselines
         any_baseline = (self.alpha0 is not None) or (self.beta0 is not None) or (self.gamma0 is not None)
         if any_baseline:
             ax = axs[4]
@@ -376,7 +547,6 @@ class DLMPlotter:
         else:
             axs[4].axis("off")
 
-        # [5] running RMSE if truth available
         if self.true_mu is not None and len(self.true_mu) == self.T:
             err = np.mean((self.mu - self.true_mu.reshape(1, -1)) ** 2, axis=1) ** 0.5
             running = np.cumsum(err) / np.arange(1, err.size + 1)
@@ -403,79 +573,64 @@ class DLMPlotter:
         save_dir: Optional[str] = None,
         show: bool = True,
         max_lag: int = 200,
-        # names shown in plot titles (make them LaTeX if you want)
         name_sigma: str = r"$\sigma$",
         name_s_alpha: str = r"$s_\alpha$",
         name_s_beta: str = r"$s_\beta$",
         name_s_gamma: str = r"$s_\gamma$",
         plot_other_scalars: bool = True,
+        trace_ylim: Optional[Tuple[float, float]] = None,
+        hist_xlim: Optional[Tuple[float, float]] = None,
+        plot_policy: str = "none",
+        diag_policy: str = "clean",
+        drop_nonfinite: bool = True,
+        clip_q: Optional[Tuple[float, float]] = None,
+        clip_nmad: Optional[float] = None,
+        max_abs: Optional[float] = None,
+        hist_bins: int = 40,
+        auto_zoom_if_clipped: bool = True,
     ) -> None:
-        """
-        Trace+hist+ACF for:
-          - sigma
-          - s_alpha/s_beta/s_gamma (if present)
-          - log10(Q[...]) for Q-columns not represented by s_*
-          - optionally: other scalar params (EXCLUDING lambda2 and tau_*)
-        """
+        def _panel(series: np.ndarray, nm: str, fname: str) -> None:
+            self._trace_hist_acf_panel(
+                series,
+                nm,
+                max_lag=max_lag,
+                save_dir=save_dir,
+                fname=fname,
+                show=show,
+                trace_ylim=trace_ylim,
+                hist_xlim=hist_xlim,
+                plot_policy=plot_policy,
+                diag_policy=diag_policy,
+                drop_nonfinite=drop_nonfinite,
+                clip_q=clip_q,
+                clip_nmad=clip_nmad,
+                max_abs=max_abs,
+                hist_bins=hist_bins,
+                auto_zoom_if_clipped=auto_zoom_if_clipped,
+            )
 
         if self.sigma is not None:
-            self._trace_hist_acf_panel(
-                self.sigma,
-                name_sigma,
-                max_lag=max_lag,
-                save_dir=save_dir,
-                fname="trace_hist_acf_sigma.png",
-                show=show,
-            )
-
+            _panel(self.sigma, name_sigma, "trace_hist_acf_sigma.png")
         if self.s_alpha is not None:
-            self._trace_hist_acf_panel(
-                self.s_alpha,
-                name_s_alpha,
-                max_lag=max_lag,
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_alpha.png",
-                show=show,
-            )
+            _panel(self.s_alpha, name_s_alpha, "trace_hist_acf_s_alpha.png")
         if self.s_beta is not None:
-            self._trace_hist_acf_panel(
-                self.s_beta,
-                name_s_beta,
-                max_lag=max_lag,
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_beta.png",
-                show=show,
-            )
+            _panel(self.s_beta, name_s_beta, "trace_hist_acf_s_beta.png")
         if self.s_gamma is not None:
-            self._trace_hist_acf_panel(
-                self.s_gamma,
-                name_s_gamma,
-                max_lag=max_lag,
-                save_dir=save_dir,
-                fname="trace_hist_acf_s_gamma.png",
-                show=show,
-            )
+            _panel(self.s_gamma, name_s_gamma, "trace_hist_acf_s_gamma.png")
 
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
             labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(Q.shape[1])]
             for j in range(Q.shape[1]):
                 nm = labels[j]
-                # if you have the scalar Q_alpha/Q_beta/Q_gamma path, these may appear; handle both label styles
                 if (nm in (r"$Q_\alpha$", "Q_alpha")) and self.s_alpha is not None:
                     continue
                 if (nm in (r"$Q_\beta$", "Q_beta")) and self.s_beta is not None:
                     continue
                 if (nm in (r"$Q_\gamma$", "Q_gamma")) and self.s_gamma is not None:
                     continue
-                self._trace_hist_acf_panel(
-                    np.log10(np.clip(Q[:, j], 1e-20, None)),
-                    rf"$\log_{{10}}({nm})$",
-                    max_lag=max_lag,
-                    save_dir=save_dir,
-                    fname=f"trace_hist_acf_log10Q_{j}.png",
-                    show=show,
-                )
+                series = np.log10(np.clip(Q[:, j], 1e-20, None))
+                _panel(series, rf"$\log_{{10}}({nm})$", f"trace_hist_acf_log10Q_{j}.png")
 
         if plot_other_scalars:
             skip = {
@@ -489,15 +644,7 @@ class DLMPlotter:
                     continue
                 if k.startswith("tau_"):
                     continue
-                # let user override names via cli if desired
-                self._trace_hist_acf_panel(
-                    arr,
-                    k,
-                    max_lag=max_lag,
-                    save_dir=save_dir,
-                    fname=f"trace_hist_acf_{k}.png",
-                    show=show,
-                )
+                _panel(arr, k, f"trace_hist_acf_{k}.png")
 
     def figure_states_separate(
         self,
@@ -508,32 +655,22 @@ class DLMPlotter:
         color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
+        center: str = "median",
         xlabel_time: str = r"$t$",
-        # ---- titles/labels (LaTeX-ready strings) ----
         title_level: str = r"Level $\alpha_t$",
         ylabel_level: str = r"$\alpha_t$",
         title_slope: str = r"Slope $\beta_t$",
         ylabel_slope: str = r"$\beta_t$",
         title_seasonality: str = r"Seasonality $\gamma_t$ (contribution)",
         ylabel_seasonality: str = r"$\gamma_t$",
-        # ---- scaling / axes ----
         slope_scale: float = 1.0,
         ylims: Optional[Dict[str, Tuple[float, float]]] = None,
         yscales: Optional[Dict[str, str]] = None,
         zero_line_slope: bool = True,
         zero_line_seasonality: bool = True,
     ) -> None:
-        """
-        Writes up to three files:
-          - <prefix>_level.png
-          - <prefix>_slope.png
-          - <prefix>_seasonality.png
-
-        IMPORTANT:
-          slope_scale rescales the plotted values ONLY.
-          It is never reflected in any title/label (by design).
-        """
         band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
         if not self.has_x:
             print("[states] no centred state draws 'x' found; skipping.")
@@ -554,9 +691,10 @@ class DLMPlotter:
             ylim: Optional[Tuple[float, float]],
             yscale: Optional[str],
         ) -> None:
-            ctr, lo, hi = self._summarize_ribbon(arr2d)
+            ctr, lo, hi = self._summarize_ribbon(arr2d, center=center)
+
             fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
-            ax.plot(t, ctr, lw=1.6, color=color, label=r"median")
+            ax.plot(t, ctr, lw=1.6, color=color, label=c_lab)
             ax.fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
 
             if truth is not None and len(truth) == self.T:
@@ -587,7 +725,6 @@ class DLMPlotter:
             else:
                 plt.close(fig)
 
-        # level
         A = self._component_draws("alpha")
         if A is not None:
             _plot_component(
@@ -601,13 +738,11 @@ class DLMPlotter:
                 yscale=yscales.get("level"),
             )
 
-        # slope (scaled, but no mention in labels/titles)
         B = self._component_draws("beta")
         if B is not None:
             sc = float(slope_scale)
             Bp = B * sc
             tb = self.true_beta * sc if (self.true_beta is not None and len(self.true_beta) == self.T) else None
-
             _plot_component(
                 Bp,
                 out_name=f"{fname_prefix}_slope.png",
@@ -619,7 +754,6 @@ class DLMPlotter:
                 yscale=yscales.get("slope"),
             )
 
-        # seasonality
         G = self._component_draws("gamma")
         if G is not None:
             _plot_component(
@@ -642,6 +776,7 @@ class DLMPlotter:
         color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
+        center: str = "median",
         title_mu: str = r"$\mu_t$",
         title_sigma: str = r"$\sigma \mid y$",
         title_scale: str = r"process scale",
@@ -650,13 +785,14 @@ class DLMPlotter:
         ylabel_scale: Optional[str] = None,
     ) -> None:
         band_label = band_label or self.band_label_default
+        c_lab = _center_label(center)
 
-        ctr, lo, hi = self._summarize_ribbon(self.mu)
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
         t = np.arange(self.T)
 
         fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
-        axs[0].plot(t, ctr, lw=1.6, color=color, label=r"median")
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
         axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.true_mu is not None and len(self.true_mu) == self.T:
             axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
@@ -742,18 +878,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "DLM plotter for Gaussian structural models (non-centred state bundles).\n"
-            "Produces overview, scalar trace/hist/ACF (excluding lambda2/tau_*), "
-            "separate state component plots, and a quick report.\n"
-            "Use --<section>-kw K=V (repeatable) to override ANY kwargs.\n"
-            "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1)."
+            "Produces overview, scalar trace/hist/ACF, separate state component plots, and a quick report.\n"
+            "Use --<section>-kw K=V (repeatable) to override kwargs.\n"
+            "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1).\n\n"
+            "Ribbon center (use via --overview-kw/--states-kw/--quick-kw):\n"
+            "  center='median' (default) or center='mean'\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument("--target", type=str, default=None,
                         help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.")
-    parser.add_argument("--root", type=str, default="results/simulations/DLM",
-                        help="Search root when --target is omitted.")
+    parser.add_argument("--root", type=str, default="results/simulations/DLM", help="Search root if --target is omitted.")
     parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
     parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     parser.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
@@ -767,14 +903,13 @@ if __name__ == "__main__":
                         help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.")
     parser.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V",
                         help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.")
-    parser.add_argument("--states-kw", action="append", default=[], metavar="K=V",
+    parser.add_argument("--states-kw", action="append", default=["slope_scale=120", "center=mean"], metavar="K=V",
                         help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.")
     parser.add_argument("--quick-kw", action="append", default=[], metavar="K=V",
                         help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.")
 
     args = parser.parse_args()
 
-    # Resolve run path
     run_path = args.target
     if run_path is None:
         print(f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ...")
@@ -784,34 +919,26 @@ if __name__ == "__main__":
             sys.exit(1)
         print(f"[info] Using latest run: {run_path}")
 
-    # Load bundle
     bundle = load_posterior(run_path)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    # Output dir
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "figures")
     _ensure_dir(out_dir)
     print(f"[info] saving figures to: {out_dir}")
 
-    # Plotter
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
-    # Parse kw overrides
     overview_kw = _parse_kv_list(args.overview_kw)
     traceacf_kw = _parse_kv_list(args.traceacf_kw)
     states_kw = _parse_kv_list(args.states_kw)
     quick_kw = _parse_kv_list(args.quick_kw)
 
-    # Call plots
     if not args.skip_overview:
         plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
-
     if not args.skip_traceacf:
         plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
-
     if not args.skip_states:
         plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
-
     if not args.skip_quick:
         plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
