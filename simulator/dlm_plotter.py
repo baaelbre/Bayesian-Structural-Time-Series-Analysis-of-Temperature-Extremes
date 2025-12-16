@@ -1,10 +1,13 @@
 # %% simulator/dlm_plotter.py
 from __future__ import annotations
-import os, json, math
+
+import os
+import math
+import sys
 from typing import Optional, Tuple, Dict, Any, List
+
 import numpy as np
 import matplotlib.pyplot as plt
-import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -20,16 +23,12 @@ except Exception as e:
     ) from e
 
 
-# -----------------------------
+# =============================================================================
 # Small utils
-# -----------------------------
+# =============================================================================
 def _ensure_dir(path: str) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
-
-
-def _safe(x, default=None):
-    return default if x is None else x
 
 
 def _acf(x: np.ndarray, max_lag: int = 200) -> np.ndarray:
@@ -50,7 +49,6 @@ def _ess(x: np.ndarray, max_lag: int = 200) -> float:
     ac = _acf(x, max_lag=max_lag)
     if not np.all(np.isfinite(ac)) or ac.size <= 1:
         return float(len(x))
-    # positive-sequence truncation
     s = 0.0
     for k in range(1, ac.size):
         if ac[k] <= 0:
@@ -75,47 +73,44 @@ def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) ->
     return (ma - mb) / denom
 
 
-def _qtiles(arr: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _qtiles(arr_2d: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     lo = (1 - level) / 2.0
     hi = 1.0 - lo
     return (
-        np.quantile(arr, 0.5, axis=0),
-        np.quantile(arr, lo, axis=0),
-        np.quantile(arr, hi, axis=0),
+        np.quantile(arr_2d, 0.5, axis=0),
+        np.quantile(arr_2d, lo, axis=0),
+        np.quantile(arr_2d, hi, axis=0),
     )
 
 
-def _maybe(a: Dict[str, Any], k: str):
-    return a[k] if (k in a and a[k] is not None) else None
+def _maybe(draws: Dict[str, Any], key: str) -> Optional[np.ndarray]:
+    v = draws.get(key, None)
+    return None if v is None else np.asarray(v)
 
 
-# -----------------------------
+# =============================================================================
 # Plotter
-# -----------------------------
+# =============================================================================
 class DLMPlotter:
     """
-    Plotter for posterior bundles from the Gaussian DLM sampler
-    with non-centred states and Bayesian lasso priors on process SDs.
+    Plotter for posterior bundles from the Gaussian DLM sampler.
 
     Expected core keys in draws:
       - mu: (S, T)
-      - y: (T,)
+      - y: (T,) optional
       - x: (S, T, dim) centred state draws (optional)
 
-    Parameters (new sampler):
-      - sigma: (S,)
-      - alpha0, beta0: (S,)
-      - gamma0: (S, K) with K = period-1
-      - s_alpha, s_beta, s_gamma: (S,) signed process SDs
-      - Q_alpha, Q_beta, Q_gamma: (S,)
-      - tau_alpha, tau_beta, tau_gamma: (S,) lasso local scales
-      - lambda2: (S,) global lasso parameter
+    Common scalars:
+      - sigma or sigma2
+      - alpha0, beta0 (and optionally gamma0)
+      - s_alpha, s_beta, s_gamma
+      - Q_alpha, Q_beta, Q_gamma or Q (S, K)
 
-    Truth overlays (optional):
-      - true_mu_t, true_alpha_t, true_beta_t, true_gamma_t: (T,)
-
-    The plotter is backward-compatible with older bundles that used
-    m0_alpha/m0_beta/m0_gamma instead of alpha0/beta0/gamma0.
+    Notes:
+      - No correlation plots in this version.
+      - No trace/hist/ACF for lambda2 or tau_* in this version.
+      - Separate component plots only (no combined states.png).
+      - Slope rescaling is applied to the plotted values ONLY, and is never shown in any label/title.
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
@@ -125,164 +120,109 @@ class DLMPlotter:
         if not (0 < self.level < 1):
             raise ValueError("level must be in (0,1)")
 
-        # Core: mu
         if "mu" not in draws:
-            raise ValueError("draws must contain 'mu' (S, T).")
-        self.mu = np.asarray(draws["mu"], float)
-        self.S, self.T = self.mu.shape
+            raise ValueError("draws must contain 'mu' of shape (S, T).")
 
-        # period
+        self.mu = np.asarray(draws["mu"], float)
+        if self.mu.ndim != 2:
+            raise ValueError("'mu' must be a 2D array (S, T).")
+
+        self.S, self.T = self.mu.shape
         self.period = int(meta.get("period", 12))
 
-        # Modes (robust)
-        modes = meta.get("modes")
-        if isinstance(modes, str):
-            toks = modes.split("-")
-            self.level_mode = toks[0] if len(toks) > 0 else "dynamic"
-            self.trend_mode = toks[1] if len(toks) > 1 else "none"
-            self.season_mode = toks[2] if len(toks) > 2 else "none"
-        else:
-            mm = modes if isinstance(modes, dict) else {}
-            self.level_mode = mm.get("level_mode", "dynamic")
-            self.trend_mode = mm.get("trend_mode", "none")
-            self.season_mode = mm.get("seasonal_mode", "none")
-
-        # Optional data & truths
+        # optional data & truths
         self.y = _maybe(draws, "y")
         self.true_mu = _maybe(draws, "true_mu_t")
         self.true_alpha = _maybe(draws, "true_alpha_t")
         self.true_beta = _maybe(draws, "true_beta_t")
         self.true_gamma = _maybe(draws, "true_gamma_t")
 
-        # layout and state indexing
-        self.has_x = ("x" in draws) and draws["x"].ndim == 3
-        self.layout = meta.get("layout")
-        if self.layout is not None:
-            self.layout = list(self.layout)
-        self.idx_alpha = None
-        self.idx_beta = None
-        self.idx_g0 = None       # seasonal contribution γ_t (the one used in μ_t = α_t + γ_t)
-        self.idx_g_end = None    # last seasonal coordinate (kept for debugging/optional use)
-
-
-        if self.has_x:
-            dim = draws["x"].shape[2]
-            if self.layout:
-                if "alpha" in self.layout:
-                    self.idx_alpha = self.layout.index("alpha")
-                if "beta" in self.layout:
-                    self.idx_beta = self.layout.index("beta")
-                g_indices = [i for i, nm in enumerate(self.layout) if nm.startswith("g")]
-                if g_indices:
-                    self.idx_g0 = g_indices[0]
-                    self.idx_g_end = g_indices[-1]
-
-            else:
-                # fallback: old layout heuristic
-                i_alpha = 0 if self.level_mode == "dynamic" else None
-                i_beta = None
-                if self.trend_mode == "dynamic":
-                    i_beta = (1 if i_alpha is not None else 0)
-                i_g0 = None
-                i_g_end = None
-                if self.season_mode == "dynamic":
-                    start = (1 if i_alpha is not None else 0) + (1 if i_beta is not None else 0)
-                    if (self.period - 1) > 0 and dim >= start + (self.period - 1):
-                        i_g0 = start
-                        i_g_end = start + (self.period - 2)
-
-                self.idx_alpha = _safe(self.idx_alpha, i_alpha)
-                self.idx_beta = _safe(self.idx_beta, i_beta)
-                self.idx_g0 = _safe(self.idx_g0, i_g0)
-                self.idx_g_end = _safe(self.idx_g_end, i_g_end)
-
-
-        # sigma (supports both 'sigma' and legacy 'sigma2')
+        # sigma
         self.sigma = None
         if "sigma" in draws and np.asarray(draws["sigma"]).shape[0] == self.S:
             self.sigma = np.asarray(draws["sigma"], float)
         elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
             self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0, None))
 
-        # Categorise all posterior arrays into scalar / vector (per draw)
+        # ---- scalar & vector params (per draw) ----
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
 
         for k, v in draws.items():
-            arr = np.asarray(v)
-            # Skip observation paths, state paths and truths
-            if k in ["y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"]:
+            if k in {"y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"}:
                 continue
-            # scalar parameter: shape (S,)
+            arr = np.asarray(v)
             if arr.ndim == 1 and arr.shape[0] == self.S:
                 self.scalar_params[k] = arr.astype(float)
-            # vector parameter: shape (S, K) with K != T (to avoid double-count 'mu')
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # Convenience aliases for process variances
-        self.Q_alpha = _maybe(self.scalar_params, "Q_alpha")
-        self.Q_beta = _maybe(self.scalar_params, "Q_beta")
-        self.Q_gamma = _maybe(self.scalar_params, "Q_gamma")
+        # baselines (alpha0 exists in your runs)
+        self.alpha0 = np.asarray(draws["alpha0"], float) if "alpha0" in draws else _maybe(draws, "m0_alpha")
+        self.beta0 = np.asarray(draws["beta0"], float) if "beta0" in draws else _maybe(draws, "m0_beta")
+        self.gamma0 = np.asarray(draws["gamma0"], float) if "gamma0" in draws else _maybe(draws, "m0_gamma")
 
-        # Baselines: prefer new names alpha0/beta0/gamma0; fall back to m0_* if needed
-        self.alpha0 = _maybe(self.scalar_params, "alpha0")
-        if self.alpha0 is None:
-            self.alpha0 = _maybe(self.scalar_params, "m0_alpha")
+        # signed SDs
+        self.s_alpha = self.scalar_params.get("s_alpha", None)
+        self.s_beta = self.scalar_params.get("s_beta", None)
+        self.s_gamma = self.scalar_params.get("s_gamma", None)
 
-        self.beta0 = _maybe(self.scalar_params, "beta0")
-        if self.beta0 is None:
-            self.beta0 = _maybe(self.scalar_params, "m0_beta")
-
-        self.gamma0 = _maybe(self.vector_params, "gamma0")
-        if self.gamma0 is None:
-            self.gamma0 = _maybe(self.vector_params, "m0_gamma")
-
-        # Signed process SDs (s_k with Q_k = s_k^2)
-        self.s_alpha = _maybe(self.scalar_params, "s_alpha")
-        self.s_beta = _maybe(self.scalar_params, "s_beta")
-        self.s_gamma = _maybe(self.scalar_params, "s_gamma")
-
-        # Lasso local/global scales (new sampler)
-        self.tau_alpha = _maybe(self.scalar_params, "tau_alpha")
-        self.tau_beta = _maybe(self.scalar_params, "tau_beta")
-        self.tau_gamma = _maybe(self.scalar_params, "tau_gamma")
-        self.lambda2 = _maybe(self.scalar_params, "lambda2")
-
-        # Build unified process variance matrix Q (S, K_Q) if available
+        # Q matrix
         self.Q = None
         self.Q_names: List[str] = []
-
         if "Q" in draws:
             Qmat = np.asarray(draws["Q"], float)
             if Qmat.ndim == 2 and Qmat.shape[0] == self.S:
                 self.Q = Qmat
-                if self.layout and len(self.layout) == Qmat.shape[1]:
-                    self.Q_names = [f"Q[{nm}]" for nm in self.layout]
+                layout = meta.get("layout")
+                if isinstance(layout, (list, tuple)) and len(layout) == Qmat.shape[1]:
+                    self.Q_names = [rf"$Q_{{{nm}}}$" for nm in layout]
                 else:
-                    self.Q_names = [f"Q[{j}]" for j in range(Qmat.shape[1])]
+                    self.Q_names = [rf"$Q_{{{j}}}$" for j in range(Qmat.shape[1])]
         else:
             cols = []
             names = []
-            if self.Q_alpha is not None:
-                cols.append(self.Q_alpha.reshape(self.S, 1))
-                names.append("Q_alpha")
-            if self.Q_beta is not None:
-                cols.append(self.Q_beta.reshape(self.S, 1))
-                names.append("Q_beta")
-            if self.Q_gamma is not None:
-                cols.append(self.Q_gamma.reshape(self.S, 1))
-                names.append("Q_gamma")
+            for nm, lab in (("Q_alpha", r"$Q_\alpha$"), ("Q_beta", r"$Q_\beta$"), ("Q_gamma", r"$Q_\gamma$")):
+                if nm in self.scalar_params:
+                    cols.append(self.scalar_params[nm].reshape(self.S, 1))
+                    names.append(lab)
             if cols:
                 self.Q = np.concatenate(cols, axis=1)
                 self.Q_names = names
 
-        # quantiles for ribbons
-        self.lo_q = (1 - self.level) / 2.0
-        self.hi_q = 1.0 - self.lo_q
-        self.band_label = f"{int(round(self.level * 100))}% band"
+        # ---- state layout indexing ----
+        self.has_x = ("x" in draws) and (np.asarray(draws["x"]).ndim == 3)
+        self.idx_alpha = None
+        self.idx_beta = None
+        self.idx_g0 = None
 
-    # ---------- helpers ----------
+        if self.has_x:
+            x = np.asarray(draws["x"])
+            dim = x.shape[2]
+            layout = meta.get("layout")
+            layout_list = list(layout) if isinstance(layout, (list, tuple)) else None
+
+            if layout_list:
+                if "alpha" in layout_list:
+                    self.idx_alpha = layout_list.index("alpha")
+                if "beta" in layout_list:
+                    self.idx_beta = layout_list.index("beta")
+                g_indices = [i for i, nm in enumerate(layout_list) if str(nm).startswith("g")]
+                if g_indices:
+                    self.idx_g0 = g_indices[0]
+            else:
+                # heuristic fallback: alpha, beta, then seasonal block
+                self.idx_alpha = 0 if dim >= 1 else None
+                self.idx_beta = 1 if dim >= 2 else None
+                i = 2
+                if self.period > 1 and dim >= i + (self.period - 1):
+                    self.idx_g0 = i
+
+        self.band_label_default = rf"{int(round(self.level * 100))}\% band"
+
+    # ------------------------------------------------------------------
+    # Core helpers
+    # ------------------------------------------------------------------
     def _summarize_ribbon(self, arr_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         return _qtiles(np.asarray(arr_2d, float), self.level)
 
@@ -290,34 +230,35 @@ class DLMPlotter:
         self,
         series: np.ndarray,
         name: str,
+        *,
+        title_trace: Optional[str] = None,
+        title_hist: Optional[str] = None,
+        title_acf: Optional[str] = None,
+        xlabel_trace: str = "iteration",
+        xlabel_acf: str = "lag",
         max_lag: int = 200,
         save_dir: Optional[str] = None,
         fname: Optional[str] = None,
         show: bool = True,
-    ):
-        """
-        1x3 panel: trace, histogram, ACF with ESS + Geweke z.
-        """
+    ) -> None:
         s = np.asarray(series, float).ravel()
         ac = _acf(s, max_lag=max_lag)
         ess = _ess(s, max_lag=max_lag)
         gz = _geweke_z(s)
 
         fig, axs = plt.subplots(1, 3, figsize=(15, 4))
-        # trace
+
         axs[0].plot(s, lw=1)
-        axs[0].set_title(f"trace: {name}")
-        axs[0].set_xlabel("iteration")
+        axs[0].set_title(title_trace or rf"trace: {name}")
+        axs[0].set_xlabel(xlabel_trace)
 
-        # hist
         axs[1].hist(s, bins=40, density=True)
-        axs[1].set_title(f"hist: {name}")
+        axs[1].set_title(title_hist or rf"hist: {name}")
 
-        # ACF
         axs[2].bar(np.arange(ac.size), ac, width=0.9)
         axs[2].set_xlim(-0.5, ac.size - 0.5)
-        axs[2].set_title(f"ACF: {name} (ESS≈{ess:.0f}, z≈{gz:.2f})")
-        axs[2].set_xlabel("lag")
+        axs[2].set_title(title_acf or rf"ACF: {name} (ESS$\approx${ess:.0f}, z$\approx${gz:.2f})")
+        axs[2].set_xlabel(xlabel_acf)
 
         plt.tight_layout()
         if save_dir and fname:
@@ -330,184 +271,125 @@ class DLMPlotter:
         else:
             plt.close(fig)
 
-    def _component_draws(self, key: str) -> Optional[np.ndarray]:
+    def _component_draws(self, which: str) -> Optional[np.ndarray]:
         if not self.has_x:
             return None
-
-        if key == "alpha" and self.idx_alpha is not None:
-            return self.draws["x"][:, :, self.idx_alpha]
-
-        if key == "beta" and self.idx_beta is not None:
-            return self.draws["x"][:, :, self.idx_beta]
-
-        # seasonal contribution that enters mu_t (gamma_t)
-        if key in ("gamma", "seasonal", "gamma0") and self.idx_g0 is not None:
-            return self.draws["x"][:, :, self.idx_g0]
-
-        # optional: last seasonal coordinate (debug/legacy)
-        if key in ("gamma_last", "gamma_end") and self.idx_g_end is not None:
-            return self.draws["x"][:, :, self.idx_g_end]
-
+        x = np.asarray(self.draws["x"])
+        if which == "alpha" and self.idx_alpha is not None:
+            return x[:, :, self.idx_alpha]
+        if which == "beta" and self.idx_beta is not None:
+            return x[:, :, self.idx_beta]
+        if which in ("gamma", "seasonal") and self.idx_g0 is not None:
+            return x[:, :, self.idx_g0]
         return None
 
-
-    def _scatter_matrix(
-        self,
-        data: np.ndarray,
-        labels: List[str],
-        title: str,
-        fname: str,
-        save_dir: Optional[str] = None,
-        show: bool = True,
-    ) -> None:
-        """
-        Simple scatter-matrix:
-          - diagonal: histogram
-          - off-diagonal: scatter with Pearson ρ annotated
-        """
-        data = np.asarray(data, float)
-        n = data.shape[1]
-        if n < 2:
-            print(f"[corr] not enough variables for {title}, need at least 2.")
-            return
-
-        fig, axes = plt.subplots(n, n, figsize=(3.0 * n, 3.0 * n))
-        for i in range(n):
-            for j in range(n):
-                ax = axes[i, j]
-                x = data[:, j]
-                y = data[:, i]
-
-                if i == j:
-                    ax.hist(x, bins=40, density=True)
-                    ax.set_ylabel(labels[i])
-                else:
-                    ax.scatter(x, y, s=4, alpha=0.4)
-                    # Pearson correlation (guard against NaNs / constants)
-                    if np.std(x) > 1e-12 and np.std(y) > 1e-12:
-                        r = float(np.corrcoef(x, y)[0, 1])
-                    else:
-                        r = float("nan")
-                    ax.text(
-                        0.05,
-                        0.9,
-                        f"ρ={r:.2f}" if np.isfinite(r) else "ρ=NA",
-                        transform=ax.transAxes,
-                        ha="left",
-                        va="top",
-                        fontsize=8,
-                    )
-
-                # tidy ticks
-                if i < n - 1:
-                    ax.set_xticklabels([])
-                if j > 0:
-                    ax.set_yticklabels([])
-
-        fig.suptitle(title)
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-
-        if save_dir:
-            _ensure_dir(save_dir)
-            path = os.path.join(save_dir, fname)
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            print(f"[save] {path}")
-        if show:
-            plt.show()
-        else:
-            plt.close(fig)
-
-    # ---------- figures ----------
+    # ------------------------------------------------------------------
+    # Figures
+    # ------------------------------------------------------------------
     def figure_overview(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "overview",
+        fname: str = "overview.png",
         show: bool = True,
-    ):
-        """
-        Overview (2x3):
-
-          [0] μ_t ribbon (with y and true μ)
-          [1] σ trace
-          [2] σ histogram
-          [3] log10(Q) histograms (available coords)
-          [4] baselines alpha0, beta0, gamma0[0] histograms (if present)
-          [5] μ_t running RMSE vs true μ (if truth available)
-        """
-        mu = self.mu
-        m_ctr, m_lo, m_hi = self._summarize_ribbon(mu)
+        color: str = "C0",
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        # ---- text ----
+        title_mu: str = r"Posterior $\mu_t$",
+        title_sigma_trace: str = r"trace: $\sigma$",
+        title_sigma_hist: Optional[str] = None,
+        title_Q: str = r"Process variances (log$_{10}$ scale)",
+        title_baselines: str = r"Baselines",
+        title_rmse: str = r"running RMSE($\mu$) vs truth",
+        xlabel_time: str = r"$t$",
+        ylabel_mu: str = r"$\mu_t$",
+        # ---- axis tweaks ----
+        ylims_mu: Optional[Tuple[float, float]] = None,
+        yscale_mu: Optional[str] = None,
+    ) -> None:
+        band_label = band_label or self.band_label_default
 
         fig, axs = plt.subplots(2, 3, figsize=(13, 8))
         axs = axs.ravel()
 
-        # [0] μ ribbon
+        # [0] mu ribbon
         t = np.arange(self.T)
-        axs[0].plot(m_ctr, lw=1.6, label="μ median")
-        axs[0].fill_between(t, m_lo, m_hi, alpha=0.25, label=self.band_label)
+        ctr, lo, hi = self._summarize_ribbon(self.mu)
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=r"median")
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.y is not None and len(self.y) == self.T:
-            axs[0].plot(self.y, lw=1.0, alpha=0.6, label="y")
+            axs[0].plot(t, self.y, lw=1.0, alpha=0.6, label=r"$y_t$")
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            axs[0].plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        axs[0].set_title("Posterior μ_t")
+            axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
+        axs[0].set_title(title_mu)
+        axs[0].set_xlabel(xlabel_time)
+        axs[0].set_ylabel(ylabel_mu)
+        if yscale_mu is not None:
+            axs[0].set_yscale(yscale_mu)
+        if ylims_mu is not None:
+            axs[0].set_ylim(*ylims_mu)
         axs[0].legend(loc="upper left")
 
-        # [1],[2] σ trace + hist
+        # [1],[2] sigma
         if self.sigma is not None:
             axs[1].plot(self.sigma, lw=1)
-            axs[1].set_title("trace: σ")
-            axs[1].set_xlabel("kept draw")
+            axs[1].set_title(title_sigma_trace)
+            axs[1].set_xlabel(r"kept draw")
 
             axs[2].hist(self.sigma, bins=40, density=True)
-            es = _ess(self.sigma)
-            gz = _geweke_z(self.sigma)
-            axs[2].set_title(f"posterior: σ  (ESS≈{es:.0f}, z≈{gz:.2f})")
+            if title_sigma_hist is None:
+                es = _ess(self.sigma)
+                gz = _geweke_z(self.sigma)
+                axs[2].set_title(rf"posterior: $\sigma$  (ESS$\approx${es:.0f}, z$\approx${gz:.2f})")
+            else:
+                axs[2].set_title(title_sigma_hist)
         else:
             axs[1].axis("off")
             axs[2].axis("off")
 
-        # [3] log10(Q) histograms (up to first few coords)
+        # [3] log10(Q)
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
             logQ = np.log10(np.clip(Q, 1e-20, None))
             ax = axs[3]
-            n_cols = logQ.shape[1]
-            labels = self.Q_names if self.Q_names else [f"Q[{j}]" for j in range(n_cols)]
-            for j in range(n_cols):
-                ax.hist(logQ[:, j], bins=40, density=True, alpha=0.55, label=f"log10 {labels[j]}")
-            ax.set_title("Process variances (log10 scale)")
+            labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(logQ.shape[1])]
+            for j in range(logQ.shape[1]):
+                ax.hist(logQ[:, j], bins=40, density=True, alpha=0.55, label=rf"$\log_{{10}}$ {labels[j]}")
+            ax.set_title(title_Q)
             ax.legend()
         else:
             axs[3].axis("off")
 
-        # [4] Baselines alpha0, beta0, gamma0[0] (if present)
-        any_baseline = any(v is not None for v in [self.alpha0, self.beta0, self.gamma0])
+        # [4] baselines
+        any_baseline = (self.alpha0 is not None) or (self.beta0 is not None) or (self.gamma0 is not None)
         if any_baseline:
             ax = axs[4]
             if self.alpha0 is not None:
-                ax.hist(self.alpha0, bins=40, density=True, alpha=0.6, label="alpha0")
+                ax.hist(np.asarray(self.alpha0).ravel(), bins=40, density=True, alpha=0.6, label=r"$\alpha_0$")
             if self.beta0 is not None:
-                ax.hist(self.beta0, bins=40, density=True, alpha=0.6, label="beta0")
-            if self.gamma0 is not None and self.gamma0.shape[1] > 0:
-                ax.hist(self.gamma0[:, 0], bins=40, density=True, alpha=0.6, label="gamma0[0]")
-            ax.set_title("Baselines alpha0/beta0/gamma0")
+                ax.hist(np.asarray(self.beta0).ravel(), bins=40, density=True, alpha=0.6, label=r"$\beta_0$")
+            if self.gamma0 is not None and np.asarray(self.gamma0).ndim == 2 and np.asarray(self.gamma0).shape[1] > 0:
+                ax.hist(np.asarray(self.gamma0)[:, 0], bins=40, density=True, alpha=0.6, label=r"$\gamma_0[0]$")
+            ax.set_title(title_baselines)
             ax.legend()
         else:
             axs[4].axis("off")
 
-        # [5] μ running RMSE vs truth (if available)
+        # [5] running RMSE if truth available
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            err = np.mean((mu - self.true_mu.reshape(1, -1)) ** 2, axis=1) ** 0.5  # draw-wise RMSE
+            err = np.mean((self.mu - self.true_mu.reshape(1, -1)) ** 2, axis=1) ** 0.5
             running = np.cumsum(err) / np.arange(1, err.size + 1)
             axs[5].plot(running, lw=1.2)
-            axs[5].set_title("running RMSE(μ) vs truth")
-            axs[5].set_xlabel("kept draw")
+            axs[5].set_title(title_rmse)
+            axs[5].set_xlabel(r"kept draw")
         else:
             axs[5].axis("off")
 
         plt.tight_layout()
         if save_dir:
             _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
+            out = os.path.join(save_dir, fname)
             fig.savefig(out, dpi=200, bbox_inches="tight")
             print(f"[save] {out}")
         if show:
@@ -515,31 +397,42 @@ class DLMPlotter:
         else:
             plt.close(fig)
 
-    def figure_trace_acf_core(self, save_dir: Optional[str] = None, show: bool = True):
+    def figure_trace_acf_core(
+        self,
+        *,
+        save_dir: Optional[str] = None,
+        show: bool = True,
+        max_lag: int = 200,
+        # names shown in plot titles (make them LaTeX if you want)
+        name_sigma: str = r"$\sigma$",
+        name_s_alpha: str = r"$s_\alpha$",
+        name_s_beta: str = r"$s_\beta$",
+        name_s_gamma: str = r"$s_\gamma$",
+        plot_other_scalars: bool = True,
+    ) -> None:
         """
-        Trace + hist + ACF panels for key scalars and ALL remaining scalar parameters:
+        Trace+hist+ACF for:
+          - sigma
+          - s_alpha/s_beta/s_gamma (if present)
+          - log10(Q[...]) for Q-columns not represented by s_*
+          - optionally: other scalar params (EXCLUDING lambda2 and tau_*)
+        """
 
-          - σ
-          - signed process SDs s_alpha, s_beta, s_gamma (if present)
-          - log10 Q for remaining Q-coordinates (for which no signed s_ exist)
-          - lambda2, tau_alpha, tau_beta, tau_gamma (if present)
-          - any other scalar posterior array (shape (S,))
-        """
-        # σ
         if self.sigma is not None:
             self._trace_hist_acf_panel(
                 self.sigma,
-                "σ",
+                name_sigma,
+                max_lag=max_lag,
                 save_dir=save_dir,
                 fname="trace_hist_acf_sigma.png",
                 show=show,
             )
 
-        # Signed process SDs: s_alpha, s_beta, s_gamma
         if self.s_alpha is not None:
             self._trace_hist_acf_panel(
                 self.s_alpha,
-                "s_alpha (±√Q_alpha)",
+                name_s_alpha,
+                max_lag=max_lag,
                 save_dir=save_dir,
                 fname="trace_hist_acf_s_alpha.png",
                 show=show,
@@ -547,7 +440,8 @@ class DLMPlotter:
         if self.s_beta is not None:
             self._trace_hist_acf_panel(
                 self.s_beta,
-                "s_beta (±√Q_beta)",
+                name_s_beta,
+                max_lag=max_lag,
                 save_dir=save_dir,
                 fname="trace_hist_acf_s_beta.png",
                 show=show,
@@ -555,152 +449,132 @@ class DLMPlotter:
         if self.s_gamma is not None:
             self._trace_hist_acf_panel(
                 self.s_gamma,
-                "s_gamma (±√Q_gamma)",
+                name_s_gamma,
+                max_lag=max_lag,
                 save_dir=save_dir,
                 fname="trace_hist_acf_s_gamma.png",
                 show=show,
             )
 
-        # Q's (log10 scale) only for those coordinates that do NOT have a signed s_*
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
-            labels = self.Q_names if self.Q_names else [f"Q[{j}]" for j in range(Q.shape[1])]
+            labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(Q.shape[1])]
             for j in range(Q.shape[1]):
-                name_j = labels[j]
-                if name_j == "Q_alpha" and self.s_alpha is not None:
+                nm = labels[j]
+                # if you have the scalar Q_alpha/Q_beta/Q_gamma path, these may appear; handle both label styles
+                if (nm in (r"$Q_\alpha$", "Q_alpha")) and self.s_alpha is not None:
                     continue
-                if name_j == "Q_beta" and self.s_beta is not None:
+                if (nm in (r"$Q_\beta$", "Q_beta")) and self.s_beta is not None:
                     continue
-                if name_j == "Q_gamma" and self.s_gamma is not None:
+                if (nm in (r"$Q_\gamma$", "Q_gamma")) and self.s_gamma is not None:
                     continue
                 self._trace_hist_acf_panel(
                     np.log10(np.clip(Q[:, j], 1e-20, None)),
-                    f"log10 {name_j}",
+                    rf"$\log_{{10}}({nm})$",
+                    max_lag=max_lag,
                     save_dir=save_dir,
                     fname=f"trace_hist_acf_log10Q_{j}.png",
                     show=show,
                 )
 
-        # Explicit panels for lasso scales if present
-        if self.lambda2 is not None:
-            self._trace_hist_acf_panel(
-                self.lambda2,
-                "lambda2",
-                save_dir=save_dir,
-                fname="trace_hist_acf_lambda2.png",
-                show=show,
-            )
-        if self.tau_alpha is not None:
-            self._trace_hist_acf_panel(
-                self.tau_alpha,
-                "tau_alpha",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_alpha.png",
-                show=show,
-            )
-        if self.tau_beta is not None:
-            self._trace_hist_acf_panel(
-                self.tau_beta,
-                "tau_beta",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_beta.png",
-                show=show,
-            )
-        if self.tau_gamma is not None:
-            self._trace_hist_acf_panel(
-                self.tau_gamma,
-                "tau_gamma",
-                save_dir=save_dir,
-                fname="trace_hist_acf_tau_gamma.png",
-                show=show,
-            )
+        if plot_other_scalars:
+            skip = {
+                "sigma", "sigma2",
+                "s_alpha", "s_beta", "s_gamma",
+                "Q_alpha", "Q_beta", "Q_gamma",
+                "lambda2", "tau_alpha", "tau_beta", "tau_gamma",
+            }
+            for k, arr in sorted(self.scalar_params.items()):
+                if k in skip:
+                    continue
+                if k.startswith("tau_"):
+                    continue
+                # let user override names via cli if desired
+                self._trace_hist_acf_panel(
+                    arr,
+                    k,
+                    max_lag=max_lag,
+                    save_dir=save_dir,
+                    fname=f"trace_hist_acf_{k}.png",
+                    show=show,
+                )
 
-        # All other scalar parameters
-        skip_keys = {
-            "sigma",
-            "sigma2",
-            "Q_alpha",
-            "Q_beta",
-            "Q_gamma",
-            "s_alpha",
-            "s_beta",
-            "s_gamma",
-            "lambda2",
-            "tau_alpha",
-            "tau_beta",
-            "tau_gamma",
-        }
-        for key, arr in sorted(self.scalar_params.items()):
-            if key in skip_keys:
-                continue
-            self._trace_hist_acf_panel(
-                arr,
-                key,
-                save_dir=save_dir,
-                fname=f"trace_hist_acf_{key}.png",
-                show=show,
-            )
-
-    def figure_states(
+    def figure_states_separate(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "states",
+        fname_prefix: str = "state",
         show: bool = True,
         color: str = "C0",
-        ylims: Optional[Dict[str, Tuple[float, float]]] = None,   # keys: "level","slope","seasonality"
-        yscales: Optional[Dict[str, str]] = None,                # keys: "level","slope","seasonality"
-    ):
-
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        xlabel_time: str = r"$t$",
+        # ---- titles/labels (LaTeX-ready strings) ----
+        title_level: str = r"Level $\alpha_t$",
+        ylabel_level: str = r"$\alpha_t$",
+        title_slope: str = r"Slope $\beta_t$",
+        ylabel_slope: str = r"$\beta_t$",
+        title_seasonality: str = r"Seasonality $\gamma_t$ (contribution)",
+        ylabel_seasonality: str = r"$\gamma_t$",
+        # ---- scaling / axes ----
+        slope_scale: float = 1.0,
+        ylims: Optional[Dict[str, Tuple[float, float]]] = None,
+        yscales: Optional[Dict[str, str]] = None,
+        zero_line_slope: bool = True,
+        zero_line_seasonality: bool = True,
+    ) -> None:
         """
-        Separate state ribbons (no combined 'states.png').
+        Writes up to three files:
+          - <prefix>_level.png
+          - <prefix>_slope.png
+          - <prefix>_seasonality.png
 
-        Writes up to three files (depending on what exists in the posterior):
-        - <prefix>_level.png        : α_t
-        - <prefix>_slope.png        : β_t
-        - <prefix>_seasonality.png  : γ_t  (seasonal contribution entering μ_t)
-
-        Color is standard matplotlib blue (C0). Series-specific coloring can be done
-        in a thin wrapper (e.g. uccle plotter).
+        IMPORTANT:
+          slope_scale rescales the plotted values ONLY.
+          It is never reflected in any title/label (by design).
         """
+        band_label = band_label or self.band_label_default
+
         if not self.has_x:
-            print("[states] no centred state draws 'x' found; skipping separate state plots.")
+            print("[states] no centred state draws 'x' found; skipping.")
             return
 
         t = np.arange(self.T)
-        color = "C0"  # standard blue
+        ylims = ylims or {}
+        yscales = yscales or {}
 
-        def _plot_one(
+        def _plot_component(
             arr2d: np.ndarray,
+            *,
+            out_name: str,
             title: str,
             ylabel: str,
             truth: Optional[np.ndarray],
-            out_name: str,
             zero_line: bool,
-            ylim: Optional[Tuple[float, float]] = None,
-            yscale: Optional[str] = None,
-        ):
+            ylim: Optional[Tuple[float, float]],
+            yscale: Optional[str],
+        ) -> None:
             ctr, lo, hi = self._summarize_ribbon(arr2d)
             fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
-
-            ax.plot(t, ctr, lw=1.6, color=color, label="median")
-            ax.fill_between(t, lo, hi, alpha=0.25, color=color, label=self.band_label)
+            ax.plot(t, ctr, lw=1.6, color=color, label=r"median")
+            ax.fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
 
             if truth is not None and len(truth) == self.T:
-                ax.plot(t, truth, lw=1.2, ls="--", color="k", alpha=0.8, label="truth")
+                ax.plot(t, truth, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
 
             if zero_line:
                 ax.axhline(0.0, lw=0.8, color="k", alpha=0.25)
 
-            if yscale is not None:
-                ax.set_yscale(yscale)          # e.g. "linear", "log", "symlog"
-
-            if ylim is not None:
-                ax.set_ylim(ylim[0], ylim[1])  # hard limits
-
             ax.set_title(title)
+            ax.set_xlabel(xlabel_time)
             ax.set_ylabel(ylabel)
             ax.grid(True, alpha=0.25)
             ax.legend(loc="best")
+
+            if yscale is not None:
+                ax.set_yscale(yscale)
+            if ylim is not None:
+                ax.set_ylim(*ylim)
 
             plt.tight_layout()
             if save_dir:
@@ -713,222 +587,108 @@ class DLMPlotter:
             else:
                 plt.close(fig)
 
-        # Level α_t
+        # level
         A = self._component_draws("alpha")
         if A is not None:
-            _plot_one(
+            _plot_component(
                 A,
-                title="Level α_t",
-                ylabel="α_t",
-                truth=self.true_alpha,
                 out_name=f"{fname_prefix}_level.png",
+                title=title_level,
+                ylabel=ylabel_level,
+                truth=self.true_alpha,
                 zero_line=False,
-                ylim=(ylims or {}).get("level"),
-                yscale=(yscales or {}).get("level"),
+                ylim=ylims.get("level"),
+                yscale=yscales.get("level"),
             )
 
-        # Slope β_t
+        # slope (scaled, but no mention in labels/titles)
         B = self._component_draws("beta")
         if B is not None:
-            _plot_one(
-                B,
-                title="Slope β_t",
-                ylabel="β_t",
-                truth=self.true_beta,
+            sc = float(slope_scale)
+            Bp = B * sc
+            tb = self.true_beta * sc if (self.true_beta is not None and len(self.true_beta) == self.T) else None
+
+            _plot_component(
+                Bp,
                 out_name=f"{fname_prefix}_slope.png",
-                zero_line=True,
-                ylim=(ylims or {}).get("slope"),
-                yscale=(yscales or {}).get("slope"),
+                title=title_slope,
+                ylabel=ylabel_slope,
+                truth=tb,
+                zero_line=zero_line_slope,
+                ylim=ylims.get("slope"),
+                yscale=yscales.get("slope"),
             )
 
-        # Seasonality γ_t
+        # seasonality
         G = self._component_draws("gamma")
         if G is not None:
-            _plot_one(
+            _plot_component(
                 G,
-                title="Seasonality γ_t (contribution)",
-                ylabel="γ_t",
-                truth=self.true_gamma,
                 out_name=f"{fname_prefix}_seasonality.png",
-                zero_line=True,
-                ylim=(ylims or {}).get("seasonality"),
-                yscale=(yscales or {}).get("seasonality"),
+                title=title_seasonality,
+                ylabel=ylabel_seasonality,
+                truth=self.true_gamma,
+                zero_line=zero_line_seasonality,
+                ylim=ylims.get("seasonality"),
+                yscale=yscales.get("seasonality"),
             )
-
-
-
-    def figure_correlations(
-        self,
-        save_dir: Optional[str] = None,
-        show: bool = True,
-        max_vars: int = 6,
-    ) -> None:
-        """
-        Correlation plots (scatter matrices) for:
-
-          1) Signed process SDs: s_alpha, s_beta, s_gamma (if >= 2 exist).
-          2) Baselines: alpha0, beta0, gamma0[j] (if >= 2 exist).
-          3) Joint baselines and signed SDs (if >= 2 total).
-
-        max_vars limits the dimensionality of each scatter matrix
-        (if there are more variables, the first max_vars are used).
-        """
-        # --------- 1) Signed process SDs only ---------
-        cols_s: List[np.ndarray] = []
-        labels_s: List[str] = []
-        if self.s_alpha is not None:
-            cols_s.append(self.s_alpha)
-            labels_s.append("s_alpha")
-        if self.s_beta is not None:
-            cols_s.append(self.s_beta)
-            labels_s.append("s_beta")
-        if self.s_gamma is not None:
-            cols_s.append(self.s_gamma)
-            labels_s.append("s_gamma")
-
-        if len(cols_s) >= 2:
-            data_s = np.column_stack(cols_s)
-            if data_s.shape[1] > max_vars:
-                print(f"[corr] s_*: limiting to first {max_vars} variables.")
-                data_s = data_s[:, :max_vars]
-                labels_s = labels_s[:max_vars]
-            self._scatter_matrix(
-                data_s,
-                labels_s,
-                title="Correlation: signed process SDs",
-                fname="corr_s_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 signed process SDs; skipping s_* correlation plot.")
-
-        # --------- 2) Baselines alpha0/beta0/gamma0 only ---------
-        cols_b: List[np.ndarray] = []
-        labels_b: List[str] = []
-        if self.alpha0 is not None:
-            cols_b.append(self.alpha0)
-            labels_b.append("alpha0")
-        if self.beta0 is not None:
-            cols_b.append(self.beta0)
-            labels_b.append("beta0")
-        if self.gamma0 is not None:
-            K = self.gamma0.shape[1]
-            for k in range(K):
-                cols_b.append(self.gamma0[:, k])
-                labels_b.append(f"gamma0[{k}]")
-
-        if len(cols_b) >= 2:
-            data_b = np.column_stack(cols_b)
-            if data_b.shape[1] > max_vars:
-                print(f"[corr] baselines: limiting to first {max_vars} variables.")
-                data_b = data_b[:, :max_vars]
-                labels_b = labels_b[:max_vars]
-            self._scatter_matrix(
-                data_b,
-                labels_b,
-                title="Correlation: baselines alpha0/beta0/gamma0",
-                fname="corr_baselines_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 baseline variables; skipping baseline correlation plot.")
-
-        # --------- 3) Joint baselines and signed SDs ---------
-        cols_joint: List[np.ndarray] = []
-        labels_joint: List[str] = []
-
-        # baselines first
-        if self.alpha0 is not None:
-            cols_joint.append(self.alpha0)
-            labels_joint.append("alpha0")
-        if self.beta0 is not None:
-            cols_joint.append(self.beta0)
-            labels_joint.append("beta0")
-        if self.gamma0 is not None:
-            K = self.gamma0.shape[1]
-            for k in range(K):
-                cols_joint.append(self.gamma0[:, k])
-                labels_joint.append(f"gamma0[{k}]")
-
-        # then signed SDs
-        if self.s_alpha is not None:
-            cols_joint.append(self.s_alpha)
-            labels_joint.append("s_alpha")
-        if self.s_beta is not None:
-            cols_joint.append(self.s_beta)
-            labels_joint.append("s_beta")
-        if self.s_gamma is not None:
-            cols_joint.append(self.s_gamma)
-            labels_joint.append("s_gamma")
-
-        if len(cols_joint) >= 2:
-            data_joint = np.column_stack(cols_joint)
-            if data_joint.shape[1] > max_vars:
-                print(f"[corr] baselines + s_*: limiting to first {max_vars} variables.")
-                data_joint = data_joint[:, :max_vars]
-                labels_joint = labels_joint[:max_vars]
-            self._scatter_matrix(
-                data_joint,
-                labels_joint,
-                title="Correlation: baselines and signed process SDs",
-                fname="corr_baselines_s_scatter_matrix.png",
-                save_dir=save_dir,
-                show=show,
-            )
-        else:
-            print("[corr] fewer than 2 total variables; skipping joint baseline–s_* plot.")
 
     def quick_report(
         self,
+        *,
         save_dir: Optional[str] = None,
-        fname_prefix: str = "quick_report",
+        fname: str = "quick_report.png",
         show: bool = True,
-    ):
-        """
-        1x3 compact panel: μ ribbon, σ posterior, and process scale:
+        color: str = "C0",
+        band_alpha: float = 0.25,
+        band_label: Optional[str] = None,
+        title_mu: str = r"$\mu_t$",
+        title_sigma: str = r"$\sigma \mid y$",
+        title_scale: str = r"process scale",
+        xlabel_time: str = r"$t$",
+        ylabel_mu: str = r"$\mu_t$",
+        ylabel_scale: Optional[str] = None,
+    ) -> None:
+        band_label = band_label or self.band_label_default
 
-          - If s_alpha is available: hist of s_alpha (±√Q_alpha)
-          - Else: hist of log10(Q_alpha) or of first Q-column.
-        """
-        mu = self.mu
-        ctr, lo, hi = self._summarize_ribbon(mu)
+        ctr, lo, hi = self._summarize_ribbon(self.mu)
         t = np.arange(self.T)
 
         fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
-        # μ
-        axs[0].plot(ctr, lw=1.6, label="μ median")
-        axs[0].fill_between(t, lo, hi, alpha=0.25, label=self.band_label)
+        axs[0].plot(t, ctr, lw=1.6, color=color, label=r"median")
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.true_mu is not None and len(self.true_mu) == self.T:
-            axs[0].plot(self.true_mu, lw=1.2, ls="--", label="true μ")
-        axs[0].set_title("μ_t")
+            axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
+        axs[0].set_title(title_mu)
+        axs[0].set_xlabel(xlabel_time)
+        axs[0].set_ylabel(ylabel_mu)
         axs[0].legend()
 
-        # σ
         if self.sigma is not None:
             axs[1].hist(self.sigma, bins=40, density=True)
-            axs[1].set_title("σ | y")
+            axs[1].set_title(title_sigma)
         else:
             axs[1].axis("off")
 
-        # Process scale: prefer s_alpha if available, otherwise log10(Q_alpha / Q[0])
         if self.s_alpha is not None:
             axs[2].hist(self.s_alpha, bins=40, density=True)
-            axs[2].set_title("s_alpha (±√Q_alpha) | y")
+            axs[2].set_title(title_scale)
+            if ylabel_scale is not None:
+                axs[2].set_xlabel(ylabel_scale)
         elif self.Q is not None and self.Q.size:
             logQ = np.log10(np.clip(self.Q[:, 0], 1e-20, None))
-            label = self.Q_names[0] if self.Q_names else "Q[0]"
             axs[2].hist(logQ, bins=40, density=True)
-            axs[2].set_title(f"log10 {label} | y")
+            axs[2].set_title(title_scale)
+            if ylabel_scale is not None:
+                axs[2].set_xlabel(ylabel_scale)
         else:
             axs[2].axis("off")
 
         plt.tight_layout()
         if save_dir:
             _ensure_dir(save_dir)
-            out = os.path.join(save_dir, f"{fname_prefix}.png")
+            out = os.path.join(save_dir, fname)
             fig.savefig(out, dpi=200, bbox_inches="tight")
             print(f"[save] {out}")
         if show:
@@ -937,80 +697,87 @@ class DLMPlotter:
             plt.close(fig)
 
 
-# -----------------------------
-# CLI: load and plot via posterior_bundle
-# -----------------------------
+# =============================================================================
+# CLI
+# =============================================================================
 if __name__ == "__main__":
     import argparse
+    import ast
+
+    def _parse_value(raw: str):
+        s = raw.strip()
+        low = s.lower()
+        if low in ("none", "null"):
+            return None
+        if low in ("true", "false"):
+            return low == "true"
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            return s
+
+    def _set_nested(d: dict, key: str, value):
+        parts = [p for p in key.split(".") if p]
+        cur = d
+        for p in parts[:-1]:
+            if p not in cur or not isinstance(cur[p], dict):
+                cur[p] = {}
+            cur = cur[p]
+        cur[parts[-1]] = value
+
+    def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for it in items:
+            if "=" not in it:
+                raise ValueError(f"Expected K=V, got: {it!r}")
+            k, v = it.split("=", 1)
+            k = k.strip()
+            val = _parse_value(v)
+            if "." in k:
+                _set_nested(out, k, val)
+            else:
+                out[k] = val
+        return out
 
     parser = argparse.ArgumentParser(
         description=(
-            "DLM plotter for Gaussian structural models with non-centred states\n"
-            "and Bayesian lasso priors on process SDs.\n"
-            "Loads a posterior bundle via optimization/posterior_bundle "
-            "and produces overview, scalars (trace+hist+ACF), correlation, and state plots."
+            "DLM plotter for Gaussian structural models (non-centred state bundles).\n"
+            "Produces overview, scalar trace/hist/ACF (excluding lambda2/tau_*), "
+            "separate state component plots, and a quick report.\n"
+            "Use --<section>-kw K=V (repeatable) to override ANY kwargs.\n"
+            "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--target",
-        type=str,
-        default=None,
-        help="Path to a run directory or directly to posterior.npz. "
-             "If omitted, searches under --root.",
-    )
-    parser.add_argument(
-        "--root",
-        type=str,
-        default="results/simulations/DLM",
-        help="Search root when --target is omitted.",
-    )
+
+    parser.add_argument("--target", type=str, default=None,
+                        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.")
+    parser.add_argument("--root", type=str, default="results/simulations/DLM",
+                        help="Search root when --target is omitted.")
     parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
-    parser.add_argument(
-        "--show",
-        action="store_true",
-        default=False,
-        help="Show figures interactively.",
-    )
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Directory to save figures. Default: <run>/figures",
-    )
-    parser.add_argument(
-        "--skip-traceacf",
-        action="store_true",
-        help="Skip trace+hist+ACF panels for scalar parameters.",
-    )
-    parser.add_argument(
-        "--skip-states",
-        action="store_true",
-        help="Skip state ribbons.",
-    )
-    parser.add_argument(
-        "--skip-overview",
-        action="store_true",
-        help="Skip overview figure.",
-    )
-    parser.add_argument(
-        "--skip-quick",
-        action="store_true",
-        help="Skip quick 1x3 panel.",
-    )
-    parser.add_argument(
-        "--skip-corr",
-        action="store_true",
-        help="Skip correlation scatter-matrix plots (baselines, s_* and joint).",
-    )
+    parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
+    parser.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
+
+    parser.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
+    parser.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
+    parser.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
+    parser.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
+
+    parser.add_argument("--overview-kw", action="append", default=[], metavar="K=V",
+                        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V",
+                        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--states-kw", action="append", default=[], metavar="K=V",
+                        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--quick-kw", action="append", default=[], metavar="K=V",
+                        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.")
+
     args = parser.parse_args()
 
-    # Resolve run path using helper
+    # Resolve run path
     run_path = args.target
     if run_path is None:
-        print(
-            f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ..."
-        )
+        print(f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ...")
         run_path = find_latest_run(root=args.root)
         if run_path is None:
             print(f"[error] No 'posterior.npz' found under {args.root!r}. Provide --target or change --root.")
@@ -1018,39 +785,34 @@ if __name__ == "__main__":
         print(f"[info] Using latest run: {run_path}")
 
     # Load bundle
-    bundle = load_posterior(run_path)  # PosteriorBundle(draws, meta, npz_path, meta_path)
+    bundle = load_posterior(run_path)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    # Save dir
+    # Output dir
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "figures")
     _ensure_dir(out_dir)
     print(f"[info] saving figures to: {out_dir}")
 
-    # Plot
+    # Plotter
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
+    # Parse kw overrides
+    overview_kw = _parse_kv_list(args.overview_kw)
+    traceacf_kw = _parse_kv_list(args.traceacf_kw)
+    states_kw = _parse_kv_list(args.states_kw)
+    quick_kw = _parse_kv_list(args.quick_kw)
+
+    # Call plots
     if not args.skip_overview:
-        plotter.figure_overview(save_dir=out_dir, fname_prefix="overview", show=args.show)
+        plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
 
     if not args.skip_traceacf:
-        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show)
+        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
 
     if not args.skip_states:
-        plotter.figure_states(
-            save_dir=out_dir,
-            color="C0",
-            ylims={
-                "level": (5, 15),
-                "slope": (-0.05, 0.05),
-                "seasonality": (-3, 3),
-            },
-        )
-
-
-    if not args.skip_corr:
-        plotter.figure_correlations(save_dir=out_dir, show=args.show)
+        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
 
     if not args.skip_quick:
-        plotter.quick_report(save_dir=out_dir, fname_prefix="quick_report", show=args.show)
+        plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
     print("[done] plots written.")
