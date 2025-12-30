@@ -365,9 +365,9 @@ def main() -> None:
     p.add_argument("--prior-b-lambda", type=float, default=0.001)
 
     # --- sampler config ---
-    p.add_argument("--n-iter", type=int, default=8000)
-    p.add_argument("--burn", type=int, default=4000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--n-iter", type=int, default=20000)
+    p.add_argument("--burn", type=int, default=5000)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=_str2bool, default=True)
     p.add_argument("--progress-every", type=int, default=10, help="0=auto (~2%).")
