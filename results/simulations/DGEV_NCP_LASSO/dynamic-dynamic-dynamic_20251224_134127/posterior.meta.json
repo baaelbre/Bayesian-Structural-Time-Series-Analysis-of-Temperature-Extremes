@@ -1,0 +1,42 @@
+{
+  "T": 500,
+  "dim": 5,
+  "period": 4,
+  "layout": [
+    "alpha",
+    "beta",
+    "g1",
+    "g2",
+    "g3"
+  ],
+  "cfg": {
+    "n_iter": 8000,
+    "burn": 4000,
+    "thin": 2,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 1,
+    "slice_w": 1.0,
+    "slice_m": 20
+  },
+  "priors": {
+    "a_sigma": 2.0,
+    "b_sigma": 2.0,
+    "xi_lower": -0.5,
+    "xi_upper": 0.5,
+    "m0_alpha": 0.0,
+    "P0_alpha": 10.0,
+    "m0_beta": 0.0,
+    "P0_beta": 10.0,
+    "m0_gamma": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "P0_gamma": 5.0,
+    "a_lambda": 0.001,
+    "b_lambda": 0.001
+  },
+  "time_center": 250.5,
+  "elapsed_seconds": 989.3439271450043
+}

@@ -26,7 +26,7 @@ sys.path.append(PROJECT_ROOT)
 # Import NCP Laplace Bayesian-lasso DGEV with seasonal dummies
 # ---------------------------------------------------------------------------
 
-from optimization.dgev_laplace import (  # type: ignore
+from optimization.less_optimal_versions.dgev_laplace import (  # type: ignore
     DGEVLaplaceNCP,
     Priors,
     SamplerConfig,

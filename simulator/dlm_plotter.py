@@ -903,7 +903,7 @@ if __name__ == "__main__":
                         help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.")
     parser.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V",
                         help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.")
-    parser.add_argument("--states-kw", action="append", default=["slope_scale=120", "center=mean"], metavar="K=V",
+    parser.add_argument("--states-kw", action="append", default=["slope_scale=1", "center=mean"], metavar="K=V",
                         help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.")
     parser.add_argument("--quick-kw", action="append", default=[], metavar="K=V",
                         help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.")

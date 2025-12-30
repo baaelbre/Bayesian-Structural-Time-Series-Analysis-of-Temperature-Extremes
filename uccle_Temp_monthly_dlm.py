@@ -9,7 +9,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # ---- import the non-centred DLM with hierarchical Bayesian lasso prior ----
-from optimization.dlm import (
+from optimization.dlm_3 import (
     DLMGibbsConjugate,
     Priors,
     SamplerConfig,

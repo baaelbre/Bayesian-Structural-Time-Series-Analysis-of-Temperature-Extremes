@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from optimization.dlm import (
+from optimization.less_optimal_versions.dlm import (
     DLMGibbsConjugate,
     Priors,
     SamplerConfig,

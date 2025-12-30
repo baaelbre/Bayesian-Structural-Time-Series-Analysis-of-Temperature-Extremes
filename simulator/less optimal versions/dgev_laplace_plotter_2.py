@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import math
+from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
@@ -90,7 +91,7 @@ def _geweke_z(x: np.ndarray, first_frac: float = 0.1, last_frac: float = 0.5) ->
         return float("nan")
     a = max(2, int(np.floor(first_frac * n)))
     b = max(2, int(np.floor(last_frac * n)))
-    xa, xb = x[:a], x[n - b:]
+    xa, xb = x[:a], x[n - b :]
     ma, mb = float(np.mean(xa)), float(np.mean(xb))
     va = float(np.var(xa, ddof=1)) / max(1, xa.size)
     vb = float(np.var(xb, ddof=1)) / max(1, xb.size)
@@ -118,22 +119,37 @@ def _center_label(center: str) -> str:
 
 
 # =============================================================================
-# DGEV Plotter (mirrors DLMPlotter, with σ and ξ)
+# Quad diagnostics container
+# =============================================================================
+@dataclass
+class QuadDiagnostics:
+    mae: Optional[np.ndarray] = None
+    p95: Optional[np.ndarray] = None
+    mx: Optional[np.ndarray] = None
+    frac_fixed: Optional[np.ndarray] = None
+    frac_invalid: Optional[np.ndarray] = None
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.mae is not None
+            or self.p95 is not None
+            or self.mx is not None
+            or self.frac_fixed is not None
+            or self.frac_invalid is not None
+        )
+
+
+# =============================================================================
+# DGEV Plotter (mirrors DLMPlotter, with σ and ξ + quad diagnostics)
 # =============================================================================
 class DGEVPlotter:
     """
     Plotter for posterior bundles from the Laplace-based structural GEV model
     (non-centred states, Bayesian lasso on process SDs).
 
-    Differences with DLMPlotter:
-      - GEV scale parameter σ and shape parameter ξ.
-      - Trace/hist/ACF panels explicitly include both σ and ξ.
-      - Quick report shows μ, σ, ξ.
-
-    Everything else mirrors DLMPlotter:
-      - Same overview layout (μ, σ, Q, baselines, RMSE).
-      - Same separate state plots (level, slope, seasonality).
-      - Same clipping / zooming logic for traces and histograms.
+    Adds support for the Laplace local quadratic diagnostics (if present in posterior):
+      - quad_mae, quad_p95, quad_max, quad_frac_fixed, quad_frac_invalid
     """
 
     def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
@@ -172,7 +188,33 @@ class DGEVPlotter:
         if "xi" in draws and np.asarray(draws["xi"]).shape[0] == self.S:
             self.xi = np.asarray(draws["xi"], float)
 
-        # scalar & vector params
+        # loglike (optional, handy for quad scatter)
+        self.loglike: Optional[np.ndarray] = None
+        if "loglike" in draws and np.asarray(draws["loglike"]).shape[0] == self.S:
+            self.loglike = np.asarray(draws["loglike"], float)
+
+        # quad diagnostics
+        self.quad = QuadDiagnostics(
+            mae=_maybe(draws, "quad_mae"),
+            p95=_maybe(draws, "quad_p95"),
+            mx=_maybe(draws, "quad_max"),
+            frac_fixed=_maybe(draws, "quad_frac_fixed"),
+            frac_invalid=_maybe(draws, "quad_frac_invalid"),
+        )
+        # validate shapes where present
+        for nm, arr in (
+            ("quad_mae", self.quad.mae),
+            ("quad_p95", self.quad.p95),
+            ("quad_max", self.quad.mx),
+            ("quad_frac_fixed", self.quad.frac_fixed),
+            ("quad_frac_invalid", self.quad.frac_invalid),
+        ):
+            if arr is not None:
+                a = np.asarray(arr)
+                if a.ndim != 1 or a.shape[0] != self.S:
+                    raise ValueError(f"{nm} must be shape (S,), got {a.shape}")
+
+        # scalar & vector params (kept draws)
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
         for k, v in draws.items():
@@ -287,7 +329,7 @@ class DGEVPlotter:
         return None
 
     # ------------------------------------------------------------------
-    # Trace/Hist/ACF panel (copied from DLMPlotter)
+    # Trace/Hist/ACF panel
     # ------------------------------------------------------------------
     def _trace_hist_acf_panel(
         self,
@@ -297,7 +339,7 @@ class DGEVPlotter:
         title_trace: Optional[str] = None,
         title_hist: Optional[str] = None,
         title_acf: Optional[str] = None,
-        xlabel_trace: str = "iteration",
+        xlabel_trace: str = "kept draw",
         xlabel_acf: str = "lag",
         max_lag: int = 200,
         save_dir: Optional[str] = None,
@@ -460,7 +502,6 @@ class DGEVPlotter:
         save_dir: Optional[str] = None,
         fname: str = "overview.png",
         show: bool = True,
-        color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
@@ -475,14 +516,6 @@ class DGEVPlotter:
         ylims_mu: Optional[Tuple[float, float]] = None,
         yscale_mu: Optional[str] = None,
     ) -> None:
-        """
-        Overview identical in layout to DLMPlotter, but interpreted for GEV:
-          - μ_t ribbon with band.
-          - σ trace + σ histogram.
-          - log10(Q) histograms.
-          - baselines (alpha0, beta0, gamma0).
-          - running RMSE if true μ is present.
-        """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
 
@@ -491,8 +524,8 @@ class DGEVPlotter:
 
         t = np.arange(self.T)
         ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
-        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
-        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
+        axs[0].plot(t, ctr, lw=1.6, label=c_lab)
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, label=band_label)
         if self.y is not None and len(self.y) == self.T:
             axs[0].plot(t, self.y, lw=1.0, alpha=0.6, label=r"$y_t$")
         if self.true_mu is not None and len(self.true_mu) == self.T:
@@ -574,6 +607,7 @@ class DGEVPlotter:
         save_dir: Optional[str] = None,
         show: bool = True,
         max_lag: int = 200,
+        include_quad: bool = True,
         name_sigma: str = r"$\sigma$",
         name_xi: str = r"$\xi$",
         name_s_alpha: str = r"$s_\alpha$",
@@ -597,7 +631,8 @@ class DGEVPlotter:
           - ξ
           - signed process SDs s_alpha, s_beta, s_gamma
           - log10 Q-coordinates without signed SDs
-          - other scalar parameters (excluding σ/ξ and tau's)
+          - quad diagnostics (optional)
+          - other scalar parameters
         """
         def _panel(series: np.ndarray, nm: str, fname: str) -> None:
             self._trace_hist_acf_panel(
@@ -650,6 +685,19 @@ class DGEVPlotter:
                 series = np.log10(np.clip(Q[:, j], 1e-20, None))
                 _panel(series, rf"$\log_{{10}}({nm})$", f"trace_hist_acf_log10Q_{j}.png")
 
+        # Quad diagnostics
+        if include_quad and self.quad.available:
+            if self.quad.mae is not None:
+                _panel(self.quad.mae, r"quad MAE", "trace_hist_acf_quad_mae.png")
+            if self.quad.p95 is not None:
+                _panel(self.quad.p95, r"quad p95 abs err", "trace_hist_acf_quad_p95.png")
+            if self.quad.mx is not None:
+                _panel(self.quad.mx, r"quad max abs err", "trace_hist_acf_quad_max.png")
+            if self.quad.frac_fixed is not None:
+                _panel(self.quad.frac_fixed, r"quad frac Hessian fixed", "trace_hist_acf_quad_frac_fixed.png")
+            if self.quad.frac_invalid is not None:
+                _panel(self.quad.frac_invalid, r"quad frac eval invalid", "trace_hist_acf_quad_frac_invalid.png")
+
         # All other scalar parameters
         if plot_other_scalars:
             skip = {
@@ -657,6 +705,7 @@ class DGEVPlotter:
                 "s_alpha", "s_beta", "s_gamma",
                 "Q_alpha", "Q_beta", "Q_gamma",
                 "lambda2", "tau_alpha", "tau_beta", "tau_gamma",
+                "quad_mae", "quad_p95", "quad_max", "quad_frac_fixed", "quad_frac_invalid",
             }
             for k, arr in sorted(self.scalar_params.items()):
                 if k in skip:
@@ -665,13 +714,142 @@ class DGEVPlotter:
                     continue
                 _panel(arr, k, f"trace_hist_acf_{k}.png")
 
+    def figure_quad_diagnostics(
+        self,
+        *,
+        save_dir: Optional[str] = None,
+        fname: str = "quad_diagnostics.png",
+        show: bool = True,
+        max_points_scatter: int = 3000,
+        clip_frac_y: Tuple[float, float] = (0.0, 1.0),
+    ) -> None:
+        """
+        Single compact figure summarising the Laplace local quadratic diagnostics (if present).
+
+        Layout (2x3):
+          (0) trace: quad_mae
+          (1) trace: quad_p95
+          (2) trace: quad_max
+          (3) trace: frac_fixed + frac_invalid
+          (4) hist:  quad_mae (finite only)
+          (5) scatter: quad_mae vs loglike (if loglike exists) else quad_mae vs sigma (if exists)
+        """
+        if not self.quad.available:
+            print("[quad] no quad diagnostics found in posterior (keys quad_mae/quad_p95/quad_max/...). Skipping.")
+            return
+
+        fig, axs = plt.subplots(2, 3, figsize=(13, 7))
+        axs = axs.ravel()
+
+        x = np.arange(self.S)
+
+        def _trace(ax, arr: Optional[np.ndarray], title: str) -> None:
+            if arr is None:
+                ax.axis("off")
+                return
+            a = np.asarray(arr, float)
+            ax.plot(x, a, lw=1.0)
+            es = _ess(a)
+            gz = _geweke_z(a)
+            ax.set_title(rf"{title}  (ESS$\approx${es:.0f}, z$\approx${gz:.2f})")
+            ax.set_xlabel("kept draw")
+            ax.grid(True, alpha=0.25)
+
+        _trace(axs[0], self.quad.mae, "quad MAE")
+        _trace(axs[1], self.quad.p95, "quad p95 abs err")
+        _trace(axs[2], self.quad.mx, "quad max abs err")
+
+        # fractions panel
+        ax = axs[3]
+        if self.quad.frac_fixed is None and self.quad.frac_invalid is None:
+            ax.axis("off")
+        else:
+            if self.quad.frac_fixed is not None:
+                ax.plot(x, np.asarray(self.quad.frac_fixed, float), lw=1.0, label="frac_fixed")
+            if self.quad.frac_invalid is not None:
+                ax.plot(x, np.asarray(self.quad.frac_invalid, float), lw=1.0, label="frac_invalid")
+            ax.set_ylim(float(clip_frac_y[0]), float(clip_frac_y[1]))
+            ax.set_title("quad fractions")
+            ax.set_xlabel("kept draw")
+            ax.grid(True, alpha=0.25)
+            ax.legend(loc="best")
+
+        # hist panel
+        ax = axs[4]
+        if self.quad.mae is None:
+            ax.axis("off")
+        else:
+            a = np.asarray(self.quad.mae, float)
+            a = a[np.isfinite(a)]
+            if a.size == 0:
+                ax.axis("off")
+            else:
+                ax.hist(a, bins=40, density=True)
+                ax.set_title("hist: quad MAE (finite only)")
+                ax.grid(True, alpha=0.25)
+
+        # scatter panel
+        ax = axs[5]
+        if self.quad.mae is None:
+            ax.axis("off")
+        else:
+            q = np.asarray(self.quad.mae, float)
+            m = np.isfinite(q)
+            xlab = None
+            ylab = "quad MAE"
+
+            if self.loglike is not None:
+                ll = np.asarray(self.loglike, float)
+                m = m & np.isfinite(ll)
+                xx = ll[m]
+                yy = q[m]
+                xlab = "loglike"
+                title = "quad MAE vs loglike"
+            elif self.sigma is not None:
+                sg = np.asarray(self.sigma, float)
+                m = m & np.isfinite(sg)
+                xx = sg[m]
+                yy = q[m]
+                xlab = r"$\sigma$"
+                title = "quad MAE vs sigma"
+            else:
+                # fallback: versus kept draw index
+                xx = np.arange(self.S)[m]
+                yy = q[m]
+                xlab = "kept draw"
+                title = "quad MAE vs kept draw"
+
+            if xx.size == 0:
+                ax.axis("off")
+            else:
+                # subsample for speed/size
+                if xx.size > int(max_points_scatter):
+                    idx = np.linspace(0, xx.size - 1, int(max_points_scatter)).astype(int)
+                    xx = xx[idx]
+                    yy = yy[idx]
+                ax.scatter(xx, yy, s=10, alpha=0.5)
+                ax.set_xlabel(xlab)
+                ax.set_ylabel(ylab)
+                ax.set_title(title)
+                ax.grid(True, alpha=0.25)
+
+        plt.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
     def figure_states_separate(
         self,
         *,
         save_dir: Optional[str] = None,
         fname_prefix: str = "state",
         show: bool = True,
-        color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
@@ -688,9 +866,6 @@ class DGEVPlotter:
         zero_line_slope: bool = True,
         zero_line_seasonality: bool = True,
     ) -> None:
-        """
-        Separate ribbons for level, slope and seasonality, exactly like in DLMPlotter.
-        """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
 
@@ -716,8 +891,8 @@ class DGEVPlotter:
             ctr, lo, hi = self._summarize_ribbon(arr2d, center=center)
 
             fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
-            ax.plot(t, ctr, lw=1.6, color=color, label=c_lab)
-            ax.fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
+            ax.plot(t, ctr, lw=1.6, label=c_lab)
+            ax.fill_between(t, lo, hi, alpha=band_alpha, label=band_label)
 
             if truth is not None and len(truth) == self.T:
                 ax.plot(t, truth, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
@@ -795,21 +970,23 @@ class DGEVPlotter:
         save_dir: Optional[str] = None,
         fname: str = "quick_report.png",
         show: bool = True,
-        color: str = "C0",
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
+        include_quad: bool = True,
         title_mu: str = r"$\mu_t$",
         title_sigma: str = r"$\sigma \mid y$",
         title_xi: str = r"$\xi \mid y$",
+        title_quad: str = r"quad MAE",
         xlabel_time: str = r"$t$",
         ylabel_mu: str = r"$\mu_t$",
     ) -> None:
         """
-        Compact 1x3 summary:
+        Compact summary:
           - μ_t ribbon.
-          - σ posterior histogram.
-          - ξ posterior histogram (or process scale if ξ missing).
+          - σ histogram.
+          - ξ histogram (or fallback).
+          - optional: quad MAE histogram (if present & include_quad).
         """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
@@ -817,11 +994,14 @@ class DGEVPlotter:
         ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
         t = np.arange(self.T)
 
-        fig, axs = plt.subplots(1, 3, figsize=(14, 4))
+        want_quad = include_quad and (self.quad.mae is not None)
+        ncols = 4 if want_quad else 3
+
+        fig, axs = plt.subplots(1, ncols, figsize=(4.7 * ncols, 4))
 
         # μ
-        axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
-        axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
+        axs[0].plot(t, ctr, lw=1.6, label=c_lab)
+        axs[0].fill_between(t, lo, hi, alpha=band_alpha, label=band_label)
         if self.true_mu is not None and len(self.true_mu) == self.T:
             axs[0].plot(t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8, label=r"truth")
         axs[0].set_title(title_mu)
@@ -849,6 +1029,18 @@ class DGEVPlotter:
             axs[2].set_title(r"process scale")
         else:
             axs[2].axis("off")
+
+        # quad
+        if want_quad:
+            q = np.asarray(self.quad.mae, float)
+            q = q[np.isfinite(q)]
+            if q.size:
+                axs[3].hist(q, bins=40, density=True)
+                es = _ess(q)
+                gz = _geweke_z(q)
+                axs[3].set_title(rf"{title_quad}  (ESS$\approx${es:.0f}, z$\approx${gz:.2f})")
+            else:
+                axs[3].axis("off")
 
         plt.tight_layout()
         if save_dir:
@@ -907,7 +1099,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "DGEV plotter for Laplace-based structural GEV models (non-centred state bundles).\n"
-            "Produces overview, scalar trace/hist/ACF, separate state component plots, and a quick report.\n"
+            "Produces overview, scalar trace/hist/ACF, separate state component plots, quick report,\n"
+            "and (if available) the Laplace local quadratic diagnostics summary.\n\n"
             "Use --<section>-kw K=V (repeatable) to override kwargs.\n"
             "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1).\n\n"
             "Ribbon center (use via --overview-kw/--states-kw/--quick-kw):\n"
@@ -925,7 +1118,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--root",
         type=str,
-        default="results/simulations/DGEV_TRUE_MH",
+        default="results/simulations/DGEV_NCP_LASSO",
         help="Search root if --target is omitted.",
     )
     parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
@@ -936,6 +1129,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
     parser.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
     parser.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
+    parser.add_argument("--skip-quad", action="store_true", help="Skip quad diagnostics figure (if available).")
 
     parser.add_argument(
         "--overview-kw",
@@ -965,6 +1159,13 @@ if __name__ == "__main__":
         metavar="K=V",
         help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
     )
+    parser.add_argument(
+        "--quad-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_quad_diagnostics(...). Repeatable. Supports nested keys via dots.",
+    )
 
     args = parser.parse_args()
 
@@ -990,6 +1191,7 @@ if __name__ == "__main__":
     traceacf_kw = _parse_kv_list(args.traceacf_kw)
     states_kw = _parse_kv_list(args.states_kw)
     quick_kw = _parse_kv_list(args.quick_kw)
+    quad_kw = _parse_kv_list(args.quad_kw)
 
     if not args.skip_overview:
         plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
@@ -999,5 +1201,7 @@ if __name__ == "__main__":
         plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
     if not args.skip_quick:
         plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
+    if not args.skip_quad:
+        plotter.figure_quad_diagnostics(save_dir=out_dir, show=args.show, **quad_kw)
 
     print("[done] plots written.")

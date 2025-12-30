@@ -26,7 +26,7 @@ import pandas as pd
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from optimization.dgev_laplace import (
+from optimization.less_optimal_versions.dgev_laplace import (
     DGEVLaplaceNCP,
     Priors,
     SamplerConfig,

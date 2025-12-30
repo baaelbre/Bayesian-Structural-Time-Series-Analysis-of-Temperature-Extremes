@@ -143,8 +143,7 @@ class SamplerConfig:
     # (kept for compatibility / CLI, not used here)
     slice_w: float = 1.0
     slice_m: int = 20
-
-
+    
 # =============================================================================
 # DGEV Approximate Gibbs with NCP + dummy seasonality + Bayesian lasso
 # =============================================================================
@@ -678,7 +677,7 @@ class DGEVLaplaceNCP:
         where t̄ is the mean of {1,…,T}. We sample θ_c = (α_c, β, γ0, s_α, s_β, s_γ)
         and then transform back to the original parametrisation:
 
-            alpha0 = α_c - t̄ β
+            alpha0 = α_c - t̄ β (time-centering)
             beta0  = β.
         """
         if self.dim_ncp == 0:
@@ -1106,7 +1105,7 @@ if __name__ == "__main__":
     p.add_argument("--start-date", type=str, default="2000-01-01")
 
     p.add_argument("--sigma", type=float, default=3.0)
-    p.add_argument("--xi", type=float, default=0.1)
+    p.add_argument("--xi", type=float, default=-0.1)
 
     p.add_argument("--level-mode", type=str, default="dynamic")
     p.add_argument("--trend-mode", type=str, default="dynamic")
