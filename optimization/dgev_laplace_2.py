@@ -14,12 +14,21 @@ import numpy as np
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-from ffbs import ffbs_dgev_ncp_laplace  # type: ignore
-from utils import (  # type: ignore
-    spd_solve,
-    symmetrize,
-    rand_invgauss,
+try:
+    from .ffbs import ffbs_dgev_ncp_laplace  # type: ignore
+    from .utils import (  # type: ignore
+        spd_solve,
+        symmetrize,
+        rand_invgauss,
+        gev_loglike_sum,
+        gev_score_hess_mu,
+    )
+except ImportError:
+    from ffbs import ffbs_dgev_ncp_laplace  # type: ignore
+    from utils import (  # type: ignore
+        spd_solve,
+        symmetrize,
+        rand_invgauss,
     gev_loglike_sum,
     gev_score_hess_mu,
 )

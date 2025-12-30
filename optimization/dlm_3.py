@@ -11,10 +11,12 @@ from datetime import datetime
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
-
-from ffbs import ffbs_dlm_ncp  # type: ignore
-from utils import rand_invgauss, spd_solve, symmetrize  # type: ignore
-
+try:
+    from .ffbs import ffbs_dlm_ncp  # type: ignore
+    from .utils import rand_invgauss, spd_solve, symmetrize  # type: ignore
+except ImportError:
+    from ffbs import ffbs_dlm_ncp  # type: ignore
+    from utils import rand_invgauss, spd_solve, symmetrize  # type: ignore
 
 # =============================================================================
 # Priors & Config

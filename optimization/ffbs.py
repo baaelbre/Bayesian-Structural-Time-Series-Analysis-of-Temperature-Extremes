@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import numpy as np
-
-from utils import spd_solve, symmetrize  # type: ignore
+try:
+    from .utils import spd_solve, symmetrize  # type: ignore
+except ImportError:
+    from utils import spd_solve, symmetrize  # type: ignore
 
 
 def ffbs_gaussian_1d(
