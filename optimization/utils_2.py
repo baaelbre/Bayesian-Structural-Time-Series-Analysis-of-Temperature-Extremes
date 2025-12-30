@@ -62,18 +62,48 @@ def spd_solve(A: np.ndarray, B: np.ndarray, jitter: float = 1e-12, max_tries: in
 # =============================================================================
 # RNG helpers
 # =============================================================================
+
+# Hard safety bounds to prevent under/overflow / invalid SciPy params.
+# These are *only* used when the chain goes numerically insane.
+_IG_MU_MIN, _IG_MU_MAX = 1e-16, 1e16
+_IG_LAM_MIN, _IG_LAM_MAX = 1e-16, 1e16
+_IG_X_MIN, _IG_X_MAX = 1e-16, 1e16
+
+
+def _clip_pos_finite(x: float, lo: float, hi: float, fallback: float) -> float:
+    x = float(x)
+    if (not np.isfinite(x)) or (x <= 0.0):
+        return float(fallback)
+    if x < lo:
+        return float(lo)
+    if x > hi:
+        return float(hi)
+    return float(x)
+
+
 def _rand_invgauss_msh(mu: float, lam: float, rng: np.random.Generator) -> float:
     """
     Michael–Schucany–Haas method for IG(mu, lam).
+    (Assumes mu>0 and lam>0 and finite.)
     """
-    if mu <= 0.0 or lam <= 0.0:
-        raise ValueError("Inverse-Gaussian requires mu>0 and lam>0")
+    if mu <= 0.0 or lam <= 0.0 or (not np.isfinite(mu)) or (not np.isfinite(lam)):
+        raise ValueError("Inverse-Gaussian requires finite mu>0 and lam>0")
 
     v = float(rng.normal())
     y = v * v
     mu2 = mu * mu
     term = mu2 * y
-    x = mu + term / (2.0 * lam) - (mu / (2.0 * lam)) * math.sqrt(4.0 * mu * lam * y + term * y)
+
+    # x = mu + (mu^2 y)/(2 lam) - (mu/(2 lam)) * sqrt(4 mu lam y + (mu^2 y) y)
+    rad = 4.0 * mu * lam * y + term * y
+    if (not np.isfinite(rad)) or (rad <= 0.0):
+        raise FloatingPointError("IG MSH radicand invalid")
+
+    x = mu + term / (2.0 * lam) - (mu / (2.0 * lam)) * math.sqrt(rad)
+
+    if (not np.isfinite(x)) or (x <= 0.0):
+        raise FloatingPointError("IG MSH produced nonpositive draw")
+
     u = float(rng.random())
     if u <= mu / (mu + x):
         return float(x)
@@ -82,22 +112,41 @@ def _rand_invgauss_msh(mu: float, lam: float, rng: np.random.Generator) -> float
 
 def rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
     """
-    Draw X ~ IG(mu, lam) with density proportional to:
-        sqrt(lam/(2π x^3)) exp(-lam (x-mu)^2 / (2 mu^2 x))
+    SAFE draw X ~ IG(mu, lam).
 
-    If SciPy is available, use its invgauss sampler with scaling:
-        if Y ~ IG(mu/lam, 1) then X = lam * Y ~ IG(mu, lam).
-    Otherwise fall back to Michael–Schucany–Haas.
+    Same target as before, but **never raises**:
+      - clamps invalid / extreme parameters into a safe positive range
+      - catches SciPy/MSH numeric failures
+      - guarantees a finite positive return
+
+    This makes Bayesian-lasso scale updates uncrashable when mu underflows to 0.
     """
-    if mu <= 0.0 or lam <= 0.0:
-        raise ValueError("Inverse-Gaussian requires mu>0 and lam>0")
+    # sanitize inputs (handle underflow to 0, negatives, nan/inf)
+    mu0 = float(mu)
+    lam0 = float(lam)
 
-    if _HAVE_SCIPY_STATS:
-        y = invgauss.rvs(mu=mu / lam, random_state=rng)  # type: ignore
-        return float(lam * y)
+    # If mu/lam invalid, fall back to a tiny but positive mean
+    mu_safe = _clip_pos_finite(mu0, _IG_MU_MIN, _IG_MU_MAX, fallback=_IG_MU_MIN)
+    lam_safe = _clip_pos_finite(lam0, _IG_LAM_MIN, _IG_LAM_MAX, fallback=_IG_LAM_MIN)
 
-    return _rand_invgauss_msh(mu, lam, rng)
+    # If the caller gave mu<=0, we'd like a "neutral" fallback close to the intended mean.
+    fallback_x = max(mu_safe, _IG_X_MIN)
 
+    try:
+        if _HAVE_SCIPY_STATS:
+            # SciPy parameterization: if Y ~ IG(mu/lam, 1), then X = lam * Y ~ IG(mu, lam).
+            shape = mu_safe / lam_safe
+            shape = _clip_pos_finite(shape, _IG_MU_MIN, _IG_MU_MAX, fallback=_IG_MU_MIN)
+
+            y = invgauss.rvs(mu=shape, random_state=rng)  # type: ignore
+            x = float(lam_safe * float(y))
+        else:
+            x = float(_rand_invgauss_msh(mu_safe, lam_safe, rng))
+    except Exception:
+        return float(_clip_pos_finite(fallback_x, _IG_X_MIN, _IG_X_MAX, fallback=_IG_X_MIN))
+
+    # final safety: guarantee finite positive
+    return float(_clip_pos_finite(x, _IG_X_MIN, _IG_X_MAX, fallback=fallback_x))
 
 # =============================================================================
 # GEV log-likelihood helpers (wrt location mu)

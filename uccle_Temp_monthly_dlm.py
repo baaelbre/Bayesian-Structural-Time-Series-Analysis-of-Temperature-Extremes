@@ -352,8 +352,8 @@ def main() -> None:
     p.add_argument("--prior-P0-beta", type=float, default=10.0)
     p.add_argument("--prior-m0-gamma", type=str, default=None, help="CSV floats length 11 (period-1), else zeros")
     p.add_argument("--prior-P0-gamma", type=float, default=5.0)
-    p.add_argument("--prior-a-lambda", type=float, default=0.001)
-    p.add_argument("--prior-b-lambda", type=float, default=0.001)
+    p.add_argument("--prior-a-lambda", type=float, default=0.001) # put to 2,0.05 for more shrinkage
+    p.add_argument("--prior-b-lambda", type=float, default=0.001) # standard: 0.001, 0.001
 
     # initials
     p.add_argument("--sigma-init", type=float, default=None, help="If omitted: 0.3*sd(y)")
