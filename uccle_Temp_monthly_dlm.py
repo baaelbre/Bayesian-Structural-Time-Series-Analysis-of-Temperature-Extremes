@@ -60,12 +60,12 @@ def _parse_csv_floats(s: Optional[str], expected_len: Optional[int] = None) -> O
 def _series_out_root(series: str, base: Path) -> Path:
     """
     Uccle directory convention (monthly means):
-      TXm -> results/uccle/TX/TXm/Monthly/DLM
-      TNm -> results/uccle/TN/TNm/Monthly/DLM
+      TXm -> results/uccle/TX/TXm/Monthly
+      TNm -> results/uccle/TN/TNm/Monthly
     """
     mapping = {
-        "TXm": base / "TX" / "TXm" / "Monthly" / "DLM",
-        "TNm": base / "TN" / "TNm" / "Monthly" / "DLM",
+        "TXm": base / "TX" / "TXm" / "Monthly",
+        "TNm": base / "TN" / "TNm" / "Monthly",
     }
     if series not in mapping:
         raise ValueError(f"Unknown series '{series}'. Expected one of {list(mapping)}.")

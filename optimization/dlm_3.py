@@ -13,10 +13,10 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 try:
     from .ffbs import ffbs_dlm_ncp  # type: ignore
-    from .utils import rand_invgauss, spd_solve, symmetrize  # type: ignore
+    from .utils_2 import rand_invgauss, spd_solve, symmetrize  # type: ignore
 except ImportError:
     from ffbs import ffbs_dlm_ncp  # type: ignore
-    from utils import rand_invgauss, spd_solve, symmetrize  # type: ignore
+    from utils_2 import rand_invgauss, spd_solve, symmetrize  # type: ignore
 
 # =============================================================================
 # Priors & Config

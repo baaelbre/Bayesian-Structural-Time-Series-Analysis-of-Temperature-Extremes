@@ -14,37 +14,34 @@ import numpy as np
 import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# ---------------------------------------------------------------------
+# Local imports (package / script)
+# ---------------------------------------------------------------------
 try:
     from .ffbs import ffbs_dgev_ncp_laplace  # type: ignore
-    from .utils import (  # type: ignore
+    from .utils_2 import (  # type: ignore
         spd_solve,
         symmetrize,
         rand_invgauss,
         gev_loglike_sum,
         gev_score_hess_mu,
+        parse_bool,
+        parse_date,
+        parse_csv_floats,
     )
 except ImportError:
     from ffbs import ffbs_dgev_ncp_laplace  # type: ignore
-    from utils import (  # type: ignore
+    from utils_2 import (  # type: ignore
         spd_solve,
         symmetrize,
         rand_invgauss,
-    gev_loglike_sum,
-    gev_score_hess_mu,
-)
-
-# =============================================================================
-# Robust wrappers (utils signature differences)
-# =============================================================================
-def _spd_solve_safe(M: np.ndarray, B: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    """
-    utils.spd_solve is used across your repo with either `eps=` or `jitter=`.
-    This wrapper supports both signatures.
-    """
-    try:
-        return spd_solve(M, B, jitter=eps)  # type: ignore[arg-type]
-    except TypeError:
-        return spd_solve(M, B, eps=eps)  # type: ignore[arg-type]
+        gev_loglike_sum,
+        gev_score_hess_mu,
+        parse_bool,
+        parse_date,
+        parse_csv_floats,
+    )
 
 
 # =============================================================================
@@ -82,6 +79,9 @@ class SamplerConfig:
     progress: bool = True
     progress_every: int = 0  # 0 => ~2% of n_iter
 
+    # NEW: restart guard (re-run an iteration if logL is -inf/nan, or a numeric exception occurs)
+    max_restarts: int = 50
+
     # kept for CLI compatibility (not used)
     slice_w: float = 1.0
     slice_m: int = 20
@@ -95,7 +95,7 @@ class DGEVLaplaceNCP:
     Structural DGEV with:
       - latent Gaussian structural component in NCP for (level, slope, seasonal dummies)
       - Laplace pseudo-observations for the GEV location mu_t
-      - FFBS in NCP using pseudo-obs for the *dynamic* part (alpha_t + g1_t)
+      - FFBS in NCP using pseudo-obs for the dynamic part (alpha_t + g1_t)
       - ONE joint regression update for:
             (alpha0, beta0, gamma0, s_alpha, s_beta, s_gamma)
         using the pseudo-obs z_mu and centred time
@@ -103,10 +103,10 @@ class DGEVLaplaceNCP:
       - random sign switches
       - RW-MH for (logsigma, xi) using the exact GEV likelihood
 
-    Bugfixes mirrored from your DLM code:
-      (1) Seasonal innovations: only the first seasonal dummy gets innovation noise.
-      (2) Centred-time intercept prior: induced correlated prior on (alpha_c, beta).
-      (3) spd_solve signature mismatch handled via _spd_solve_safe().
+    Key robustness fix:
+      - If an iteration produces an invalid likelihood (logL = -inf or nan),
+        or hits a numerical exception, we restore the previous state and
+        re-run that iteration up to cfg.max_restarts times.
     """
 
     def __init__(
@@ -124,7 +124,7 @@ class DGEVLaplaceNCP:
         s_gamma_init: float = 1e-3,
         priors: Priors = Priors(),
         cfg: SamplerConfig = SamplerConfig(),
-        # knobs (kept as in your "old code works better" behaviour)
+        # knobs
         ffbs_C0_scale: float = 1e-6,
         ffbs_C0_A: float = 1e-6,
         ffbs_jitter: float = 1e-12,
@@ -259,7 +259,7 @@ class DGEVLaplaceNCP:
     def _build_season_design(self) -> np.ndarray:
         """
         Static seasonal design S[t,:] for baseline gamma0 (length p-1), sum-to-zero.
-        We align observation t=1..T with rows i=t-1=0..T-1, so season = i % p.
+        Align observation t=1..T with rows i=t-1=0..T-1, so season = i % p.
         """
         T, p = self.T, self.period
         K = p - 1
@@ -295,7 +295,7 @@ class DGEVLaplaceNCP:
             R[0, :] = -1.0
             if K > 1:
                 R[1:, :-1] = np.eye(K - 1)
-            G[gs : ge + 1, gs : ge + 1] = R
+            G[gs: ge + 1, gs: ge + 1] = R
 
         return G
 
@@ -325,15 +325,15 @@ class DGEVLaplaceNCP:
 
           beta_t  = beta0 + s_beta * tilde_beta_t
           alpha_t = alpha0 + t*beta0 + s_alpha*tilde_alpha_t + s_beta*A_t
-          g_t     = s_gamma * tilde_g_t   (vector of length p-1)
+          g_t     = s_gamma * tilde_g_t   (vector length p-1)
 
-        (baseline seasonal means gamma0 enter the observation equation via S @ gamma0)
+        (baseline seasonal means gamma0 enter observation equation via S @ gamma0)
         """
         z = self.z
         tilde_alpha = z[:, self.idx_tilde_alpha]
         tilde_beta = z[:, self.idx_tilde_beta]
         A_t = z[:, self.idx_A]
-        tilde_g = z[:, self.idx_tilde_g_start : self.idx_tilde_g_end + 1]
+        tilde_g = z[:, self.idx_tilde_g_start: self.idx_tilde_g_end + 1]
 
         beta_cp = self.beta0 + self.s_beta * tilde_beta
         alpha_cp = self.alpha0 + self._t0 * self.beta0 + self.s_alpha * tilde_alpha + self.s_beta * A_t
@@ -341,13 +341,11 @@ class DGEVLaplaceNCP:
 
         self.x[:, self.idx_alpha] = alpha_cp
         self.x[:, self.idx_beta] = beta_cp
-        self.x[:, self.idx_g_start : self.idx_g_end + 1] = g_cp
+        self.x[:, self.idx_g_start: self.idx_g_end + 1] = g_cp
 
     # ----------------------------- mean vector ----------------------------- #
     def mu_vec(self) -> np.ndarray:
-        """
-        mu_t = alpha_t + g1_t + S[t-1,:]@gamma0 for t=1..T
-        """
+        """mu_t = alpha_t + g1_t + S[t-1,:]@gamma0 for t=1..T."""
         mu_dyn = self.x[1:, self.idx_alpha] + self.x[1:, self.idx_g1]
         mu_base = (self._S @ self.gamma0) if self._S.size else 0.0
         return mu_dyn + mu_base
@@ -392,10 +390,7 @@ class DGEVLaplaceNCP:
           z_star_t = z_mu_t - S[t-1,:]@gamma0
         so the measurement targets the dynamic part alpha_t + g1_t.
         """
-        if self._S.size:
-            z_star = z_mu - (self._S @ self.gamma0)
-        else:
-            z_star = z_mu
+        z_star = z_mu - (self._S @ self.gamma0) if self._S.size else z_mu
 
         self.z = ffbs_dgev_ncp_laplace(
             z_star=z_star,
@@ -430,7 +425,7 @@ class DGEVLaplaceNCP:
 
         with alpha_c = alpha0 + tbar*beta.
 
-        FIX: use induced correlated prior on (alpha_c, beta) from independent priors on (alpha0, beta0).
+        Uses the induced correlated prior on (alpha_c, beta) from independent priors on (alpha0, beta0).
         """
         T = self.T
         t_c = self._t1 - self._tbar
@@ -472,7 +467,7 @@ class DGEVLaplaceNCP:
                 m_gamma = np.asarray(self.priors.m0_gamma, float)
                 if m_gamma.size != self.K_gamma:
                     raise ValueError("Priors.m0_gamma must have length p-1")
-            m0[idx_gamma0 : idx_gamma0 + self.K_gamma] = m_gamma
+            m0[idx_gamma0: idx_gamma0 + self.K_gamma] = m_gamma
 
         # prior precision
         prior_prec = np.zeros((d, d), float)
@@ -487,14 +482,14 @@ class DGEVLaplaceNCP:
             dtype=float,
         )
         Sigma_ab = symmetrize(Sigma_ab) + 1e-15 * np.eye(2)
-        Prec_ab = _spd_solve_safe(Sigma_ab, np.eye(2), eps=1e-12)
+        Prec_ab = spd_solve(Sigma_ab, np.eye(2), jitter=1e-12)
         Prec_ab = symmetrize(Prec_ab)
-        prior_prec[idx_alpha_c : idx_beta + 1, idx_alpha_c : idx_beta + 1] = Prec_ab
+        prior_prec[idx_alpha_c: idx_beta + 1, idx_alpha_c: idx_beta + 1] = Prec_ab
 
         if self.K_gamma > 0:
             Pg = max(float(self.priors.P0_gamma), 1e-12)
-            prior_prec[idx_gamma0 : idx_gamma0 + self.K_gamma,
-                       idx_gamma0 : idx_gamma0 + self.K_gamma] = (1.0 / Pg) * np.eye(self.K_gamma)
+            prior_prec[idx_gamma0: idx_gamma0 + self.K_gamma,
+                       idx_gamma0: idx_gamma0 + self.K_gamma] = (1.0 / Pg) * np.eye(self.K_gamma)
 
         eps = 1e-16
         prior_prec[idx_s_alpha, idx_s_alpha] = 1.0 / max(self.sigma2_eff * self.tau_alpha, eps)
@@ -505,10 +500,10 @@ class DGEVLaplaceNCP:
         Xty = Xw.T @ yw
 
         post_prec = symmetrize(XtX + prior_prec) + 1e-12 * np.eye(d)
-        post_cov = _spd_solve_safe(post_prec, np.eye(d), eps=1e-12)
+        post_cov = spd_solve(post_prec, np.eye(d), jitter=1e-12)
         post_cov = symmetrize(post_cov)
 
-        # guard
+        # guard (ensure SPD-ish)
         eigmin = float(np.linalg.eigvalsh(post_cov).min())
         if eigmin < 1e-12:
             post_cov = post_cov + (1e-12 - eigmin) * np.eye(d)
@@ -523,7 +518,7 @@ class DGEVLaplaceNCP:
         self.alpha0 = alpha_c - self._tbar * beta
 
         if self.K_gamma > 0:
-            self.gamma0 = theta[idx_gamma0 : idx_gamma0 + self.K_gamma].copy()
+            self.gamma0 = theta[idx_gamma0: idx_gamma0 + self.K_gamma].copy()
 
         self.s_alpha = float(theta[idx_s_alpha])
         self.s_beta = float(theta[idx_s_beta])
@@ -536,17 +531,29 @@ class DGEVLaplaceNCP:
           tau_k | s_k, sigma2_eff, lambda2 ~ InvGaussian(mu_k, lambda2),
             mu_k = sqrt(lambda2 * sigma2_eff / s_k^2)
           lambda2 | tau ~ Gamma(a_lambda + K, b_lambda + 0.5 * sum tau_k)
+
+        Made robust against extreme states (mu underflow -> 0) by flooring mu
+        and catching IG draw errors (so the iteration can be restarted).
         """
         lam2 = max(float(self.lambda2), 1e-12)
-        eps = 1e-16
-        sig2 = self.sigma2_eff
+        sig2 = float(self.sigma2_eff)
+        eps_s2 = 1e-32
+        mu_floor = 1e-12
 
         def upd_tau(sk: float) -> float:
-            s2 = sk * sk
-            if s2 < eps:
+            s2 = float(sk * sk)
+            if (not np.isfinite(s2)) or s2 < eps_s2:
                 return 1.0
-            mu = math.sqrt(lam2 * sig2 / s2)
-            return rand_invgauss(mu, lam2, self.rng)
+            mu = math.sqrt((lam2 * sig2) / s2)
+            if (not np.isfinite(mu)) or (mu <= 0.0):
+                mu = mu_floor
+            else:
+                mu = max(mu, mu_floor)
+            try:
+                return float(rand_invgauss(mu, lam2, self.rng))
+            except Exception:
+                # let the outer restart logic handle the bad iteration
+                raise
 
         self.tau_alpha = upd_tau(self.s_alpha)
         self.tau_beta = upd_tau(self.s_beta)
@@ -576,7 +583,7 @@ class DGEVLaplaceNCP:
 
         if self.K_gamma > 0 and self.rng.random() < 0.5:
             self.s_gamma *= -1.0
-            self.z[:, self.idx_tilde_g_start : self.idx_tilde_g_end + 1] *= -1.0
+            self.z[:, self.idx_tilde_g_start: self.idx_tilde_g_end + 1] *= -1.0
 
     # ----------------------------- observation parameter updates ----------------------------- #
     def _log_prior_logsigma(self, logsigma: float) -> float:
@@ -596,13 +603,16 @@ class DGEVLaplaceNCP:
         sigma_prop = float(math.exp(prop))
 
         mu = self.mu_vec()
-        ll_old = gev_loglike_sum(self.y, mu, sigma_cur, self.xi)
-        ll_new = gev_loglike_sum(self.y, mu, sigma_prop, self.xi)
-        if ll_new == -np.inf:
+        ll_old = float(gev_loglike_sum(self.y, mu, sigma_cur, self.xi))
+        if not np.isfinite(ll_old):
             return
 
-        lp_old = self._log_prior_logsigma(cur)
-        lp_new = self._log_prior_logsigma(prop)
+        ll_new = float(gev_loglike_sum(self.y, mu, sigma_prop, self.xi))
+        if not np.isfinite(ll_new):
+            return
+
+        lp_old = float(self._log_prior_logsigma(cur))
+        lp_new = float(self._log_prior_logsigma(prop))
 
         logacc = (ll_new + lp_new) - (ll_old + lp_old)
         if math.log(self.rng.random()) < min(0.0, logacc):
@@ -618,18 +628,66 @@ class DGEVLaplaceNCP:
             return
 
         mu = self.mu_vec()
-        ll_old = gev_loglike_sum(self.y, mu, self.sigma, cur)
-        ll_new = gev_loglike_sum(self.y, mu, self.sigma, prop)
-        if ll_new == -np.inf:
+        ll_old = float(gev_loglike_sum(self.y, mu, self.sigma, cur))
+        if not np.isfinite(ll_old):
+            return
+
+        ll_new = float(gev_loglike_sum(self.y, mu, self.sigma, prop))
+        if not np.isfinite(ll_new):
             return
 
         logacc = ll_new - ll_old  # uniform prior on xi
         if math.log(self.rng.random()) < min(0.0, logacc):
             self.xi = prop
 
+    # ----------------------------- restart snapshot / restore ----------------------------- #
+    def _pack_state(self) -> dict:
+        """Snapshot everything needed to roll back ONE iteration."""
+        return {
+            "alpha0": float(self.alpha0),
+            "beta0": float(self.beta0),
+            "gamma0": self.gamma0.copy(),
+            "logsigma": float(self.logsigma),
+            "sigma": float(self.sigma),
+            "xi": float(self.xi),
+            "s_alpha": float(self.s_alpha),
+            "s_beta": float(self.s_beta),
+            "s_gamma": float(self.s_gamma),
+            "tau_alpha": float(self.tau_alpha),
+            "tau_beta": float(self.tau_beta),
+            "tau_gamma": float(self.tau_gamma),
+            "lambda2": float(self.lambda2),
+            "z": self.z.copy(),
+            "x": self.x.copy(),
+            "last_loglike": float(self.last_loglike) if np.isfinite(self.last_loglike) else float("nan"),
+        }
+
+    def _restore_state(self, st: dict) -> None:
+        """Restore a previously packed state."""
+        self.alpha0 = float(st["alpha0"])
+        self.beta0 = float(st["beta0"])
+        self.gamma0 = np.asarray(st["gamma0"], float).copy()
+
+        self.logsigma = float(st["logsigma"])
+        self.sigma = float(st["sigma"])
+        self.xi = float(st["xi"])
+
+        self.s_alpha = float(st["s_alpha"])
+        self.s_beta = float(st["s_beta"])
+        self.s_gamma = float(st["s_gamma"])
+
+        self.tau_alpha = float(st["tau_alpha"])
+        self.tau_beta = float(st["tau_beta"])
+        self.tau_gamma = float(st["tau_gamma"])
+        self.lambda2 = float(st["lambda2"])
+
+        self.z = np.asarray(st["z"], float).copy()
+        self.x = np.asarray(st["x"], float).copy()
+        self.last_loglike = float(st.get("last_loglike", float("nan")))
+
     # ----------------------------- progress ----------------------------- #
-    def _progress_line(self, it: int) -> str:
-        return (
+    def _progress_line(self, it: int, *, restarts: int = 0) -> str:
+        s = (
             f"[it {it+1}/{self.cfg.n_iter}] "
             f"σ={self.sigma:.3f} | ξ={self.xi:.3f} | "
             f"Qα={self.s_alpha**2:.3g} Qβ={self.s_beta**2:.3g} Qγ={self.s_gamma**2:.3g} | "
@@ -637,6 +695,9 @@ class DGEVLaplaceNCP:
             f"τ=[{self.tau_alpha:.3g},{self.tau_beta:.3g},{self.tau_gamma:.3g}] λ²={self.lambda2:.3g} | "
             f"logL={self.last_loglike:.2f}"
         )
+        if restarts > 0:
+            s += f" | restart={restarts}"
+        return s
 
     # ----------------------------- MCMC ----------------------------- #
     def run(self) -> Dict[str, np.ndarray]:
@@ -665,39 +726,68 @@ class DGEVLaplaceNCP:
             "lambda2": np.zeros(n_kept, float),
             "loglike": np.zeros(n_kept, float),
             "x": np.zeros((n_kept, self.T, self.dim), float),
+            "restarts": np.zeros(n_kept, int),
         }
 
         print_every = cfg.progress_every if cfg.progress_every > 0 else max(1, cfg.n_iter // 50)
+        max_r = int(max(0, cfg.max_restarts))
 
         for it in range(cfg.n_iter):
-            # (A) Build Laplace pseudo-obs ONCE (reused)
-            z_mu, R_t = self.laplace_pseudo_mu()
+            state0 = self._pack_state()
+            ok = False
+            restarts = 0
+            mu_now = None
 
-            # (B) FFBS in NCP given current params
-            self.ffbs_ncp_laplace(z_mu=z_mu, R_t=R_t)
-            self._refresh_cp_from_ncp()
+            for r in range(max_r + 1):
+                if r > 0:
+                    self._restore_state(state0)
+                    restarts = r
 
-            # (C) Joint regression update for (alpha0,beta0,gamma0,s_*)
-            self.update_theta_fs(z_mu=z_mu, R_t=R_t)
-            self._refresh_cp_from_ncp()
+                try:
+                    # (A) Build Laplace pseudo-obs ONCE (reused)
+                    z_mu, R_t = self.laplace_pseudo_mu()
 
-            # (D) Random sign switches + refresh
-            self.random_sign_switches()
-            self._refresh_cp_from_ncp()
+                    # (B) FFBS in NCP given current params
+                    self.ffbs_ncp_laplace(z_mu=z_mu, R_t=R_t)
+                    self._refresh_cp_from_ncp()
 
-            # (E) Lasso scale updates (tau, lambda2)
-            self.update_lasso_scales()
+                    # (C) Joint regression update for (alpha0,beta0,gamma0,s_*)
+                    self.update_theta_fs(z_mu=z_mu, R_t=R_t)
+                    self._refresh_cp_from_ncp()
 
-            # (F) Exact GEV MH updates
-            self.update_logsigma()
-            self.update_xi()
+                    # (D) Random sign switches + refresh
+                    self.random_sign_switches()
+                    self._refresh_cp_from_ncp()
 
-            # monitoring loglike
-            mu_now = self.mu_vec()
-            self.last_loglike = gev_loglike_sum(self.y, mu_now, self.sigma, self.xi)
+                    # (E) Lasso scale updates (tau, lambda2)
+                    self.update_lasso_scales()
+
+                    # (F) Exact GEV MH updates
+                    self.update_logsigma()
+                    self.update_xi()
+
+                    mu_now = self.mu_vec()
+                    ll = float(gev_loglike_sum(self.y, mu_now, self.sigma, self.xi))
+                    self.last_loglike = ll
+
+                    if np.isfinite(ll):
+                        ok = True
+                        break
+                except Exception:
+                    # Any numeric issue: treat as invalid and restart the iteration
+                    self.last_loglike = float("-inf")
+                    ok = False
+                    continue
+
+            # if still invalid: revert and take a no-move
+            if not ok:
+                self._restore_state(state0)
+                mu_now = self.mu_vec()
+                self.last_loglike = float(gev_loglike_sum(self.y, mu_now, self.sigma, self.xi))
+                restarts = max_r
 
             if cfg.progress and (((it + 1) % print_every == 0) or (it == cfg.n_iter - 1)):
-                print(self._progress_line(it))
+                print(self._progress_line(it, restarts=restarts))
 
             if it in save_set:
                 self.keep["sigma"][keep_idx] = self.sigma
@@ -723,6 +813,7 @@ class DGEVLaplaceNCP:
                 self.keep["lambda2"][keep_idx] = self.lambda2
 
                 self.keep["x"][keep_idx] = self.x[1:, :]
+                self.keep["restarts"][keep_idx] = int(restarts)
                 keep_idx += 1
 
         return self.keep
@@ -765,7 +856,7 @@ class DGEVLaplaceNCP:
             "fixes": {
                 "correlated_prior_alpha_c_beta": True,
                 "seasonal_noise_first_component_only": True,
-                "spd_solve_signature_wrapper": True,
+                "restart_on_invalid_loglike": True,
             },
         }
         if extra_meta:
@@ -782,40 +873,6 @@ class DGEVLaplaceNCP:
 # =============================================================================
 # CLI / Example run
 # =============================================================================
-def _parse_bool(x) -> bool:
-    if isinstance(x, bool):
-        return x
-    if x is None:
-        return False
-    s = str(x).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
-
-
-def _parse_date(s: str | None) -> datetime:
-    if not s:
-        return datetime.today()
-    parts = [int(p) for p in s.split("-")]
-    if len(parts) == 1:
-        return datetime(parts[0], 1, 1)
-    if len(parts) == 2:
-        return datetime(parts[0], parts[1], 1)
-    if len(parts) == 3:
-        return datetime(parts[0], parts[1], parts[2])
-    raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
-
-
-def _parse_csv_floats(s: Optional[str], expected_len: Optional[int] = None) -> Optional[List[float]]:
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if ss == "":
-        return None
-    vals = [float(z) for z in ss.split(",")]
-    if expected_len is not None and len(vals) != expected_len:
-        raise ValueError(f"Expected {expected_len} comma-separated floats, got {len(vals)}")
-    return vals
-
-
 def main() -> None:
     import sys
     import matplotlib.pyplot as plt
@@ -830,7 +887,8 @@ def main() -> None:
             "Non-centred structural DGEV with baseline seasonal fixed effects (sum-to-zero), "
             "dynamic seasonal deviations with innovations only in the first dummy, "
             "Bayesian lasso on signed process SDs, "
-            "FFBS on Laplace pseudo-observations + JOINT FS regression update."
+            "FFBS on Laplace pseudo-observations + JOINT FS regression update, "
+            "and restart-on-invalid-loglik safety."
         )
     )
 
@@ -867,10 +925,11 @@ def main() -> None:
     # Sampler
     p.add_argument("--n-iter", type=int, default=8000)
     p.add_argument("--burn", type=int, default=4000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
+    p.add_argument("--max-restarts", type=int, default=50)
     p.add_argument("--out-dir", type=str, default="results/simulations/DGEV_NCP_LASSO")
     p.add_argument("--plot", default=True)
     p.add_argument("--print-summary", default=True)
@@ -889,11 +948,11 @@ def main() -> None:
     p.add_argument("--sigma2-eff", type=float, default=1.0)
 
     args = p.parse_args()
-    start_date = _parse_date(args.start_date)
+    start_date = parse_date(args.start_date)
 
     K = int(args.period) - 1
-    m0_season = _parse_csv_floats(args.m0_season, expected_len=K) or ([2.0] * K)
-    v0_season = _parse_csv_floats(args.v0_season, expected_len=K) or ([0.01] * K)
+    m0_season = parse_csv_floats(args.m0_season, expected_len=K) or ([2.0] * K)
+    v0_season = parse_csv_floats(args.v0_season, expected_len=K) or ([0.01] * K)
 
     ts = Extremal_Time_Series(
         parameters=(float(args.sigma), float(args.xi)),
@@ -920,10 +979,10 @@ def main() -> None:
     y = np.asarray(y, float)
 
     truths = ts.get_truth_paths(as_numpy=False)
-    mu_T = np.asarray(truths["mu"][1 : 1 + int(args.T)], float)
+    mu_T = np.asarray(truths["mu"][1: 1 + int(args.T)], float)
     dates_T = truths.get("index", np.arange(int(args.T)))
 
-    pri_gamma_vec = _parse_csv_floats(args.prior_m0_gamma, expected_len=K) or ([0.0] * K)
+    pri_gamma_vec = parse_csv_floats(args.prior_m0_gamma, expected_len=K) or ([0.0] * K)
     priors = Priors(
         a_sigma=float(args.prior_a_sigma),
         b_sigma=float(args.prior_b_sigma),
@@ -944,11 +1003,12 @@ def main() -> None:
         burn=int(args.burn),
         thin=int(args.thin),
         random_seed=int(args.seed),
-        progress=_parse_bool(args.progress),
+        progress=parse_bool(args.progress),
         progress_every=int(args.progress_every),
+        max_restarts=int(args.max_restarts),
     )
 
-    gamma0_init = _parse_csv_floats(args.gamma0_init, expected_len=K)
+    gamma0_init = parse_csv_floats(args.gamma0_init, expected_len=K)
 
     sampler = DGEVLaplaceNCP(
         y=y,
@@ -971,7 +1031,7 @@ def main() -> None:
     sampler.set_truth(sigma=float(args.sigma), xi=float(args.xi), Q=(args.q_level, args.q_trend, args.q_season))
     sampler.set_truth_paths(mu=mu_T)
 
-    if _parse_bool(args.print_summary):
+    if parse_bool(args.print_summary):
         print(
             f"\nSimulated {int(args.T)} observations (σ={float(args.sigma):.4g}, ξ={float(args.xi):.4g}) "
             "with modes dynamic/dynamic/dynamic.\n"
@@ -982,7 +1042,8 @@ def main() -> None:
         print(f"  λ²  ~ Gamma(a_λ={priors.a_lambda:.3g}, b_λ={priors.b_lambda:.3g})\n")
         print("Fixes enabled:")
         print("  - correlated prior on (alpha_c, beta) under time-centring")
-        print("  - seasonal innovation only in first seasonal dummy (g1)\n")
+        print("  - seasonal innovation only in first seasonal dummy (g1)")
+        print("  - restart-on-invalid log-likelihood / numeric exceptions\n")
 
     t0 = time.time()
     post = sampler.run()
@@ -1003,8 +1064,7 @@ def main() -> None:
         },
     )
 
-    # ---- summary (like your DLM script) ----
-    if _parse_bool(args.print_summary):
+    if parse_bool(args.print_summary):
         print("\n--- Posterior means ---")
         print(f"σ  = {float(np.mean(post['sigma'])):.4f}")
         print(f"ξ  = {float(np.mean(post['xi'])):.4f}")
@@ -1019,14 +1079,16 @@ def main() -> None:
         print(f"mean τ_γ = {float(np.mean(post['tau_gamma'])):.4g}")
         if "loglike" in post:
             print(f"mean logL = {float(np.mean(post['loglike'])):.2f}")
+        if "restarts" in post:
+            print(f"mean restarts/kept iter = {float(np.mean(post['restarts'])):.3g}")
 
-    if _parse_bool(args.plot):
+    if parse_bool(args.plot):
         mu_hat = post["mu"].mean(axis=0)
         plt.figure(figsize=(10, 4))
         plt.plot(dates_T, y, label="y_t", lw=1)
         plt.plot(dates_T, mu_T, "--", label="μ_t (truth)")
         plt.plot(dates_T, mu_hat, "-.", label="μ̂_t (post mean)")
-        plt.title("DGEV (Laplace NCP, Bayesian lasso on process SDs; seasonal innov only in g1)")
+        plt.title("DGEV (Laplace NCP, Bayesian lasso; restart-on-invalid enabled)")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()

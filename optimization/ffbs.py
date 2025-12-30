@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import numpy as np
 try:
-    from .utils import spd_solve, symmetrize  # type: ignore
+    from .utils_2 import spd_solve, symmetrize  # type: ignore
 except ImportError:
-    from utils import spd_solve, symmetrize  # type: ignore
+    from utils_2 import spd_solve, symmetrize  # type: ignore
 
 
 def ffbs_gaussian_1d(
