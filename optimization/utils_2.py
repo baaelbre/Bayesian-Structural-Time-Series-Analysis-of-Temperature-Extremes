@@ -60,7 +60,7 @@ def spd_solve(A: np.ndarray, B: np.ndarray, jitter: float = 1e-12, max_tries: in
 
 
 # =============================================================================
-# RNG helpers
+# RNG helpers (SAFE inverse-Gaussian)
 # =============================================================================
 
 # Hard safety bounds to prevent under/overflow / invalid SciPy params.
@@ -94,7 +94,6 @@ def _rand_invgauss_msh(mu: float, lam: float, rng: np.random.Generator) -> float
     mu2 = mu * mu
     term = mu2 * y
 
-    # x = mu + (mu^2 y)/(2 lam) - (mu/(2 lam)) * sqrt(4 mu lam y + (mu^2 y) y)
     rad = 4.0 * mu * lam * y + term * y
     if (not np.isfinite(rad)) or (rad <= 0.0):
         raise FloatingPointError("IG MSH radicand invalid")
@@ -118,26 +117,20 @@ def rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
       - clamps invalid / extreme parameters into a safe positive range
       - catches SciPy/MSH numeric failures
       - guarantees a finite positive return
-
-    This makes Bayesian-lasso scale updates uncrashable when mu underflows to 0.
     """
-    # sanitize inputs (handle underflow to 0, negatives, nan/inf)
     mu0 = float(mu)
     lam0 = float(lam)
 
-    # If mu/lam invalid, fall back to a tiny but positive mean
     mu_safe = _clip_pos_finite(mu0, _IG_MU_MIN, _IG_MU_MAX, fallback=_IG_MU_MIN)
     lam_safe = _clip_pos_finite(lam0, _IG_LAM_MIN, _IG_LAM_MAX, fallback=_IG_LAM_MIN)
 
-    # If the caller gave mu<=0, we'd like a "neutral" fallback close to the intended mean.
     fallback_x = max(mu_safe, _IG_X_MIN)
 
     try:
         if _HAVE_SCIPY_STATS:
-            # SciPy parameterization: if Y ~ IG(mu/lam, 1), then X = lam * Y ~ IG(mu, lam).
+            # SciPy: if Y ~ IG(mu/lam, 1), then X = lam * Y ~ IG(mu, lam).
             shape = mu_safe / lam_safe
             shape = _clip_pos_finite(shape, _IG_MU_MIN, _IG_MU_MAX, fallback=_IG_MU_MIN)
-
             y = invgauss.rvs(mu=shape, random_state=rng)  # type: ignore
             x = float(lam_safe * float(y))
         else:
@@ -145,45 +138,85 @@ def rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
     except Exception:
         return float(_clip_pos_finite(fallback_x, _IG_X_MIN, _IG_X_MAX, fallback=_IG_X_MIN))
 
-    # final safety: guarantee finite positive
     return float(_clip_pos_finite(x, _IG_X_MIN, _IG_X_MAX, fallback=fallback_x))
 
+
 # =============================================================================
-# GEV log-likelihood helpers (wrt location mu)
+# GEV log-likelihood helpers (overflow-safe)
 # =============================================================================
+_LOG_EXP_MAX = 700.0  # ~ log(max float)
+
+
+def _safe_pow(u: float, p: float) -> float:
+    """
+    Return u**p using exp(p*log(u)) with overflow protection.
+    If it would overflow -> +inf; if it would underflow -> 0.
+    Requires u>0.
+    """
+    lu = math.log(u)
+    t = p * lu
+    if t > _LOG_EXP_MAX:
+        return math.inf
+    if t < -_LOG_EXP_MAX:
+        return 0.0
+    return math.exp(t)
+
+
 def gev_logpdf(y: float, mu: float, sigma: float, xi: float) -> float:
     """log f(y | mu, sigma>0, xi) under GEV(mu, sigma, xi)."""
-    if sigma <= 0.0 or not np.isfinite(mu) or not np.isfinite(y):
+    if sigma <= 0.0 or (not np.isfinite(mu)) or (not np.isfinite(y)) or (not np.isfinite(xi)):
         return -np.inf
 
     z = (y - mu) / sigma
+    if abs(xi) < 1e-8:  # Gumbel
+        # log f = -log σ - z - exp(-z)
+        ez = math.exp(-z) if (-z) < _LOG_EXP_MAX else math.inf
+        if not np.isfinite(ez):
+            return -np.inf
+        return -math.log(sigma) - z - ez
+
     u = 1.0 + xi * z
-    if u <= 0.0:
+    if u <= 0.0 or (not np.isfinite(u)):
         return -np.inf
 
-    if abs(xi) < 1e-8:  # Gumbel limit
-        return -math.log(sigma) - z - math.exp(-z)
+    # term = u^{-1/xi} = exp((-1/xi) log u), overflow -> -inf logpdf
+    t = (-1.0 / xi) * math.log(u)
+    if t > _LOG_EXP_MAX:
+        return -np.inf
+    term = math.exp(t)
 
-    return -math.log(sigma) - (1.0 + 1.0 / xi) * math.log(u) - u ** (-1.0 / xi)
+    return -math.log(sigma) - (1.0 + 1.0 / xi) * math.log(u) - term
 
 
 def gev_loglike_sum(y: np.ndarray, mu_vec: np.ndarray, sigma: float, xi: float) -> float:
-    """Sum_t log f(y_t | mu_t, sigma, xi). Vectorised."""
+    """Sum_t log f(y_t | mu_t, sigma, xi). Vectorised + overflow-safe."""
     y = np.asarray(y, float)
     mu_vec = np.asarray(mu_vec, float)
 
     if sigma <= 0.0 or y.shape != mu_vec.shape or np.any(~np.isfinite(mu_vec)) or np.any(~np.isfinite(y)):
         return -np.inf
-
-    z = (y - mu_vec) / sigma
-    u = 1.0 + xi * z
-    if np.any(u <= 0.0):
+    if not np.isfinite(xi):
         return -np.inf
 
-    if abs(xi) < 1e-8:
-        return float(np.sum(-math.log(sigma) - z - np.exp(-z)))
+    z = (y - mu_vec) / sigma
 
-    return float(np.sum(-math.log(sigma) - (1.0 + 1.0 / xi) * np.log(u) - u ** (-1.0 / xi)))
+    if abs(xi) < 1e-8:
+        # log f = -log σ - z - exp(-z)
+        ez = np.exp(np.clip(-z, -_LOG_EXP_MAX, _LOG_EXP_MAX))
+        # if -z exceeded +LOG_EXP_MAX, ez is huge but finite; loglike is then very negative (ok)
+        return float(np.sum(-math.log(sigma) - z - ez))
+
+    u = 1.0 + xi * z
+    if np.any(u <= 0.0) or np.any(~np.isfinite(u)):
+        return -np.inf
+
+    logu = np.log(u)
+    t = (-1.0 / xi) * logu
+    if np.any(t > _LOG_EXP_MAX):
+        return -np.inf
+    term = np.exp(np.clip(t, -_LOG_EXP_MAX, _LOG_EXP_MAX))
+
+    return float(np.sum(-math.log(sigma) - (1.0 + 1.0 / xi) * logu - term))
 
 
 def gev_score_hess_mu(y: float, mu: float, sigma: float, xi: float) -> tuple[float, float]:
@@ -191,41 +224,57 @@ def gev_score_hess_mu(y: float, mu: float, sigma: float, xi: float) -> tuple[flo
     First and second derivative of log f(y | mu, sigma, xi) w.r.t. mu.
     Returns (g, h) where g=dℓ/dmu, h=d²ℓ/dmu².
 
-    Notes:
-      - returns a weak negative curvature when outside support or numerically unstable,
-        so Laplace weights remain positive.
+    Always returns a finite g and a strictly negative h (fallback) when unstable,
+    so Laplace weights remain positive and finite.
     """
-    if sigma <= 0.0 or not np.isfinite(mu) or not np.isfinite(y):
+    if sigma <= 0.0 or (not np.isfinite(mu)) or (not np.isfinite(y)) or (not np.isfinite(xi)):
         return 0.0, -1e-8
 
     z = (y - mu) / sigma
 
     if abs(xi) < 1e-8:  # Gumbel
-        e = math.exp(-z)
-        g = (1.0 - e) / sigma
-        h = -e / (sigma * sigma)
-        if not np.isfinite(g) or not np.isfinite(h) or h >= 0.0:
+        # g = (1 - exp(-z))/σ ; h = -exp(-z)/σ²
+        ez = math.exp(-z) if (-z) < _LOG_EXP_MAX else math.inf
+        if not np.isfinite(ez):
+            return 0.0, -1e-8
+        g = (1.0 - ez) / sigma
+        h = -ez / (sigma * sigma)
+        if (not np.isfinite(g)) or (not np.isfinite(h)) or (h >= 0.0):
             return 0.0, -1e-8
         return float(g), float(h)
 
     u = 1.0 + xi * z
-    if u <= 0.0 or not np.isfinite(u):
+    if u <= 0.0 or (not np.isfinite(u)):
         return 0.0, -1e-8
 
-    # ℓ = -log σ - (1 + 1/ξ) log u - u^{-1/ξ}
-    # g = (1/σ)[ (ξ + 1)/u - u^{-1/ξ - 1} ]
-    g = ((xi + 1.0) / u - u ** (-1.0 / xi - 1.0)) / sigma
+    logu = math.log(u)
+
+    # a = (-1/xi - 1) so u^a = exp(a logu)
+    a = (-1.0 / xi) - 1.0
+    t1 = a * logu
+    if t1 > _LOG_EXP_MAX:
+        # u^a overflow -> g,h blow -> fallback
+        return 0.0, -1e-8
+    u_a = math.exp(t1)
+
+    g = ((xi + 1.0) / u - u_a) / sigma
 
     # h = (1+ξ)/(σ²) [ ξ/u² - u^{-(1+2ξ)/ξ} ]
-    h = (1.0 + xi) * (xi / (u * u) - u ** (-(1.0 + 2.0 * xi) / xi)) / (sigma * sigma)
+    b = (-(1.0 + 2.0 * xi) / xi)
+    t2 = b * logu
+    if t2 > _LOG_EXP_MAX:
+        return 0.0, -1e-8
+    u_b = math.exp(t2)
 
-    if not np.isfinite(g) or not np.isfinite(h) or h >= 0.0:
+    h = (1.0 + xi) * (xi / (u * u) - u_b) / (sigma * sigma)
+
+    if (not np.isfinite(g)) or (not np.isfinite(h)) or (h >= 0.0):
         return 0.0, -1e-8
     return float(g), float(h)
 
 
 # =============================================================================
-# CLI parsing helpers (moved out of optimization modules)
+# CLI parsing helpers
 # =============================================================================
 def parse_bool(x) -> bool:
     if isinstance(x, bool):
