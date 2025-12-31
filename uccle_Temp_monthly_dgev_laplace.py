@@ -361,8 +361,8 @@ def main() -> None:
     p.add_argument("--prior-P0-gamma", type=float, default=5.0)
 
     # --- priors (lasso hyperprior on lambda^2) ---
-    p.add_argument("--prior-a-lambda", type=float, default=2)
-    p.add_argument("--prior-b-lambda", type=float, default=0.05)
+    p.add_argument("--prior-a-lambda", type=float, default=0.001)
+    p.add_argument("--prior-b-lambda", type=float, default=0.001)
 
     # --- sampler config ---
     p.add_argument("--n-iter", type=int, default=20000)

@@ -82,7 +82,7 @@ def list_runs(root: str = "results/simulations/DGEV") -> list:
     run_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(d, "posterior.npz")))
     return run_dirs
 
-def find_latest_run(root: str = "results/simulations/DGEV") -> str | None:
+def find_latest_run(root: str = "results/simulations/DGEV") -> str or None:
     """
     Find the most recent run *directory that contains 'posterior.npz'*.
 
