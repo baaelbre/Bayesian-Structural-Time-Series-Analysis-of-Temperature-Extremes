@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import math
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Literal
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -118,64 +118,270 @@ def _center_label(center: str) -> str:
 
 
 # =============================================================================
+# Credible interval helpers: ETI vs HPD
+# =============================================================================
+Interval = Literal["eti", "hpd"]
+
+
+def _normalize_interval(interval: str) -> Interval:
+    s = str(interval).strip().lower()
+    if s in ("eti", "equal", "equal-tailed", "equaltail", "equaltails", "quantile", "qt"):
+        return "eti"
+    if s in ("hpd", "hdr", "hd", "highest", "highest-density", "highestdensity"):
+        return "hpd"
+    raise ValueError("interval must be one of {'eti','hpd'} (aliases: equal-tailed/quantile, hdr).")
+
+
+def _hpd_1d(x: np.ndarray, mass: float) -> Tuple[float, float]:
+    """
+    Unimodal 1D HPD/shortest interval approximation from samples.
+
+    Returns a single shortest interval containing `mass` probability
+    (i.e., about mass*S samples), by scanning sorted samples.
+
+    Notes:
+      - If the true HPD is disconnected (multimodal), this returns the *shortest
+        contiguous* interval. For plotting ribbons, that's typically what you want.
+      - Requires >= 2 finite points.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    if n == 0:
+        return float("nan"), float("nan")
+    if n == 1:
+        return float(x[0]), float(x[0])
+
+    mass = float(mass)
+    mass = min(max(mass, 0.0), 1.0)
+    if mass <= 0.0:
+        # degenerate: return point mass at median
+        m = float(np.median(x))
+        return m, m
+    if mass >= 1.0:
+        return float(np.min(x)), float(np.max(x))
+
+    xs = np.sort(x)
+    m = int(np.floor(mass * n))
+    m = max(1, min(m, n - 1))  # ensure valid window length
+
+    widths = xs[m:] - xs[: n - m]
+    j = int(np.argmin(widths))
+    lo = float(xs[j])
+    hi = float(xs[j + m])
+    return lo, hi
+
+
+def _interval_2d(arr_2d: np.ndarray, mass: float, interval: Interval) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given arr_2d of shape (S,T), return (lo[T], hi[T]) using ETI or HPD.
+    """
+    arr_2d = np.asarray(arr_2d, float)
+    if arr_2d.ndim != 2:
+        raise ValueError("arr_2d must be 2D (S,T).")
+    S, T = arr_2d.shape
+
+    interval = _normalize_interval(interval)
+    mass = float(mass)
+
+    if interval == "eti":
+        lo_q = (1.0 - mass) / 2.0
+        hi_q = 1.0 - lo_q
+        lo = np.quantile(arr_2d, lo_q, axis=0)
+        hi = np.quantile(arr_2d, hi_q, axis=0)
+        return lo, hi
+
+    # HPD: compute a shortest interval per time index
+    lo = np.empty(T, dtype=float)
+    hi = np.empty(T, dtype=float)
+    for t in range(T):
+        lo[t], hi[t] = _hpd_1d(arr_2d[:, t], mass=mass)
+    return lo, hi
+
+
+def _interval_1d(x: np.ndarray, mass: float, interval: Interval) -> Tuple[float, float]:
+    """
+    1D credible interval from samples.
+    """
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return float("nan"), float("nan")
+    interval = _normalize_interval(interval)
+    mass = float(mass)
+    if interval == "eti":
+        lo_q = (1.0 - mass) / 2.0
+        hi_q = 1.0 - lo_q
+        return float(np.quantile(x, lo_q)), float(np.quantile(x, hi_q))
+    return _hpd_1d(x, mass=mass)
+
+
+# =============================================================================
+# minima detection + sign back-transform
+# =============================================================================
+def _coerce_bool(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, np.integer)):
+        return bool(int(x))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("true", "t", "1", "yes", "y"):
+            return True
+        if s in ("false", "f", "0", "no", "n"):
+            return False
+    return None
+
+
+def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+
+    for k in ("minima", "is_minima", "minima_series"):
+        b = _coerce_bool(meta.get(k, None))
+        if b is not None:
+            return b
+
+    ms = meta.get("model_sign", None)
+    try:
+        if ms is not None and float(ms) < 0:
+            return True
+    except Exception:
+        pass
+
+    dt = meta.get("data_transform", None)
+    if isinstance(dt, str):
+        s = dt.strip().lower()
+        if any(tok in s for tok in ("negate", "minus", "signflip", "flip_sign", "neg")):
+            return True
+
+    ser = meta.get("series", None)
+    if isinstance(ser, str):
+        ss = ser.strip()
+        if ss in {"TNn", "TXn"}:
+            return True
+        if len(ss) >= 2 and ss.endswith("n") and ss[:-1].isalpha():
+            return True
+
+    return False
+
+
+def _apply_sign_backtransform(draws: Dict[str, Any], *, minima: bool) -> Dict[str, Any]:
+    if not minima:
+        return draws
+
+    out: Dict[str, Any] = dict(draws)
+
+    loc_keys = {
+        "y",
+        "mu",
+        "x",
+        "alpha0",
+        "beta0",
+        "gamma0",
+        "m0_alpha",
+        "m0_beta",
+        "m0_gamma",
+        "true_mu_t",
+        "true_alpha_t",
+        "true_beta_t",
+        "true_gamma_t",
+    }
+
+    for k in list(loc_keys):
+        if k in out and out[k] is not None:
+            out[k] = -np.asarray(out[k])
+
+    for k in ("s_alpha", "s_beta", "s_gamma"):
+        if k in out and out[k] is not None:
+            out[k] = -np.asarray(out[k])
+
+    return out
+
+
+# =============================================================================
 # DGEV Plotter (mirrors DLMPlotter, with σ and ξ)
 # =============================================================================
 class DGEVPlotter:
     """
-    Plotter for posterior bundles from the Laplace-based structural GEV model
-    (non-centred states, Bayesian lasso on process SDs).
+    Plotter for posterior bundles from the Laplace-based structural GEV model.
 
-    Differences with DLMPlotter:
-      - GEV scale parameter σ and shape parameter ξ.
-      - Trace/hist/ACF panels explicitly include both σ and ξ.
-      - Quick report shows μ, σ, ξ.
-
-    Everything else mirrors DLMPlotter:
-      - Same overview layout (μ, σ, Q, baselines, RMSE).
-      - Same separate state plots (level, slope, seasonality).
-      - Same clipping / zooming logic for traces and histograms.
+    Features:
+      - ETI (equal-tailed) OR HPD (shortest) credible intervals for ribbons and parameters.
+      - Auto-detects minima=True (negated series) from meta and back-transforms for plotting.
     """
 
-    def __init__(self, draws: Dict[str, np.ndarray], meta: Dict[str, Any], level: float = 0.90):
-        self.draws = draws
-        self.meta = meta
+    def __init__(
+        self,
+        draws: Dict[str, np.ndarray],
+        meta: Dict[str, Any],
+        level: float = 0.90,
+        *,
+        minima: Optional[bool] = None,
+        interval: str = "eti",
+    ):
+        # keep copies: don't mutate callers
+        self.meta: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
+        minima_detected = _detect_minima_from_meta(self.meta)
+        self.minima = bool(minima_detected) if minima is None else bool(minima)
+
+        # interval policy
+        self.interval: Interval = _normalize_interval(interval)
+
+        # backtransform (if needed) for plotting
+        self.draws: Dict[str, Any] = _apply_sign_backtransform(dict(draws), minima=self.minima)
+
+        disp = self.meta.get("display", {})
+        if not isinstance(disp, dict):
+            disp = {}
+        disp.update(
+            {
+                "minima": self.minima,
+                "backtransform_applied": self.minima,
+                "interval": self.interval,
+            }
+        )
+        self.meta["display"] = disp
+
         self.level = float(level)
         if not (0.0 < self.level < 1.0):
             raise ValueError("level must be in (0,1)")
 
-        if "mu" not in draws:
+        if "mu" not in self.draws:
             raise ValueError("draws must contain 'mu' of shape (S, T).")
 
-        self.mu = np.asarray(draws["mu"], float)
+        self.mu = np.asarray(self.draws["mu"], float)
         if self.mu.ndim != 2:
             raise ValueError("'mu' must be a 2D array (S, T).")
 
         self.S, self.T = self.mu.shape
-        self.period = int(meta.get("period", 12))
+        self.period = int(self.meta.get("period", 12))
 
-        # optional data & truths
-        self.y = _maybe(draws, "y")
-        self.true_mu = _maybe(draws, "true_mu_t")
-        self.true_alpha = _maybe(draws, "true_alpha_t")
-        self.true_beta = _maybe(draws, "true_beta_t")
-        self.true_gamma = _maybe(draws, "true_gamma_t")
+        # optional data & truths (already backtransformed if minima=True)
+        self.y = _maybe(self.draws, "y")
+        self.true_mu = _maybe(self.draws, "true_mu_t")
+        self.true_alpha = _maybe(self.draws, "true_alpha_t")
+        self.true_beta = _maybe(self.draws, "true_beta_t")
+        self.true_gamma = _maybe(self.draws, "true_gamma_t")
 
-        # GEV scale σ
+        # GEV scale σ (NOT sign-flipped)
         self.sigma: Optional[np.ndarray] = None
-        if "sigma" in draws and np.asarray(draws["sigma"]).shape[0] == self.S:
-            self.sigma = np.asarray(draws["sigma"], float)
-        elif "sigma2" in draws and np.asarray(draws["sigma2"]).shape[0] == self.S:
-            self.sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0.0, None))
+        if "sigma" in self.draws and np.asarray(self.draws["sigma"]).shape[0] == self.S:
+            self.sigma = np.asarray(self.draws["sigma"], float)
+        elif "sigma2" in self.draws and np.asarray(self.draws["sigma2"]).shape[0] == self.S:
+            self.sigma = np.sqrt(np.clip(np.asarray(self.draws["sigma2"], float), 0.0, None))
 
-        # GEV shape ξ
+        # GEV shape ξ (NOT sign-flipped)
         self.xi: Optional[np.ndarray] = None
-        if "xi" in draws and np.asarray(draws["xi"]).shape[0] == self.S:
-            self.xi = np.asarray(draws["xi"], float)
+        if "xi" in self.draws and np.asarray(self.draws["xi"]).shape[0] == self.S:
+            self.xi = np.asarray(self.draws["xi"], float)
 
         # scalar & vector params
         self.scalar_params: Dict[str, np.ndarray] = {}
         self.vector_params: Dict[str, np.ndarray] = {}
-        for k, v in draws.items():
+        for k, v in self.draws.items():
             if k in {"y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"}:
                 continue
             arr = np.asarray(v)
@@ -184,24 +390,24 @@ class DGEVPlotter:
             elif arr.ndim == 2 and arr.shape[0] == self.S and arr.shape[1] != self.T:
                 self.vector_params[k] = arr.astype(float)
 
-        # baselines
-        self.alpha0 = np.asarray(draws["alpha0"], float) if "alpha0" in draws else _maybe(draws, "m0_alpha")
-        self.beta0 = np.asarray(draws["beta0"], float) if "beta0" in draws else _maybe(draws, "m0_beta")
-        self.gamma0 = np.asarray(draws["gamma0"], float) if "gamma0" in draws else _maybe(draws, "m0_gamma")
+        # baselines (already backtransformed if minima=True)
+        self.alpha0 = np.asarray(self.draws["alpha0"], float) if "alpha0" in self.draws else _maybe(self.draws, "m0_alpha")
+        self.beta0 = np.asarray(self.draws["beta0"], float) if "beta0" in self.draws else _maybe(self.draws, "m0_beta")
+        self.gamma0 = np.asarray(self.draws["gamma0"], float) if "gamma0" in self.draws else _maybe(self.draws, "m0_gamma")
 
-        # signed SDs (for structural components, not GEV)
+        # signed SDs (for structural components, not GEV) — may have been flipped above if minima=True
         self.s_alpha = self.scalar_params.get("s_alpha", None)
         self.s_beta = self.scalar_params.get("s_beta", None)
         self.s_gamma = self.scalar_params.get("s_gamma", None)
 
-        # Process variances Q
+        # Process variances Q (NOT sign-flipped)
         self.Q: Optional[np.ndarray] = None
         self.Q_names: List[str] = []
-        if "Q" in draws:
-            Qmat = np.asarray(draws["Q"], float)
+        if "Q" in self.draws:
+            Qmat = np.asarray(self.draws["Q"], float)
             if Qmat.ndim == 2 and Qmat.shape[0] == self.S:
                 self.Q = Qmat
-                layout = meta.get("layout")
+                layout = self.meta.get("layout")
                 if isinstance(layout, (list, tuple)) and len(layout) == Qmat.shape[1]:
                     self.Q_names = [rf"$Q_{{{nm}}}$" for nm in layout]
                 else:
@@ -217,15 +423,15 @@ class DGEVPlotter:
                 self.Q_names = names
 
         # state layout indexing
-        self.has_x = ("x" in draws) and (np.asarray(draws["x"]).ndim == 3)
+        self.has_x = ("x" in self.draws) and (np.asarray(self.draws["x"]).ndim == 3)
         self.idx_alpha: Optional[int] = None
         self.idx_beta: Optional[int] = None
         self.idx_g0: Optional[int] = None
 
         if self.has_x:
-            x = np.asarray(draws["x"])
+            x = np.asarray(self.draws["x"])
             dim = x.shape[2]
-            layout = meta.get("layout")
+            layout = self.meta.get("layout")
             layout_list = list(layout) if isinstance(layout, (list, tuple)) else None
 
             if layout_list:
@@ -243,7 +449,11 @@ class DGEVPlotter:
                 if self.period > 1 and dim >= i + (self.period - 1):
                     self.idx_g0 = i
 
-        self.band_label_default = rf"{int(round(self.level * 100))}% band"
+        self.band_label_default = rf"{int(round(self.level * 100))}% {self.interval.upper()}"
+
+        if self.minima:
+            print("[info] minima=True detected → back-transforming (negated) location-scale draws for plotting.")
+        print(f"[info] credible interval type: {self.interval.upper()}")
 
     # ------------------------------------------------------------------
     # Core helpers
@@ -253,19 +463,18 @@ class DGEVPlotter:
         arr_2d: np.ndarray,
         *,
         center: str = "median",
+        interval: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Returns (center_line, lo, hi) where lo/hi are quantiles at the chosen level,
-        and center_line is either posterior median or posterior mean.
+        Returns (center_line, lo, hi) for arr_2d of shape (S,T).
+        center_line: posterior mean or median
+        lo/hi: ETI or HPD at mass=self.level
         """
         arr_2d = np.asarray(arr_2d, float)
         c = _normalize_center(center)
+        use_interval = self.interval if interval is None else _normalize_interval(interval)
 
-        lo_q = (1.0 - self.level) / 2.0
-        hi_q = 1.0 - lo_q
-
-        lo = np.quantile(arr_2d, lo_q, axis=0)
-        hi = np.quantile(arr_2d, hi_q, axis=0)
+        lo, hi = _interval_2d(arr_2d, mass=self.level, interval=use_interval)
 
         if c == "mean":
             ctr = np.mean(arr_2d, axis=0)
@@ -287,7 +496,7 @@ class DGEVPlotter:
         return None
 
     # ------------------------------------------------------------------
-    # Trace/Hist/ACF panel (copied from DLMPlotter)
+    # Trace/Hist/ACF panel
     # ------------------------------------------------------------------
     def _trace_hist_acf_panel(
         self,
@@ -313,6 +522,9 @@ class DGEVPlotter:
         max_abs: Optional[float] = None,
         hist_bins: int = 40,
         auto_zoom_if_clipped: bool = True,
+        # NEW:
+        ci_interval: Optional[str] = None,  # "eti" | "hpd" | None (use plotter default)
+        ci_level: Optional[float] = None,   # None -> uses plotter.level
     ) -> None:
         s_raw = np.asarray(series, float).ravel()
         finite_mask = np.isfinite(s_raw)
@@ -407,6 +619,11 @@ class DGEVPlotter:
         ess = _ess(s_diag, max_lag=max_lag)
         gz = _geweke_z(s_diag)
 
+        # NEW: show CI width in title (ETI or HPD), computed on s_diag
+        mass = self.level if ci_level is None else float(ci_level)
+        use_interval = self.interval if ci_interval is None else _normalize_interval(ci_interval)
+        ci_lo, ci_hi = _interval_1d(s_diag, mass=mass, interval=use_interval)
+
         extra = []
         if drop_nonfinite and n_nonfinite > 0:
             extra.append(f"nonfinite={n_nonfinite}")
@@ -431,7 +648,13 @@ class DGEVPlotter:
             hist_range = (float(lo_bound), float(hi_bound))
 
         axs[1].hist(s_hist, bins=int(hist_bins), density=True, range=hist_range)
-        axs[1].set_title(title_hist or rf"hist: {name}{extra_txt}")
+        if title_hist is None:
+            axs[1].set_title(
+                rf"hist: {name}{extra_txt}  "
+                rf"({int(round(mass*100))}% {use_interval.upper()} [{ci_lo:.3g}, {ci_hi:.3g}])"
+            )
+        else:
+            axs[1].set_title(title_hist)
         if hist_xlim is not None:
             axs[1].set_xlim(*hist_xlim)
 
@@ -464,6 +687,7 @@ class DGEVPlotter:
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
+        interval: Optional[str] = None,  # NEW
         title_mu: str = r"Posterior $\mu_t$",
         title_sigma_trace: str = r"trace: $\sigma$",
         title_sigma_hist: Optional[str] = None,
@@ -475,14 +699,6 @@ class DGEVPlotter:
         ylims_mu: Optional[Tuple[float, float]] = None,
         yscale_mu: Optional[str] = None,
     ) -> None:
-        """
-        Overview identical in layout to DLMPlotter, but interpreted for GEV:
-          - μ_t ribbon with band.
-          - σ trace + σ histogram.
-          - log10(Q) histograms.
-          - baselines (alpha0, beta0, gamma0).
-          - running RMSE if true μ is present.
-        """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
 
@@ -490,7 +706,7 @@ class DGEVPlotter:
         axs = axs.ravel()
 
         t = np.arange(self.T)
-        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center, interval=interval)
         axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
         axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.y is not None and len(self.y) == self.T:
@@ -590,15 +806,10 @@ class DGEVPlotter:
         max_abs: Optional[float] = None,
         hist_bins: int = 40,
         auto_zoom_if_clipped: bool = True,
+        # NEW:
+        interval: Optional[str] = None,   # controls CI shown in hist title
+        level: Optional[float] = None,    # controls CI shown in hist title
     ) -> None:
-        """
-        Trace + hist + ACF panels for:
-          - σ
-          - ξ
-          - signed process SDs s_alpha, s_beta, s_gamma
-          - log10 Q-coordinates without signed SDs
-          - other scalar parameters (excluding σ/ξ and tau's)
-        """
         def _panel(series: np.ndarray, nm: str, fname: str) -> None:
             self._trace_hist_acf_panel(
                 series,
@@ -617,17 +828,15 @@ class DGEVPlotter:
                 max_abs=max_abs,
                 hist_bins=hist_bins,
                 auto_zoom_if_clipped=auto_zoom_if_clipped,
+                ci_interval=interval,
+                ci_level=level,
             )
 
-        # σ
         if self.sigma is not None:
             _panel(self.sigma, name_sigma, "trace_hist_acf_sigma.png")
-
-        # ξ
         if self.xi is not None:
             _panel(self.xi, name_xi, "trace_hist_acf_xi.png")
 
-        # signed process SDs
         if self.s_alpha is not None:
             _panel(self.s_alpha, name_s_alpha, "trace_hist_acf_s_alpha.png")
         if self.s_beta is not None:
@@ -635,7 +844,6 @@ class DGEVPlotter:
         if self.s_gamma is not None:
             _panel(self.s_gamma, name_s_gamma, "trace_hist_acf_s_gamma.png")
 
-        # Q's (log10 scale) only for coords without signed SDs
         if self.Q is not None and self.Q.size:
             Q = np.asarray(self.Q, float)
             labels = self.Q_names if self.Q_names else [rf"$Q_{{{j}}}$" for j in range(Q.shape[1])]
@@ -650,7 +858,6 @@ class DGEVPlotter:
                 series = np.log10(np.clip(Q[:, j], 1e-20, None))
                 _panel(series, rf"$\log_{{10}}({nm})$", f"trace_hist_acf_log10Q_{j}.png")
 
-        # All other scalar parameters
         if plot_other_scalars:
             skip = {
                 "sigma", "sigma2", "xi",
@@ -675,6 +882,7 @@ class DGEVPlotter:
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
+        interval: Optional[str] = None,  # NEW
         xlabel_time: str = r"$t$",
         title_level: str = r"Level $\alpha_t$",
         ylabel_level: str = r"$\alpha_t$",
@@ -688,9 +896,6 @@ class DGEVPlotter:
         zero_line_slope: bool = True,
         zero_line_seasonality: bool = True,
     ) -> None:
-        """
-        Separate ribbons for level, slope and seasonality, exactly like in DLMPlotter.
-        """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
 
@@ -713,7 +918,7 @@ class DGEVPlotter:
             ylim: Optional[Tuple[float, float]],
             yscale: Optional[str],
         ) -> None:
-            ctr, lo, hi = self._summarize_ribbon(arr2d, center=center)
+            ctr, lo, hi = self._summarize_ribbon(arr2d, center=center, interval=interval)
 
             fig, ax = plt.subplots(1, 1, figsize=(12, 3.4))
             ax.plot(t, ctr, lw=1.6, color=color, label=c_lab)
@@ -799,27 +1004,22 @@ class DGEVPlotter:
         band_alpha: float = 0.25,
         band_label: Optional[str] = None,
         center: str = "median",
+        interval: Optional[str] = None,  # NEW
         title_mu: str = r"$\mu_t$",
         title_sigma: str = r"$\sigma \mid y$",
         title_xi: str = r"$\xi \mid y$",
         xlabel_time: str = r"$t$",
         ylabel_mu: str = r"$\mu_t$",
     ) -> None:
-        """
-        Compact 1x3 summary:
-          - μ_t ribbon.
-          - σ posterior histogram.
-          - ξ posterior histogram (or process scale if ξ missing).
-        """
         band_label = band_label or self.band_label_default
         c_lab = _center_label(center)
 
-        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center)
+        ctr, lo, hi = self._summarize_ribbon(self.mu, center=center, interval=interval)
         t = np.arange(self.T)
 
         fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
-        # μ
+        # μ ribbon
         axs[0].plot(t, ctr, lw=1.6, color=color, label=c_lab)
         axs[0].fill_between(t, lo, hi, alpha=band_alpha, color=color, label=band_label)
         if self.true_mu is not None and len(self.true_mu) == self.T:
@@ -908,63 +1108,34 @@ if __name__ == "__main__":
         description=(
             "DGEV plotter for Laplace-based structural GEV models (non-centred state bundles).\n"
             "Produces overview, scalar trace/hist/ACF, separate state component plots, and a quick report.\n"
-            "Use --<section>-kw K=V (repeatable) to override kwargs.\n"
-            "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1).\n\n"
+            "Auto-detects minima=True (negated series) from meta and back-transforms for plotting.\n"
+            "Credible bands can be ETI (equal-tailed) or HPD (shortest).\n\n"
             "Ribbon center (use via --overview-kw/--states-kw/--quick-kw):\n"
             "  center='median' (default) or center='mean'\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument(
-        "--target",
-        type=str,
-        default=None,
-        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.",
-    )
-    parser.add_argument(
-        "--root",
-        type=str,
-        default="results/simulations/DGEV_TRUE_MH",
-        help="Search root if --target is omitted.",
-    )
-    parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
+    parser.add_argument("--target", type=str, default=None, help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.")
+    parser.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO", help="Search root if --target is omitted.")
+    parser.add_argument("--level", type=float, default=0.90, help="Credible mass for ribbons.")
+    parser.add_argument("--interval", type=str, default="eti", choices=["eti", "hpd"], help="Credible interval type for ribbons (ETI or HPD).")
     parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     parser.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
+
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--minima", action="store_true", help="Force minima=True (treat stored series as negated; back-transform).")
+    g.add_argument("--maxima", action="store_true", help="Force minima=False (no back-transform).")
 
     parser.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
     parser.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
     parser.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
     parser.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
 
-    parser.add_argument(
-        "--overview-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
-    )
-    parser.add_argument(
-        "--traceacf-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
-    )
-    parser.add_argument(
-        "--states-kw",
-        action="append",
-        default=["slope_scale=120", "center=mean"],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
-    )
-    parser.add_argument(
-        "--quick-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
-    )
+    parser.add_argument("--overview-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--states-kw", action="append", default=["slope_scale=120", "center=median"], metavar="K=V", help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.")
+    parser.add_argument("--quick-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.")
 
     args = parser.parse_args()
 
@@ -984,7 +1155,21 @@ if __name__ == "__main__":
     _ensure_dir(out_dir)
     print(f"[info] saving figures to: {out_dir}")
 
-    plotter = DGEVPlotter(draws=draws, meta=meta, level=float(args.level))
+    minima_override: Optional[bool]
+    if args.minima:
+        minima_override = True
+    elif args.maxima:
+        minima_override = False
+    else:
+        minima_override = None
+
+    plotter = DGEVPlotter(
+        draws=draws,
+        meta=meta,
+        level=float(args.level),
+        minima=minima_override,
+        interval=args.interval,
+    )
 
     overview_kw = _parse_kv_list(args.overview_kw)
     traceacf_kw = _parse_kv_list(args.traceacf_kw)

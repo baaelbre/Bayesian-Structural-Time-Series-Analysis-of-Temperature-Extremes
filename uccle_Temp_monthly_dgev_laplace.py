@@ -370,7 +370,7 @@ def main() -> None:
     p.add_argument("--data-dir", type=str, default="data")
     p.add_argument("--start-year", type=int, default=1892)
     p.add_argument("--end-year", type=int, default=2022)
-    p.add_argument("--series", choices=["TXx", "TXn", "TNx", "TNn"], default="TNx")
+    p.add_argument("--series", choices=["TXx", "TXn", "TNx", "TNn"], default="TXn")
     p.add_argument("--period", type=int, default=12)
 
     # --- files (overrideable) ---
@@ -409,8 +409,8 @@ def main() -> None:
     p.add_argument("--prior-P0-gamma", type=float, default=5.0)
 
     # --- priors (lasso hyperprior on lambda^2) ---
-    p.add_argument("--prior-a-lambda", type=float, default=2.0)
-    p.add_argument("--prior-b-lambda", type=float, default=0.05)
+    p.add_argument("--prior-a-lambda", type=float, default=4)
+    p.add_argument("--prior-b-lambda", type=float, default=0.0005)
 
     # --- sampler config ---
     p.add_argument("--n-iter", type=int, default=20000)

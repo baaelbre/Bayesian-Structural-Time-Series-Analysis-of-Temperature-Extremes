@@ -7,15 +7,19 @@ Uccle DGEV Laplace Plotter (TXx, TXn, TNx, TNn, Precx; Seasonal / Monthly)
 Uccle wrapper around the generic Laplace DGEV plotter:
 
     simulator.dgev_laplace_plotter.DGEVPlotter
-    simulator.dgev_laplace_plotter.load_posterior
 
 Key features
 ------------
-- Same figures as the generic DGEV plotter (overview, trace/hist/ACF, states, quick report).
-- Uccle-specific default roots for Laplace runs.
+- Same figures + CLI interface style as simulator.dgev_laplace_plotter.py:
+    --target / --root / --level / --interval / --show / --out
+    --minima / --maxima
+    --skip-overview / --skip-traceacf / --skip-states / --skip-quick
+    --overview-kw / --traceacf-kw / --states-kw / --quick-kw (repeatable K=V)
+- Uccle-specific default root selection via --series and --agg when --target is omitted.
 - Robust "latest run" discovery even if files are named posterior_*.npz (not necessarily posterior.npz).
-- Works with load_posterior returning a PosteriorBundle object (NOT a tuple).
-- Optional post-hoc burn-in and thinning on the stored draws.
+- Ensures TNn and TXn are treated as minima series (negated convention) by:
+    (i) injecting meta['series']=<series> (if missing), and
+    (ii) defaulting minima=True for series in {TXn, TNn} unless user forces --maxima.
 
 Default Uccle Laplace roots
 ---------------------------
@@ -32,62 +36,74 @@ Default Uccle Laplace roots
 
 Examples
 --------
-# latest Seasonal TXx Laplace run
+# latest Seasonal TXx Laplace run (ETI ribbons)
 python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal --show
 
-# monthly TNn, only quick report
-python -u uccle_dgev_laplace_plotter.py --series TNn --agg Monthly \
-  --skip-overview --skip-states --skip-traces --show
+# monthly TNn (minima series), HPD ribbons:
+python -u uccle_dgev_laplace_plotter.py --series TNn --agg Monthly --interval hpd --show
 
 # explicit run directory or posterior .npz
 python -u uccle_dgev_laplace_plotter.py --target path/to/run_or_posterior.npz
 
-# with post-hoc burn/thin
-python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal --burn 1000 --thin 5
+# override kwargs
+python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal \
+  --states-kw center=mean --states-kw slope_scale=120 \
+  --traceacf-kw max_lag=400
 """
 
 import os
 import re
 import sys
-import math
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
-
-import numpy as np
+from typing import Any, Dict, Optional, Tuple, List
 
 # Make project root importable
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from simulator.dgev_laplace_plotter import DGEVPlotter, load_posterior  # type: ignore
+import numpy as np
+
+from simulator.dgev_laplace_plotter import DGEVPlotter  # type: ignore
+
+# ---------------------------------------------------------------------
+# I/O helpers: posterior loader
+# ---------------------------------------------------------------------
+try:
+    from optimization.posterior_bundle import load_posterior  # type: ignore
+except Exception as e:
+    raise ImportError(
+        "Could not import optimization.posterior_bundle.load_posterior.\n"
+        "Make sure optimization/posterior_bundle.py is on PYTHONPATH."
+    ) from e
 
 
 # ---------------------------------------------------------------------------
-# Utilities
+# Small utils
 # ---------------------------------------------------------------------------
-def ensure_dir(p: Optional[str]) -> None:
+def _ensure_dir(p: Optional[str]) -> None:
     if p:
         os.makedirs(p, exist_ok=True)
+
+
+def _parse_agg(agg: str) -> str:
+    a = str(agg).strip().lower()
+    if a.startswith("s"):
+        return "Seasonal"
+    if a.startswith("m"):
+        return "Monthly"
+    raise ValueError(f"Unknown aggregation {agg!r} (use Seasonal or Monthly).")
 
 
 def uccle_root(series: str, agg: str) -> str:
     """
     Map (series, aggregation) to root containing Laplace runs.
-
     series ∈ {TXx, TXn, TNx, TNn, Precx}
-    agg    ∈ {Seasonal, Monthly} (case-insensitive; "s"/"m" ok)
+    agg    ∈ {Seasonal, Monthly} (case-insensitive; 's'/'m' ok)
     """
     base = "results/uccle"
     s = str(series).strip()
-    a = str(agg).strip().lower()
-
-    if a.startswith("s"):
-        agg_dir = "Seasonal"
-    elif a.startswith("m"):
-        agg_dir = "Monthly"
-    else:
-        raise ValueError(f"Unknown aggregation {agg!r} (use Seasonal or Monthly).")
+    agg_dir = _parse_agg(agg)
 
     mapping = {
         "TXx": os.path.join(base, "TX", "TXx", agg_dir, "Laplace"),
@@ -101,9 +117,9 @@ def uccle_root(series: str, agg: str) -> str:
     return mapping[s]
 
 
-def _extract_ts(path_str: str) -> Optional[float]:
+def _extract_ts_from_path(path_str: str) -> Optional[float]:
     """
-    Extract YYYYMMDD_HHMMSS from path (common in your run directory names),
+    Extract YYYYMMDD_HHMMSS from a path (common in your run directory names),
     return epoch seconds. None if not found/parsable.
     """
     m = re.search(r"(\d{8})_(\d{6})", path_str)
@@ -130,13 +146,12 @@ def find_latest_posterior_npz(root: str) -> Optional[str]:
 
     cands = list(rp.rglob("posterior*.npz"))
     if not cands:
-        # also allow any .npz containing "posterior" (more permissive)
         cands = [p for p in rp.rglob("*.npz") if "posterior" in p.name.lower()]
     if not cands:
         return None
 
     def key(p: Path) -> Tuple[int, float]:
-        ts = _extract_ts(str(p))
+        ts = _extract_ts_from_path(str(p))
         if ts is not None:
             return (1, ts)
         return (0, p.stat().st_mtime)
@@ -145,7 +160,54 @@ def find_latest_posterior_npz(root: str) -> Optional[str]:
     return str(best)
 
 
+# ---------------------------------------------------------------------------
+# CLI kw override parsing (same as generic plotter)
+# ---------------------------------------------------------------------------
+def _parse_value(raw: str):
+    import ast
+
+    s = raw.strip()
+    low = s.lower()
+    if low in ("none", "null"):
+        return None
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return s
+
+
+def _set_nested(d: dict, key: str, value):
+    parts = [p for p in key.split(".") if p]
+    cur = d
+    for p in parts[:-1]:
+        if p not in cur or not isinstance(cur[p], dict):
+            cur[p] = {}
+        cur = cur[p]
+    cur[parts[-1]] = value
+
+
+def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for it in items:
+        if "=" not in it:
+            raise ValueError(f"Expected K=V, got: {it!r}")
+        k, v = it.split("=", 1)
+        k = k.strip()
+        val = _parse_value(v)
+        if "." in k:
+            _set_nested(out, k, val)
+        else:
+            out[k] = val
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Bundle resolution
+# ---------------------------------------------------------------------------
 def resolve_bundle(
+    *,
     target: Optional[str],
     series: str,
     agg: str,
@@ -158,7 +220,7 @@ def resolve_bundle(
         return load_posterior(target)
 
     search_root = root or uccle_root(series, agg)
-    print(f"[info] searching latest posterior under: {search_root!r}")
+    print(f"[info] --target not provided; searching latest posterior under: {search_root!r}")
 
     npz = find_latest_posterior_npz(search_root)
     if npz is None:
@@ -172,102 +234,81 @@ def resolve_bundle(
     return load_posterior(npz)
 
 
-def apply_burn_thin(
-    draws: Dict[str, Any],
-    meta: Dict[str, Any],
-    burn: int = 0,
-    thin: int = 1,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Post-hoc burn-in + thinning for arrays whose first dim matches n_samp
-    inferred from draws['mu'].
-    """
-    if "mu" not in draws:
-        print("[warn] 'mu' not in draws; skipping post-hoc burn/thin.")
-        return draws, meta
-
-    burn = int(burn or 0)
-    thin = int(thin or 1)
-    if burn < 0:
-        raise ValueError(f"--burn must be >= 0, got {burn}")
-    if thin < 1:
-        raise ValueError(f"--thin must be >= 1, got {thin}")
-
-    mu = np.asarray(draws["mu"])
-    if mu.ndim < 2:
-        print("[warn] 'mu' does not look like (n_samp, T); skipping post-hoc burn/thin.")
-        return draws, meta
-
-    n_samp = int(mu.shape[0])
-    if burn >= n_samp:
-        raise ValueError(f"--burn={burn} ≥ number of draws ({n_samp}).")
-
-    idx = slice(burn, None, thin)
-    n_used = math.ceil((n_samp - burn) / thin)
-    print(f"[info] post-hoc burn/thin: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}")
-
-    for k, v in list(draws.items()):
-        if not isinstance(v, np.ndarray):
-            continue
-        arr = np.asarray(v)
-        if arr.ndim >= 1 and arr.shape[0] == n_samp:
-            draws[k] = arr[idx, ...]
-
-    postproc = meta.get("postproc", {})
-    postproc.update(
-        {
-            "extra_burn": int(burn),
-            "thin": int(thin),
-            "n_samples_raw": int(n_samp),
-            "n_samples_used": int(np.asarray(draws["mu"]).shape[0]),
-        }
-    )
-    meta["postproc"] = postproc
-    return draws, meta
-
-
 # ---------------------------------------------------------------------------
-# Main / CLI
+# Main
 # ---------------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Uccle DGEV Laplace Plotter (TXx/TXn/TNx/TNn/Precx; Seasonal/Monthly)",
+        description=(
+            "Uccle wrapper for the Laplace DGEV plotter.\n"
+            "If --target is omitted, we search the default Uccle Laplace root derived from --series and --agg."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Uccle selectors
+    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNn")
+    p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
+
+    # Same “core” args as the generic plotter
     p.add_argument(
         "--target",
         type=str,
         default=None,
-        help=(
-            "Run directory or posterior .npz. If omitted, search under the Uccle Laplace root "
-            "derived from --series and --agg."
-        ),
+        help="Path to a run directory or directly to a posterior .npz. If omitted, searches under --root (or the Uccle default root).",
     )
-    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNx")
-    p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
     p.add_argument(
         "--root",
         type=str,
         default=None,
-        help="Override the search root used when --target is omitted.",
+        help="Search root if --target is omitted. If not provided, uses the Uccle default root for (--series, --agg).",
+    )
+    p.add_argument("--level", type=float, default=0.90, help="Credible mass for ribbons.")
+    p.add_argument("--interval", type=str, default="hpd", choices=["eti", "hpd"], help="Credible interval type for ribbons (ETI or HPD).")
+    p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
+    p.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
+
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--minima", action="store_true", help="Force minima=True (back-transform negated location-scale quantities).")
+    g.add_argument("--maxima", action="store_true", help="Force minima=False (no back-transform).")
+
+    p.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
+    p.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
+    p.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
+    p.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
+
+    # Kw overrides (same pattern as the generic plotter)
+    p.add_argument(
+        "--overview-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--traceacf-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--states-kw",
+        action="append",
+        default=["slope_scale=120", "center=median"],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--quick-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
     )
 
-    p.add_argument("--level", type=float, default=0.90, help="Credible band level for μ_t and states.")
-    p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
-    p.add_argument("--out", type=str, default=None, help="Output directory (default: <run-dir>/figures).")
-
-    # Figure toggles
-    p.add_argument("--skip-overview", action="store_true", default=False)
-    p.add_argument("--skip-states", action="store_true", default=False)
-    p.add_argument("--skip-traces", action="store_true", default=False)
-    p.add_argument("--skip-quick", action="store_true", default=False)
-
-    p.add_argument("--max-lag", type=int, default=200, help="ACF / ESS max lag for trace plots.")
-
-    # Post-hoc chain processing
-    p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
-    p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
+    # Backward-compatible alias (older uccle plotter used --skip-traces)
+    p.add_argument("--skip-traces", action="store_true", default=False, help=argparse.SUPPRESS)
 
     return p
 
@@ -275,53 +316,66 @@ def build_argparser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_argparser().parse_args()
 
-    # Resolve posterior bundle (object)
-    bundle = resolve_bundle(args.target, args.series, args.agg, args.root)
+    # Harmonize alias
+    if getattr(args, "skip_traces", False):
+        args.skip_traceacf = True
 
-    # load_posterior returns PosteriorBundle, not a tuple
+    # Load bundle
+    bundle = resolve_bundle(target=args.target, series=args.series, agg=args.agg, root=args.root)
     draws: Dict[str, Any] = bundle.draws
-    meta: Dict[str, Any] = bundle.meta
+    meta: Dict[str, Any] = bundle.meta if isinstance(bundle.meta, dict) else {}
     npz_path: str = bundle.npz_path
 
-    # Optional post-hoc burn/thin
-    if args.burn > 0 or args.thin > 1:
-        draws, meta = apply_burn_thin(draws, meta, burn=args.burn, thin=args.thin)
+    # Inject Uccle context for minima detection heuristics
+    meta = dict(meta)
+    meta.setdefault("series", args.series)
+    meta.setdefault("agg", args.agg)
 
+    # Choose minima override:
+    # - explicit flags win
+    # - else: enforce minima for TNn/TXn by default (user request)
+    minima_override: Optional[bool]
+    if args.minima:
+        minima_override = True
+    elif args.maxima:
+        minima_override = False
+    else:
+        minima_override = True if args.series in {"TXn", "TNn"} else None
+
+    # Output directory
     run_dir = os.path.dirname(npz_path)
     out_dir = args.out or os.path.join(run_dir, "figures")
-    ensure_dir(out_dir)
+    _ensure_dir(out_dir)
 
     print(f"[info] Uccle DGEV Laplace ({args.series}, {args.agg})")
     print(f"[info] Posterior source: {npz_path}")
     print(f"[info] Saving figures to: {out_dir}")
 
-    pl = DGEVPlotter(draws=draws, meta=meta, level=float(args.level))
+    # Instantiate plotter (interval controls ribbons; per-figure overrides can still be passed via *-kw)
+    plotter = DGEVPlotter(
+        draws=draws,
+        meta=meta,
+        level=float(args.level),
+        minima=minima_override,
+        interval=args.interval,
+    )
 
-    # Overview
+    overview_kw = _parse_kv_list(args.overview_kw)
+    traceacf_kw = _parse_kv_list(args.traceacf_kw)
+    states_kw = _parse_kv_list(args.states_kw)
+    quick_kw = _parse_kv_list(args.quick_kw)
+
     if not args.skip_overview:
-        pl.figure_overview(save_dir=out_dir, show=args.show)
+        plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
 
-    # Trace + hist + ACF (σ, ξ, process scales, other scalars)
-    if not args.skip_traces:
-        pl.figure_trace_acf_core(
-            save_dir=out_dir,
-            show=args.show,
-            max_lag=int(args.max_lag),
-        )
+    if not args.skip_traceacf:
+        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
 
-    # Separate states (level, slope, seasonality)
     if not args.skip_states:
-        # Keep same default slope scaling as in DLM plotter (120 months ~ 10 years)
-        pl.figure_states_separate(
-            save_dir=out_dir,
-            show=args.show,
-            slope_scale=120.0,
-            center="mean",
-        )
+        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
 
-    # Quick report
     if not args.skip_quick:
-        pl.quick_report(save_dir=out_dir, show=args.show)
+        plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
     print("[done] Uccle DGEV Laplace plots written.")
 
