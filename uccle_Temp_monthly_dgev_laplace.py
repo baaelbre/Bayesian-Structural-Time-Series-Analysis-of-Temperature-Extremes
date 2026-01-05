@@ -399,7 +399,7 @@ def main() -> None:
     p.add_argument("--prior-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-P0-alpha", type=float, default=10.0)
     p.add_argument("--prior-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-P0-beta", type=float, default=10.0)
+    p.add_argument("--prior-P0-beta", type=float, default=1e-5)
     p.add_argument(
         "--prior-m0-gamma",
         type=str,
