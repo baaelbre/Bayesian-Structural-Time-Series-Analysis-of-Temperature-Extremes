@@ -1,389 +1,588 @@
-# run_uccle_dlm_prec_monthly.py  — monthly precipitation (period = 12)
-# Gaussian DLM with:
-#   - dummy monthly seasonal component (p=12; seasonal state length p-1, newest-first rotation)
+# run_uccle_dlm_prec_monthly.py
+# ------------------------------------------------------------
+# Uccle monthly precipitation (Precm, period=12) with:
+#   - Gaussian DLM
+#   - dummy monthly seasonal component (p=12; seasonal baseline length p-1; sum-to-zero)
 #   - non-centred parametrisation (NCP) + FFBS
 #   - hierarchical Bayesian lasso prior on signed process SDs
 #
-# Assumes: optimization/dlm.py exports (DLMGibbsConjugate, Priors, SamplerConfig)
-
+# Style/behavior matches run_uccle_dlm_lasso_monthly.py.
+#
+# Examples:
+#   python -u run_uccle_dlm_prec_monthly.py
+#   python -u run_uccle_dlm_prec_monthly.py --n-iter 30000 --burn 15000 --thin 2
+#   python -u run_uccle_dlm_prec_monthly.py --gamma0-init "0,0,0,0,0,0,0,0,0,0,0"
+#
 from __future__ import annotations
 
-from pathlib import Path
+import argparse
+import math
+import os
+import time
+from dataclasses import asdict
 from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")  # always safe for batch runs
 import matplotlib.pyplot as plt
 
-from optimization.less_optimal_versions.dlm import (
-    DLMGibbsConjugate,
-    Priors,
-    SamplerConfig,
-)
+# ---------------------------------------------------------------------
+# Import from project (robust)
+# ---------------------------------------------------------------------
+try:
+    from optimization.dlm_3 import DLMGibbsConjugate, Priors, SamplerConfig  # type: ignore
+except Exception:
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+    from optimization.dlm_3 import DLMGibbsConjugate, Priors, SamplerConfig  # type: ignore
 
-DATA_DIR = Path("data")
 
-
-# ======================================================================
+# =============================================================================
 # Small helpers
-# ======================================================================
+# =============================================================================
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
-def _idx_for_matplotlib(idx: pd.Index):
-    # Matplotlib cannot plot Period objects; convert to timestamps
-    if isinstance(idx, pd.PeriodIndex):
-        return idx.to_timestamp()  # DatetimeIndex
-    return idx
+
+def _parse_bool(x) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return False
+    s = str(x).strip().lower()
+    return s in ("1", "true", "t", "yes", "y", "on")
 
 
-def _series_out_root(series: str) -> Path:
+def _parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
+    if s is None:
+        return None
+    ss = str(s).strip()
+    if ss == "":
+        return None
+    return [float(z) for z in ss.split(",") if str(z).strip() != ""]
+
+
+def _series_out_root(series: str, base: Path) -> Path:
     """
-    Map series name to required output root directories:
-
-      Precm → results/uccle/Prec/Precm/Monthly/NCP_LASSO
+    Uccle directory convention (monthly precipitation):
+      Precm -> results/uccle/Prec/Precm/Monthly
     """
-    base = Path("results/uccle")
     mapping = {
         "Precm": base / "Prec" / "Precm" / "Monthly",
     }
-
     if series not in mapping:
-        raise ValueError(f"Unknown series '{series}' for output mapping.")
+        raise ValueError(f"Unknown series '{series}'. Expected one of {list(mapping)}.")
     return mapping[series]
 
 
 def _date_tag_from_index(idx: pd.Index) -> str:
-    """
-    Build a date tag 'start-end' from a pandas index.
-    • For DatetimeIndex: YYYY-MM-DD
-    • For PeriodIndex: str(period)
-    • Otherwise: str(index_value)
-    """
     if len(idx) == 0:
         return "NA-NA"
-
     if isinstance(idx, pd.DatetimeIndex):
-        start = idx[0].strftime("%Y-%m-%d")
-        end = idx[-1].strftime("%Y-%m-%d")
-    elif isinstance(idx, pd.PeriodIndex):
-        start = str(idx[0])
-        end = str(idx[-1])
-    else:
-        start = str(idx[0])
-        end = str(idx[-1])
-
-    return f"{start}-{end}"
+        return f"{idx[0].strftime('%Y-%m')}-{idx[-1].strftime('%Y-%m')}"
+    if isinstance(idx, pd.PeriodIndex):
+        return f"{str(idx[0])}-{str(idx[-1])}"
+    return f"{str(idx[0])}-{str(idx[-1])}"
 
 
-def _month_id_from_index(idx: pd.Index, period: int) -> np.ndarray:
+def _start_end_from_index(idx: pd.Index) -> Tuple[str, str]:
+    if len(idx) == 0:
+        return ("NA", "NA")
+    if isinstance(idx, pd.DatetimeIndex):
+        return (idx[0].strftime("%Y-%m-%d"), idx[-1].strftime("%Y-%m-%d"))
+    return (str(idx[0]), str(idx[-1]))
+
+
+def _index_to_strings(idx: pd.Index) -> np.ndarray:
+    return np.asarray([str(x) for x in idx], dtype="U")
+
+
+# =============================================================================
+# Seasonal utilities (sum-to-zero parametrisation, gamma0 length p-1)
+# =============================================================================
+def _to_gamma0_pminus1(vals: List[float], period: int) -> np.ndarray:
     """
-    Return integer month IDs in {0,...,period-1} aligned with idx.
-    If idx is monthly PeriodIndex/DatetimeIndex: use calendar month.
-    Otherwise: fallback to t % period.
+    Convert a user-provided seasonal pattern to gamma0 (length p-1) for sum-to-zero:
+      seasonal_full = [gamma0..., -sum(gamma0)]
+
+    Accepts:
+      - p-1 floats: interpreted directly as gamma0
+      - p floats  : mean-center to sum-to-zero, then take first p-1 as gamma0
+    """
+    p = int(period)
+    arr = np.asarray(vals, float).ravel()
+    if arr.size == p - 1:
+        return arr.copy()
+    if arr.size == p:
+        arr = arr - float(arr.mean())
+        arr = arr - float(arr.sum()) / float(p)  # enforce exact sum-to-zero numerically
+        return arr[: p - 1].copy()
+    raise ValueError(f"Season pattern must have length {p-1} or {p}, got {arr.size}.")
+
+
+def _month_ids(idx: pd.Index, period: int) -> np.ndarray:
+    """
+    Month IDs in {0,...,period-1}, aligned with index.
     """
     n = len(idx)
-    if isinstance(idx, pd.PeriodIndex) and (idx.freqstr is not None) and ("M" in idx.freqstr):
+    if isinstance(idx, pd.PeriodIndex):
         return (idx.month - 1).astype(int)
     if isinstance(idx, pd.DatetimeIndex):
         return (idx.month - 1).astype(int)
-    return (np.arange(n) % period).astype(int)
+    return (np.arange(n) % int(period)).astype(int)
 
 
 def _gamma0_init_from_monthly_means(y: np.ndarray, idx: pd.Index, period: int) -> np.ndarray:
     """
-    Sensible seasonal init (length period-1) from monthly means with sum-to-zero.
-
-    Compute mean per month, center across months so sum_m effect_m = 0,
-    then take the first period-1 entries; the last month is implied by
-    -sum_{j=1}^{p-1} gamma_j.
+    Data-driven init for gamma0 (length p-1):
+      - compute mean per month
+      - center across months so sum-to-zero
+      - take first p-1 entries (last implied)
     """
-    month_id = _month_id_from_index(idx, period)
-    effects = np.zeros(period, float)
-    overall = float(np.mean(y)) if len(y) else 0.0
-    for m in range(period):
-        mask = (month_id == m)
-        effects[m] = float(np.mean(y[mask])) if np.any(mask) else overall
-    effects = effects - float(np.mean(effects))
-    return effects[: period - 1].copy()
+    p = int(period)
+    mid = _month_ids(idx, p)
+    eff = np.zeros(p, float)
+    overall = float(np.mean(y)) if y.size else 0.0
+    for m in range(p):
+        mask = (mid == m)
+        eff[m] = float(np.mean(y[mask])) if np.any(mask) else overall
+    eff = eff - float(np.mean(eff))
+    eff = eff - float(eff.sum()) / float(p)
+    return eff[: p - 1].copy()
 
 
-# ======================================================================
-# Data loading
-# ======================================================================
-def load_series(csv_path: Path) -> pd.Series:
+# =============================================================================
+# Data loading (monthly)
+# =============================================================================
+def load_monthly_series(
+    csv_path: Path,
+    *,
+    series_name_hint: Optional[str] = None,
+    start_year: Optional[int] = None,
+    end_year: Optional[int] = None,
+    force_start_january: bool = True,
+    trim_full_years: bool = True,
+) -> pd.Series:
     """
-    Load a univariate *monthly* precipitation time series from CSV and trim to a
-    multiple of 12 (whole number of years).
+    Load a univariate monthly series from CSV.
 
-    Expected flexible formats:
-      - A single date-like column (date/time/Date/Time) parsable by pandas, OR
-      - Separate year/month columns, OR
-      - A Period-like column already.
+    Accepted index formats:
+      (i) a single date-like column among: date/time/Date/Time/datetime
+      (ii) year+month columns among: (year|Year|YYYY) and (month|Month|MM)
+      (iii) otherwise: RangeIndex
 
-    Values:
-      - Uses 'value' column if present, otherwise 'Precm' if present,
-        otherwise first numeric column.
+    Value column:
+      - 'value' if present
+      - else column equal to series_name_hint if present (e.g. Precm)
+      - else first numeric column
+
+    Post-processing:
+      - drop NA
+      - sort by index (when possible)
+      - optional year filter (if datetime/period index)
+      - optionally trim leading months until January (clean seasonal dummy alignment)
+      - optionally trim length to multiple of 12 (whole number of years)
+      - convert DatetimeIndex to PeriodIndex('M') for consistent tagging
     """
     df = pd.read_csv(csv_path)
 
-    # --- values ---
+    # ---- values ----
     if "value" in df.columns:
         vals = pd.to_numeric(df["value"], errors="coerce")
-    elif "Precm" in df.columns:
-        vals = pd.to_numeric(df["Precm"], errors="coerce")
+    elif series_name_hint is not None and series_name_hint in df.columns:
+        vals = pd.to_numeric(df[series_name_hint], errors="coerce")
     else:
-        # fallback: first numeric column
         numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         if not numcols:
-            for c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="ignore")
-            numcols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            tmp = df.copy()
+            for c in tmp.columns:
+                tmp[c] = pd.to_numeric(tmp[c], errors="ignore")
+            numcols = [c for c in tmp.columns if pd.api.types.is_numeric_dtype(tmp[c])]
+            df = tmp
         if not numcols:
-            raise ValueError(f"No numeric columns found in {csv_path}")
+            raise ValueError(f"No numeric column found in {csv_path}")
         vals = pd.to_numeric(df[numcols[0]], errors="coerce")
 
-    # --- index ---
-    idx = None
+    # ---- index ----
+    idx: pd.Index | None = None
 
-    # 1) common date column
-    for cand in ["date", "time", "Date", "Time"]:
+    # (i) common date column
+    for cand in ("date", "time", "Date", "Time", "datetime", "Datetime", "DATE", "TIME"):
         if cand in df.columns:
             dt = pd.to_datetime(df[cand], errors="coerce")
-            idx = dt
+            ok = dt.notna() & vals.notna()
+            idx = pd.DatetimeIndex(dt[ok])
+            vals = vals[ok].reset_index(drop=True)
             break
 
-    # 2) year+month columns
+    # (ii) year+month
     if idx is None:
-        year_col = None
-        month_col = None
-        for yc in ["year", "Year", "YYYY"]:
-            if yc in df.columns:
-                year_col = yc
-                break
-        for mc in ["month", "Month", "MM"]:
-            if mc in df.columns:
-                month_col = mc
-                break
-
+        year_col = next((c for c in ("year", "Year", "YYYY") if c in df.columns), None)
+        month_col = next((c for c in ("month", "Month", "MM") if c in df.columns), None)
         if year_col is not None and month_col is not None:
             yy = pd.to_numeric(df[year_col], errors="coerce")
             mm = pd.to_numeric(df[month_col], errors="coerce")
-            ok = yy.notna() & mm.notna()
-            idx = pd.PeriodIndex(
-                year=yy[ok].astype(int),
-                month=mm[ok].astype(int),
-                freq="M",
-            )
+            ok = yy.notna() & mm.notna() & vals.notna()
+            idx = pd.PeriodIndex(year=yy[ok].astype(int), month=mm[ok].astype(int), freq="M")
             vals = vals[ok].reset_index(drop=True)
 
-    # 3) fallback: RangeIndex
+    # (iii) fallback
     if idx is None:
+        ok = vals.notna()
+        vals = vals[ok].reset_index(drop=True)
         idx = pd.RangeIndex(len(vals), name="t")
 
-    ser = pd.Series(np.asarray(vals, float), index=idx, name=csv_path.stem).dropna()
+    ser = pd.Series(np.asarray(vals, float), index=idx, name=series_name_hint or csv_path.stem).dropna()
 
-    # If we have real dates, sort them
+    # sort where possible
     try:
         ser = ser.sort_index()
     except Exception:
         pass
 
-    # Optional: ensure we start on January for dummy-season alignment
-    if isinstance(ser.index, (pd.DatetimeIndex, pd.PeriodIndex)):
-        month0 = int(ser.index[0].month)
-        if month0 != 1:
-            mask = ser.index.month == 1
-            first_jan_pos = int(np.argmax(mask.to_numpy())) if mask.any() else 0
-            ser = ser.iloc[first_jan_pos:]
+    # year filter (only when index supports it)
+    if start_year is not None or end_year is not None:
+        if isinstance(ser.index, pd.DatetimeIndex):
+            y = ser.index.year
+            lo = -10**9 if start_year is None else int(start_year)
+            hi = 10**9 if end_year is None else int(end_year)
+            ser = ser[(y >= lo) & (y <= hi)]
+        elif isinstance(ser.index, pd.PeriodIndex):
+            y = ser.index.year
+            lo = -10**9 if start_year is None else int(start_year)
+            hi = 10**9 if end_year is None else int(end_year)
+            ser = ser[(y >= lo) & (y <= hi)]
 
-    # trim to a multiple of 12 (full years)
-    n = len(ser) - (len(ser) % 12)
-    if n <= 0:
-        raise ValueError(f"Series in {csv_path} is shorter than one full year (12 points).")
-    ser = ser.iloc[:n]
+    # enforce start at January for clean monthly seasonal alignment
+    if force_start_january and isinstance(ser.index, (pd.DatetimeIndex, pd.PeriodIndex)) and len(ser) > 0:
+        months = ser.index.month
+        if int(months[0]) != 1:
+            mask = (months == 1)
+            if bool(np.any(mask)):
+                first = int(np.argmax(np.asarray(mask, dtype=bool)))
+                ser = ser.iloc[first:]
 
-    # for nicer tagging/plotting
+    # trim to whole years
+    if trim_full_years:
+        n = len(ser) - (len(ser) % 12)
+        if n < 12:
+            raise ValueError(f"{csv_path} yields < 12 observations after trimming; cannot run monthly DLM.")
+        ser = ser.iloc[:n]
+
+    # convert DatetimeIndex to PeriodIndex for consistent month tagging
     if isinstance(ser.index, pd.DatetimeIndex):
         ser.index = ser.index.to_period("M")
 
     return ser
 
 
-# ======================================================================
+# =============================================================================
 # Core runner
-# ======================================================================
+# =============================================================================
 def run_one(
+    *,
     series: str,
     y_ser: pd.Series,
     out_root: Path,
+    period: int,
+    priors: Priors,
+    cfg: SamplerConfig,
+    sigma_init: float,
+    s_alpha_init: float,
+    s_beta_init: float,
+    s_gamma_init: float,
+    gamma0_init: Optional[np.ndarray],
     level_mode: str = "dynamic",
     trend_mode: str = "dynamic",
     seasonal_mode: str = "dynamic",
+    make_plots: bool = True,
 ) -> None:
-    """
-    Run the non-centred DLM with dummy monthly seasonality and hierarchical Bayesian
-    lasso prior on process SDs for a single *monthly* precipitation series.
-    """
     y = y_ser.to_numpy(dtype=float)
-    period = 12
-    idx = y_ser.index[: len(y)]
+    T = int(y.size)
+    idx = y_ser.index
 
-    # --- priors ---
-    # gamma0 prior vector must have length period-1 (newest-first convention inside model)
-    m0_gamma_prior = [0.0] * (period - 1)
+    # ---- initial baseline guesses ----
+    alpha0_init = float(np.mean(y))
+    beta0_init = 0.0
 
-    pri = Priors(
-        # obs precision prior: tau = 1/sigma^2 ~ Gamma(a_sigma, b_sigma) (shape-rate)
-        a_sigma=2.0,
-        b_sigma=2.0,
-        # baseline priors (kept weak / scale-robust for precipitation)
-        m0_alpha=0.0,
-        P0_alpha=100.0,
-        m0_beta=0.0,
-        P0_beta=10.0,
-        m0_gamma=m0_gamma_prior,
-        P0_gamma=100.0,
-        # lasso hyperprior on lambda^2
-        a_lambda=0.001,
-        b_lambda=0.001,
-    )
-
-    # --- sampler config ---
-    cfg = SamplerConfig(
-        n_iter=20000,
-        burn=10000,
-        thin=1,
-        random_seed=42,
-        progress=True,
-        progress_every=10,
-    )
-
-    # --- initial values ---
-    y_sd = float(np.std(y)) if len(y) > 1 else 1.0
-    sigma2_init = float(np.var(y) * 0.2) if len(y) > 1 else 1.0
-
-    init_level = float(np.mean(y[: min(len(y), period)])) if len(y) >= period else float(np.mean(y))
-    init_trend = 0.0
-    gamma0_init = _gamma0_init_from_monthly_means(y, idx, period=period)
-
-    # signed process SDs (lasso will shrink if needed)
-    s_alpha_init = 0.05 * y_sd
-    s_beta_init = 0.01 * y_sd
-    s_gamma_init = 0.05 * y_sd
-
-    sampler = DLMGibbsConjugate(
+    # ---- build sampler (pass modes if supported; otherwise fall back) ----
+    kwargs = dict(
         y=y,
-        period=period,
-        level_mode=level_mode,
-        trend_mode=trend_mode,
-        seasonal_mode=seasonal_mode,
-        alpha0=init_level,
-        beta0=init_trend,
-        gamma0=gamma0_init,        # data-driven seasonal init (length p-1)
-        sigma2_init=sigma2_init,
-        s_alpha_init=s_alpha_init,
-        s_beta_init=s_beta_init,
-        s_gamma_init=s_gamma_init,
-        priors=pri,
+        period=int(period),
+        alpha0=float(alpha0_init),
+        beta0=float(beta0_init),
+        gamma0=None if gamma0_init is None else gamma0_init.astype(float),
+        sigma2_init=float(sigma_init) ** 2,
+        s_alpha_init=float(s_alpha_init),
+        s_beta_init=float(s_beta_init),
+        s_gamma_init=float(s_gamma_init),
+        priors=priors,
         cfg=cfg,
     )
+    try:
+        sampler = DLMGibbsConjugate(
+            level_mode=str(level_mode),
+            trend_mode=str(trend_mode),
+            seasonal_mode=str(seasonal_mode),
+            **kwargs,
+        )
+    except TypeError:
+        sampler = DLMGibbsConjugate(**kwargs)
 
-    # --- output paths ---
+    # ---- output paths ----
+    _ensure_dir(out_root)
     date_tag = _date_tag_from_index(idx)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    start_date, end_date = _start_end_from_index(idx)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     modes_tag = f"{level_mode}_{trend_mode}_{seasonal_mode}"
-    tag = f"{series}_{modes_tag}"
+    run_dir = out_root / f"{series}_monthly_{date_tag}_{modes_tag}_{stamp}"
+    _ensure_dir(run_dir)
 
-    outdir = out_root / f"{tag}_{timestamp}"
-    _ensure_dir(outdir)
-
-    # --- run ---
-    print(f"Running Uccle monthly DLM (Bayesian lasso) for {series} with modes={modes_tag} ...")
-    t0 = datetime.now().timestamp()
+    # ---- run ----
+    print(f"\n[Uccle DLM Prec] series={series} | T={T} | period={period}")
+    print(f"out: {run_dir}")
+    t0 = time.time()
     post = sampler.run()
-    elapsed = datetime.now().timestamp() - t0
-    print(f"{series}: run time {elapsed:.2f} seconds")
+    elapsed = time.time() - t0
+    print(f"[done] elapsed = {elapsed:.1f}s")
 
-    # --- save posterior ---
-    npz_name = f"posterior_{series}_{date_tag}_{modes_tag}.npz"
-    out_npz = outdir / npz_name
-
+    # ---- save posterior ----
+    out_npz = run_dir / "posterior.npz"
     sampler.save_posterior(
         out_npz_path=str(out_npz),
         extra_meta={
             "series": series,
-            "label": f"{series}_monthly",
-            "data_path": str(DATA_DIR / f"{series}.csv"),
-            "index_type": type(idx).__name__,
-            "index_values_preview": [str(ix) for ix in idx[: min(10, len(idx))]],
-            "description": (
-                "Gaussian DLM with dummy monthly seasonality (newest-first rotation), "
-                "dynamic level/trend/season, non-centred parametrisation (FFBS), "
-                "hierarchical Bayesian lasso prior on signed process SDs: "
-                "s_k | τ_k, σ² ~ N(0, σ² τ_k), τ_k | λ² ~ Exp(λ²/2), "
-                "λ² ~ Gamma(a_lambda, b_lambda)."
-            ),
-            "period": period,
+            "frequency": "monthly",
+            "period": int(period),
+            "T": int(T),
             "date_tag": date_tag,
+            "start_date": start_date,
+            "end_date": end_date,
+            "index_type": type(idx).__name__,
+            "index_start": str(idx[0]),
+            "index_end": str(idx[-1]),
             "elapsed_seconds": float(elapsed),
             "timestamp": datetime.now().isoformat(),
-            "lasso_hyperpriors": {
-                "a_lambda": pri.a_lambda,
-                "b_lambda": pri.b_lambda,
-            },
+            "priors": asdict(priors),
+            "cfg": asdict(cfg),
+            "model": "DLM_GAUSSIAN_NCP_LASSO_DUMMIES",
             "modes": {
-                "level_mode": level_mode,
-                "trend_mode": trend_mode,
-                "seasonal_mode": seasonal_mode,
+                "level_mode": str(level_mode),
+                "trend_mode": str(trend_mode),
+                "seasonal_mode": str(seasonal_mode),
+            },
+            "model_notes": {
+                "ncp": True,
+                "seasonality": "dummy_encoded_sum_to_zero_length_p_minus_1",
+                "process_sds": "hierarchical_bayesian_lasso_on_signed_s",
             },
         },
     )
 
-    # --- quick fit plot (post mean + 90% band) ---
-    mu_draws = post["mu"]
-    mu_hat = mu_draws.mean(axis=0)
-    lo, hi = np.quantile(mu_draws, [0.05, 0.95], axis=0)
+    # also store the index as strings (so plots can be reproduced without CSV)
+    np.save(run_dir / "index_strings.npy", _index_to_strings(idx))
 
-    idx_plot = _idx_for_matplotlib(idx)
+    # ---- plots ----
+    if make_plots:
+        mu = post["mu"]  # (n_kept, T)
+        mu_hat = mu.mean(axis=0)
+        lo, hi = np.quantile(mu, [0.05, 0.95], axis=0)
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(idx_plot, y, lw=1, label=series)
-    plt.plot(idx_plot, mu_hat, "-.", lw=1.5, label=r"$\hat{\mu}_t$ (post. mean)")
-    plt.fill_between(idx_plot, lo, hi, alpha=0.2, label=r"90% CI for $\mu_t$")
-    plt.title(f"{series}: monthly DLM (Bayesian lasso on process SDs) — modes={modes_tag}, period={period}")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
+        x = idx.to_timestamp() if isinstance(idx, pd.PeriodIndex) else idx
 
-    fit_name = f"fit_{series}_{date_tag}_{modes_tag}.png"
-    plt.savefig(outdir / fit_name, dpi=150)
-    plt.close()
+        plt.figure(figsize=(12, 4))
+        plt.plot(x, y, lw=1, label=series)
+        plt.plot(x, mu_hat, lw=1.5, linestyle="--", label=r"$\hat\mu_t$ (post. mean)")
+        plt.fill_between(x, lo, hi, alpha=0.2, label="90% CI for $\\mu_t$")
+        plt.title(f"{series} — monthly DLM (NCP FFBS + Bayesian lasso), period={period}, modes={modes_tag}")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(run_dir / "fit_mu.png", dpi=150)
+        plt.close()
+
+        # traces (a few key scalars)
+        fig, ax = plt.subplots(figsize=(12, 6))
+        if "sigma" in post:
+            ax.plot(post["sigma"], lw=1, label="sigma")
+        for name in ("Q_alpha", "Q_beta", "Q_gamma"):
+            if name in post:
+                ax.plot(np.sqrt(np.maximum(post[name], 0.0)), lw=1, label=f"sqrt({name})")
+        if "lambda2" in post:
+            ax.plot(post["lambda2"], lw=1, label="lambda2")
+        ax.set_title(f"{series} — traces (kept draws)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(run_dir / "traces.png", dpi=150)
+        plt.close(fig)
+
+    print(f"[saved] {out_npz}")
+    if make_plots:
+        print(f"[saved] {run_dir / 'fit_mu.png'}")
+        print(f"[saved] {run_dir / 'traces.png'}")
 
 
-    print(f"Saved posterior to {out_npz}")
-    print(f"Saved fit plot to {outdir / fit_name}\n")
-
-
-# ======================================================================
+# =============================================================================
 # Main
-# ======================================================================
+# =============================================================================
 def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Run Uccle monthly precipitation Gaussian DLM (NCP FFBS) with Bayesian lasso on process SDs."
+    )
+
+    # data
+    p.add_argument("--data-dir", type=str, default="data")
+    p.add_argument("--precm-file", type=str, default="Precm.csv")
+    p.add_argument("--start-year", type=int, default=1892)
+    p.add_argument("--end-year", type=int, default=2022)
+    p.add_argument("--force-start-january", default=True)
+    p.add_argument("--trim-full-years", default=True)
+
+    # output
+    p.add_argument("--results-root", type=str, default="results/uccle")
+    p.add_argument("--plots", default=True)
+
+    # model
+    p.add_argument("--period", type=int, default=12)
+    p.add_argument("--level-mode", type=str, default="dynamic")
+    p.add_argument("--trend-mode", type=str, default="dynamic")
+    p.add_argument("--seasonal-mode", type=str, default="dynamic")
+
+    # sampler
+    p.add_argument("--n-iter", type=int, default=20000)
+    p.add_argument("--burn", type=int, default=10000)
+    p.add_argument("--thin", type=int, default=1)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--progress", default=True)
+    p.add_argument("--progress-every", type=int, default=10)
+
+    # priors
+    p.add_argument("--prior-a-sigma", type=float, default=2.0)
+    p.add_argument("--prior-b-sigma", type=float, default=2.0)
+    p.add_argument("--prior-m0-alpha", type=float, default=0.0)
+    p.add_argument("--prior-P0-alpha", type=float, default=100.0)
+    p.add_argument("--prior-m0-beta", type=float, default=0.0)
+    p.add_argument("--prior-P0-beta", type=float, default=10.0)
+    p.add_argument(
+        "--prior-m0-gamma",
+        type=str,
+        default=None,
+        help="CSV floats length p-1 or p; if omitted: zeros.",
+    )
+    p.add_argument("--prior-P0-gamma", type=float, default=100.0)
+    p.add_argument("--prior-a-lambda", type=float, default=0.001)
+    p.add_argument("--prior-b-lambda", type=float, default=0.001)
+
+    # initials
+    p.add_argument("--sigma-init", type=float, default=None, help="If omitted: 0.3*sd(y)")
+    p.add_argument("--s-alpha-init", type=float, default=1e-2)
+    p.add_argument("--s-beta-init", type=float, default=1e-3)
+    p.add_argument("--s-gamma-init", type=float, default=1e-3)
+    p.add_argument(
+        "--gamma0-init",
+        type=str,
+        default=None,
+        help="CSV floats length p-1 or p; if omitted: init from monthly means (sum-to-zero).",
+    )
+
+    args = p.parse_args()
+    np.random.seed(int(args.seed))
+
     series = "Precm"
-    y_ser = load_series(DATA_DIR / f"{series}.csv")
+    period = int(args.period)
+    K = period - 1
 
-    print(f"{series} head:\n{y_ser.head()}\n")
+    data_dir = Path(args.data_dir)
+    results_root = Path(args.results_root)
 
-    out_root = _series_out_root(series)
+    make_plots = _parse_bool(args.plots)
+    do_progress = _parse_bool(args.progress)
+    force_start_january = _parse_bool(args.force_start_january)
+    trim_full_years = _parse_bool(args.trim_full_years)
 
-    level_mode = "dynamic"
-    trend_mode = "dynamic"
-    seasonal_mode = "dynamic"
+    # ---- load data ----
+    csv_path = data_dir / str(args.precm_file)
+    y_ser = load_monthly_series(
+        csv_path,
+        series_name_hint=series,
+        start_year=int(args.start_year),
+        end_year=int(args.end_year),
+        force_start_january=force_start_january,
+        trim_full_years=trim_full_years,
+    )
 
-    run_one(series, y_ser, out_root, level_mode, trend_mode, seasonal_mode)
+    y = y_ser.to_numpy(dtype=float)
 
-    print("Saved monthly results under:")
-    print(f"  {out_root}/*")
+    # ---- priors ----
+    m0_gamma_vals = _parse_csv_floats(args.prior_m0_gamma)
+    if m0_gamma_vals is None:
+        m0_gamma = [0.0] * K
+    else:
+        m0_gamma = _to_gamma0_pminus1(m0_gamma_vals, period).tolist()
+
+    priors = Priors(
+        a_sigma=float(args.prior_a_sigma),
+        b_sigma=float(args.prior_b_sigma),
+        m0_alpha=float(args.prior_m0_alpha),
+        P0_alpha=float(args.prior_P0_alpha),
+        m0_beta=float(args.prior_m0_beta),
+        P0_beta=float(args.prior_P0_beta),
+        m0_gamma=m0_gamma,
+        P0_gamma=float(args.prior_P0_gamma),
+        a_lambda=float(args.prior_a_lambda),
+        b_lambda=float(args.prior_b_lambda),
+    )
+
+    cfg = SamplerConfig(
+        n_iter=int(args.n_iter),
+        burn=int(args.burn),
+        thin=int(args.thin),
+        random_seed=int(args.seed),
+        progress=bool(do_progress),
+        progress_every=int(args.progress_every),
+    )
+
+    # ---- initials ----
+    sd = float(np.std(y, ddof=1)) if y.size > 1 else 1.0
+    if args.sigma_init is None:
+        sigma_init = max(0.3 * sd, 1e-6)
+    else:
+        sigma_init = float(args.sigma_init)
+
+    gamma0_init_vals = _parse_csv_floats(args.gamma0_init)
+    if gamma0_init_vals is None:
+        gamma0_init = _gamma0_init_from_monthly_means(y, y_ser.index, period=period)
+    else:
+        gamma0_init = _to_gamma0_pminus1(gamma0_init_vals, period)
+
+    out_root = _series_out_root(series, results_root)
+
+    run_one(
+        series=series,
+        y_ser=y_ser,
+        out_root=out_root,
+        period=period,
+        priors=priors,
+        cfg=cfg,
+        sigma_init=float(sigma_init),
+        s_alpha_init=float(args.s_alpha_init),
+        s_beta_init=float(args.s_beta_init),
+        s_gamma_init=float(args.s_gamma_init),
+        gamma0_init=gamma0_init,
+        level_mode=str(args.level_mode),
+        trend_mode=str(args.trend_mode),
+        seasonal_mode=str(args.seasonal_mode),
+        make_plots=make_plots,
+    )
+
+    print("\n[finished]")
+    print(f"  {series}: {str(out_root)}")
 
 
 if __name__ == "__main__":

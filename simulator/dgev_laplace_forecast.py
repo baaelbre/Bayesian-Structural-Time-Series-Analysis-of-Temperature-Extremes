@@ -1,686 +1,879 @@
-# %% simulator/dgev_return_forecast.py
+# simulator/dgev_forecast.py
 from __future__ import annotations
 
+"""
+DGEV posterior predictive forecasting (fine + annual + meteorological seasons).
+
+Key design choices (mirrors your manuscript + Laplace posterior format):
+- Fine forecast: simulate future latent state paths under the structural evolution,
+  then draw y_{T+1:T+h} from the GEV observation model.
+- Annual / seasonal block extremes: conditional on the future (mu_t, sigma, xi),
+  use the product-CDF max distribution (eq. 31) via 1D inversion; optionally
+  combine with already-observed months in the same block via max(m0, Z_future).
+
+Plot policy (as requested):
+- Only plot observed training data + forecast median + forecast band.
+- No posterior fit ribbon on training period.
+
+Seasonal aggregation policy (as requested):
+- Meteorological seasons (DJF/MAM/JJA/SON) only when period==12 AND dates available.
+- Annual summaries always work (calendar-year if dates available; else blocks of length=period).
+
+Latest-run discovery (as requested):
+- If --target omitted, uses find_latest_run(root=--root) exactly like the plotter.
+"""
+
 import os
-import math
 import sys
-from typing import Optional, Dict, Any, List, Tuple
+import math
+import json
+import argparse
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Make optimization package visible (mirrors dgev_plotter.py / dlm_plotter.py)
+# Make optimization package visible (mirrors dgev_laplace_plotter.py)
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # ---------------------------------------------------------------------
-# I/O helpers: posterior loader
+# I/O helpers: posterior loader (EXACTLY like the plotter pattern)
 # ---------------------------------------------------------------------
 try:
-    from optimization.posterior_bundle import load_posterior, find_latest_run
+    from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
 except Exception as e:
     raise ImportError(
         "Could not import optimization.posterior_bundle.load_posterior/find_latest_run.\n"
         "Make sure optimization/posterior_bundle.py is on PYTHONPATH."
     ) from e
 
+try:
+    import pandas as pd
+except Exception:
+    pd = None  # type: ignore
 
-# ---------------------------------------------------------------------
+
+# =============================================================================
 # Small utils
-# ---------------------------------------------------------------------
+# =============================================================================
 def _ensure_dir(path: str) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
 
 
-def _parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
-    if s is None:
+def _coerce_bool(x: Any) -> Optional[bool]:
+    if x is None:
         return None
-    s = str(s).strip()
-    if not s:
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, np.integer)):
+        return bool(int(x))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("true", "t", "1", "yes", "y"):
+            return True
+        if s in ("false", "f", "0", "no", "n"):
+            return False
+    return None
+
+
+def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
+    """
+    Same logic as in your plotter: check meta flags, transform hints, series naming.
+    """
+    if not isinstance(meta, dict):
+        return False
+
+    for k in ("minima", "is_minima", "minima_series"):
+        b = _coerce_bool(meta.get(k, None))
+        if b is not None:
+            return b
+
+    ms = meta.get("model_sign", None)
+    try:
+        if ms is not None and float(ms) < 0:
+            return True
+    except Exception:
+        pass
+
+    dt = meta.get("data_transform", None)
+    if isinstance(dt, str):
+        s = dt.strip().lower()
+        if any(tok in s for tok in ("negate", "minus", "signflip", "flip_sign", "neg")):
+            return True
+
+    ser = meta.get("series", None)
+    if isinstance(ser, str):
+        ss = ser.strip()
+        if ss in {"TNn", "TXn"}:
+            return True
+        if len(ss) >= 2 and ss.endswith("n") and ss[:-1].isalpha():
+            return True
+
+    return False
+
+
+def _infer_period(meta: Dict[str, Any], draws: Dict[str, np.ndarray]) -> int:
+    if isinstance(meta, dict) and "period" in meta:
+        return int(meta["period"])
+    if "period" in draws:
+        return int(np.asarray(draws["period"]).item())
+    if "gamma0" in draws:
+        return int(np.asarray(draws["gamma0"]).shape[1] + 1)
+    if "x" in draws:
+        # x: (S,T,dim) with dim = 2 + (p-1) => dim = p+1 => p = dim-1
+        dim = int(np.asarray(draws["x"]).shape[2])
+        return int(dim - 1)
+    raise ValueError("Could not infer period from meta/draws.")
+
+
+def _tail_quantiles(alpha: float) -> Tuple[float, float]:
+    a = float(alpha)
+    a = min(max(a, 1e-6), 0.49)
+    return (a, 1.0 - a)
+
+
+# =============================================================================
+# GEV helpers
+# =============================================================================
+def gev_cdf(z: np.ndarray, mu: np.ndarray, sigma: float, xi: float) -> np.ndarray:
+    z = np.asarray(z, float)
+    mu = np.asarray(mu, float)
+    sig = float(sigma)
+    x = float(xi)
+
+    if sig <= 0.0 or not np.isfinite(sig):
+        return np.full_like(z, np.nan)
+
+    t = (z - mu) / sig
+    if abs(x) < 1e-12:
+        return np.exp(-np.exp(-t))
+
+    a = 1.0 + x * t
+    out = np.zeros_like(a)
+    ok = a > 0
+    out[~ok] = 0.0
+    out[ok] = np.exp(-(a[ok]) ** (-1.0 / x))
+    return out
+
+
+def gev_ppf(u: np.ndarray, mu: np.ndarray, sigma: float, xi: float) -> np.ndarray:
+    u = np.asarray(u, float)
+    mu = np.asarray(mu, float)
+    sig = float(sigma)
+    x = float(xi)
+
+    u = np.clip(u, 1e-12, 1.0 - 1e-12)
+    if abs(x) < 1e-12:
+        return mu - sig * np.log(-np.log(u))
+    return mu + (sig / x) * ((-np.log(u)) ** (-x) - 1.0)
+
+
+# =============================================================================
+# Structural seasonal rotation (dummy seasonal block)
+# =============================================================================
+def _season_rotate(g_prev: np.ndarray) -> np.ndarray:
+    """
+    Seasonal state for dummy encoding with sum-to-zero:
+      g_new[0] = -sum(g_prev)
+      g_new[1:] = g_prev[:-1]
+    Innovation noise is added only to g_new[0].
+    """
+    g_prev = np.asarray(g_prev, float)
+    if g_prev.size == 0:
+        return g_prev.copy()
+    out = np.empty_like(g_prev)
+    out[0] = -float(np.sum(g_prev))
+    if g_prev.size > 1:
+        out[1:] = g_prev[:-1]
+    return out
+
+
+def _baseline_effect(season_idx: int, gamma0: np.ndarray) -> float:
+    """
+    Fixed seasonal baseline (sum-to-zero dummy coding) with length K=p-1:
+    months 0..K-1 use gamma0[k], the last season uses -sum(gamma0).
+    """
+    gamma0 = np.asarray(gamma0, float)
+    K = int(gamma0.size)
+    if season_idx < K:
+        return float(gamma0[season_idx])
+    return -float(np.sum(gamma0))
+
+
+# =============================================================================
+# Dates (optional, if meta has start_date)
+# =============================================================================
+def _try_build_dates(meta: Dict[str, Any], T: int, h: int, period: int):
+    if pd is None:
         return None
-    return [float(z) for z in s.split(",")]
+    start = meta.get("start_date") or meta.get("start-date") or meta.get("startDate")
+    if start is None:
+        return None
+    try:
+        start_dt = pd.to_datetime(start)
+    except Exception:
+        return None
+
+    # monthly
+    if period == 12:
+        try:
+            return pd.date_range(start=start_dt, periods=T + h, freq="MS")
+        except Exception:
+            return pd.date_range(start=start_dt, periods=T + h, freq=pd.DateOffset(months=1))
+
+    # if period divides 12, interpret as regular sub-annual blocks (e.g. 4=quarters, 6=bimonthly)
+    if 12 % period == 0:
+        step_m = 12 // period
+        return pd.date_range(start=start_dt, periods=T + h, freq=pd.DateOffset(months=step_m))
+
+    return None
 
 
-# ---------------------------------------------------------------------
-# GEV helpers (standalone)
-# ---------------------------------------------------------------------
-def _gev_cdf(x: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray) -> np.ndarray:
+def _year_float_from_dates(dates) -> np.ndarray:
+    years = dates.year.astype(float)
+    # represent within-year position using month
+    years = years + (dates.month.astype(float) - 1.0) / 12.0
+    return np.asarray(years, float)
+
+
+# =============================================================================
+# Product-CDF inversion sampler for block maxima (eq. 31)
+# =============================================================================
+def _max_cdf(z: float, mus: np.ndarray, sigma: float, xi: float) -> float:
     """
-    Broadcasting-safe GEV CDF.
-
-    - Stable near xi=0 (Gumbel limit).
-    - Correct support handling:
-        xi > 0: CDF = 0 for x below lower endpoint
-        xi < 0: CDF = 1 for x above upper endpoint
+    CDF of the maximum of independent GEV draws with varying mu_t (shared sigma, xi):
+      P(max <= z) = prod_t G(z; mu_t, sigma, xi).
     """
-    x = np.asarray(x, float)
-    mu = np.asarray(mu, float)
-    sigma = np.clip(np.asarray(sigma, float), 1e-12, None)
-    xi = np.asarray(xi, float)
-
-    z = (x - mu) / sigma
-    tol = 1e-8
-
-    is_gumbel = np.abs(xi) < tol
-
-    # Gumbel CDF
-    F0 = np.exp(-np.exp(-z))
-
-    # General xi != 0 branch (computed in a broadcast-safe way)
-    t = 1.0 + xi * z
-
-    # Safe placeholder where t<=0 (we overwrite those via support rules)
-    t_pos = np.where(t > 0.0, t, 1.0)
-
-    # raw formula where t>0
-    F1_raw = np.exp(-(t_pos ** (-1.0 / xi)))
-
-    # Support corrections for t<=0
-    # xi>0  => below lower endpoint => F=0
-    # xi<0  => above upper endpoint => F=1
-    F1 = np.where(
-        t > 0.0,
-        F1_raw,
-        np.where(xi > 0.0, 0.0, 1.0),
-    )
-
-    F = np.where(is_gumbel, F0, F1)
-    return np.clip(F, 0.0, 1.0)
+    mus = np.asarray(mus, float)
+    G = gev_cdf(np.full_like(mus, float(z)), mus, float(sigma), float(xi))
+    G = np.clip(G, 0.0, 1.0)
+    # compute in log space to reduce underflow
+    with np.errstate(divide="ignore"):
+        lg = np.log(np.maximum(G, 1e-300))
+    return float(np.exp(np.sum(lg)))
 
 
-
-def _gev_return_level_block(mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray, N: float) -> np.ndarray:
+def _sample_max_product_cdf(
+    rng: np.random.Generator,
+    mus: np.ndarray,
+    sigma: float,
+    xi: float,
+    *,
+    max_iter: int = 80,
+) -> float:
     """
-    Block return level z_N such that P(X <= z_N) = 1 - 1/N.
+    Sample Z = max(Y_1,...,Y_m) where Y_j ~ GEV(mu_j, sigma, xi) independent,
+    using 1D inversion by bisection on F_Z(z) = prod_j G(z; mu_j, sigma, xi).
 
-    Works when mu, sigma, xi are arrays of the same shape and N is scalar.
+    Falls back to direct simulation if bracketing fails.
     """
-    mu = np.asarray(mu, float)
-    sigma = np.asarray(sigma, float)
-    xi = np.asarray(xi, float)
+    mus = np.asarray(mus, float)
+    if mus.size == 0:
+        return float("nan")
 
-    N_val = float(N)
-    p = 1.0 - 1.0 / max(N_val, 1.0 + 1e-12)
-    p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
-    tol = 1e-8
+    u = float(rng.uniform(1e-12, 1.0 - 1e-12))
+    sig = float(sigma)
+    x = float(xi)
 
-    z = np.empty_like(mu)
-    g = -math.log(-math.log(p))  # scalar
+    if sig <= 0 or not np.isfinite(sig) or not np.isfinite(x):
+        # degrade gracefully: draw directly using an arbitrary positive sigma
+        sig = 1.0 if (not np.isfinite(sig) or sig <= 0) else sig
+        x = 0.0 if (not np.isfinite(x)) else x
 
-    mask0 = np.abs(xi) < tol
-    mask1 = ~mask0
+    # choose a reasonable bracket [lo, hi]
+    lo = float(np.min(mus) - 10.0 * sig)
 
-    # Gumbel limit
-    if np.any(mask0):
-        z[mask0] = mu[mask0] + sigma[mask0] * g
+    if x < -1e-12:
+        # finite upper endpoint for each margin: mu - sigma/xi ; max endpoint is min over endpoints
+        endpoints = mus - sig / x
+        hi = float(np.min(endpoints) - 1e-9 * max(1.0, abs(np.min(endpoints))))
+    else:
+        hi = float(np.max(mus) + 10.0 * sig)
 
-    # xi != 0
-    if np.any(mask1):
-        base = -math.log(p)  # scalar
-        z[mask1] = (
-            mu[mask1]
-            + (sigma[mask1] / xi[mask1]) * (np.power(base, -xi[mask1]) - 1.0)
-        )
+    # widen lo until F(lo) <= u
+    f_lo = _max_cdf(lo, mus, sig, x)
+    step = 10.0 * sig if sig > 0 else 10.0
+    k = 0
+    while (np.isfinite(f_lo) and f_lo > u) and (k < 50):
+        lo -= step
+        step *= 1.5
+        f_lo = _max_cdf(lo, mus, sig, x)
+        k += 1
 
-    return z
+    # widen hi until F(hi) >= u (only if xi>=0)
+    f_hi = _max_cdf(hi, mus, sig, x)
+    step = 10.0 * sig if sig > 0 else 10.0
+    k = 0
+    while (np.isfinite(f_hi) and f_hi < u) and (k < 60):
+        if x < -1e-12:
+            break
+        hi += step
+        step *= 1.5
+        f_hi = _max_cdf(hi, mus, sig, x)
+        k += 1
 
+    # fallback if bracketing fails
+    if (not np.isfinite(f_lo)) or (not np.isfinite(f_hi)) or (not (f_lo <= u <= f_hi)):
+        yy = gev_ppf(rng.uniform(size=mus.size), mus, sig, x)
+        return float(np.max(yy))
 
-# ---------------------------------------------------------------------
-# Seasonal baseline design + seasonal rotation
-# ---------------------------------------------------------------------
-def _build_season_design(T: int, period: int) -> np.ndarray:
-    """
-    Seasons indexed 0..p-1 with period=p.
-    For seasons 0..p-2: one-hot in coordinates 0..p-2.
-    For season p-1: -1 in all entries (sum-to-zero constraint).
-    """
-    if period < 2:
-        return np.zeros((T, 0))
-    p = period
-    K = p - 1
-    S = np.zeros((T, K), float)
-    for t in range(T):
-        season = t % p
-        if season < K:
-            S[t, season] = 1.0
+    # bisection
+    a, b = lo, hi
+    for _ in range(int(max_iter)):
+        m = 0.5 * (a + b)
+        fm = _max_cdf(m, mus, sig, x)
+        if not np.isfinite(fm):
+            # if numerics go weird, shrink interval conservatively
+            b = m
+            continue
+        if fm < u:
+            a = m
         else:
-            S[t, :] = -1.0
-    return S
+            b = m
+    return 0.5 * (a + b)
 
 
-def _season_rotation_matrix(K: int) -> np.ndarray:
-    """
-    Rotation matrix R for dummy seasonal dynamics:
-      R[0, :] = -1
-      R[1:, :-1] = I_{K-1}
-    """
-    if K <= 0:
-        return np.zeros((0, 0))
-    R = np.zeros((K, K))
-    R[0, :] = -1.0
-    if K > 1:
-        R[1:, :-1] = np.eye(K - 1)
-    return R
+# =============================================================================
+# Aggregation helpers (annual + meteorological seasons)
+# =============================================================================
+def _season_label(month: int) -> str:
+    if month in (12, 1, 2):
+        return "DJF"
+    if month in (3, 4, 5):
+        return "MAM"
+    if month in (6, 7, 8):
+        return "JJA"
+    return "SON"
 
 
-# ---------------------------------------------------------------------
-# Core: forecasting μ_t
-# ---------------------------------------------------------------------
-def _extract_state_indices(layout: List[str], period: int) -> Tuple[int, int, int, int]:
-    """
-    Extract indices for alpha, beta and the block of seasonal dynamic states g1..g_{p-1}.
-    """
-    if "alpha" not in layout or "beta" not in layout:
-        raise ValueError("layout must contain 'alpha' and 'beta' entries.")
-    idx_alpha = layout.index("alpha")
-    idx_beta = layout.index("beta")
-
-    g_indices = [i for i, nm in enumerate(layout) if nm.startswith("g")]
-    if not g_indices:
-        raise ValueError("layout must contain dynamic seasonal states 'g1', 'g2', ..., 'g{p-1}'.")
-    idx_g_start = min(g_indices)
-    idx_g_end = max(g_indices)
-
-    expected_K = period - 1
-    if expected_K > 0 and (idx_g_end - idx_g_start + 1) < expected_K:
-        raise ValueError(
-            f"layout appears inconsistent with period={period}: "
-            f"expected ≥ {expected_K} seasonal coords, got {idx_g_end - idx_g_start + 1}."
-        )
-
-    return idx_alpha, idx_beta, idx_g_start, idx_g_end
+def _season_year(year: int, month: int) -> int:
+    # DJF is grouped with "season-year" = year+1 for December
+    return year + 1 if month == 12 else year
 
 
-def forecast_mu_and_params(
+def _sorted_unique(items: List[Any]) -> List[Any]:
+    seen = set()
+    out = []
+    for it in items:
+        if it in seen:
+            continue
+        seen.add(it)
+        out.append(it)
+    return out
+
+
+# =============================================================================
+# Forecast core
+# =============================================================================
+def forecast_from_bundle(
     draws: Dict[str, np.ndarray],
     meta: Dict[str, Any],
-    horizon: int,
-    seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    *,
+    h: int,
+    rng: np.random.Generator,
+    n_draws: Optional[int],
+    rep_per_draw: int,
+    rep_per_draw_max: int,
+    alpha: float,
+    minima: bool,
+) -> Dict[str, Any]:
     """
-    From posterior draws and meta, build a forecast of μ_t for t = 1..T+H:
-
-      - Structural CP dynamics:
-          alpha_{t+1} = alpha_t + beta_t + η_alpha,t   (η ~ N(0, s_alpha^2))
-          beta_{t+1}  = beta_t + η_beta,t              (η ~ N(0, s_beta^2))
-          gamma_{t+1} = R gamma_t + η_gamma,t          (η ~ N(0, s_gamma^2 I))
-
-      - Baseline seasonal design S[t,:] @ gamma0 (static γ0).
-      - σ, ξ constant over t.
-
-    Returns:
-      mu_all: (S, T+H)
-      sigma : (S,)
-      xi    : (S,)
+    Returns a dict with:
+      - fine forecast: y_obs (training), x_train, x_fore, y_fore_samples (S*rep_per_draw, h)
+      - annual: years, obs, med, lo, hi (aligned arrays with NaNs where unavailable)
+      - seasons (only if period==12 and dates): season_x, season_year, season_name, obs, med, lo, hi
     """
-    mu_draws = np.asarray(draws["mu"], float)  # (S, T)
-    S_draws, T = mu_draws.shape
+    period = _infer_period(meta, draws)
 
-    if "x" not in draws or draws["x"].ndim != 3:
-        raise ValueError("draws must contain 'x' with shape (S, T, dim) for forecasting.")
-    x_draws = np.asarray(draws["x"], float)
+    # stored model-scale series (may be negated for minima-series)
+    y_model = np.asarray(draws["y"], float)
+    T = int(y_model.size)
+    if T < 1:
+        raise ValueError("Posterior bundle has empty 'y'.")
 
-    # GEV params
-    if "sigma" in draws:
-        sigma = np.asarray(draws["sigma"], float)
-    elif "sigma2" in draws:
-        sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float), 0, None))
+    # core posterior draws
+    sigma_all = np.asarray(draws["sigma"], float)
+    xi_all = np.asarray(draws["xi"], float)
+    x_all = np.asarray(draws["x"], float)  # (S,T,dim) with dim = 2 + (p-1)
+
+    S_all = int(sigma_all.size)
+    if x_all.ndim != 3 or x_all.shape[0] != S_all or x_all.shape[1] != T:
+        raise ValueError("Expected draws['x'] to have shape (S,T,dim) consistent with sigma and y.")
+
+    # baseline seasonal means gamma0 (S, p-1) in your Laplace code
+    if "gamma0" in draws:
+        gamma0_all = np.asarray(draws["gamma0"], float)
+        if gamma0_all.ndim != 2 or gamma0_all.shape[0] != S_all:
+            raise ValueError("draws['gamma0'] must be (S,p-1).")
     else:
-        raise ValueError("draws must contain 'sigma' or 'sigma2'.")
-    if sigma.shape[0] != S_draws:
-        raise ValueError("Length of sigma does not match number of draws S.")
+        gamma0_all = np.zeros((S_all, period - 1), float)
 
-    if "xi" not in draws:
-        raise ValueError("draws must contain 'xi'.")
-    xi = np.asarray(draws["xi"], float)
-    if xi.shape[0] != S_draws:
-        raise ValueError("Length of xi does not match number of draws S.")
-
-    period = int(meta.get("period", 1))
-    if period < 1:
-        raise ValueError("meta['period'] must be >= 1.")
-    K_gamma = max(period - 1, 0)
-
-    layout = meta.get("layout")
-    if layout is None:
-        raise ValueError("meta must contain 'layout' as list of state names.")
-    layout = list(layout)
-    idx_alpha, idx_beta, idx_g_start, _idx_g_end = _extract_state_indices(layout, period)
-
-    def _get_signed_sd(name_s: str, name_q: str) -> np.ndarray:
-        if name_s in draws:
-            arr = np.asarray(draws[name_s], float)
-            if arr.shape[0] != S_draws:
-                raise ValueError(f"{name_s} length mismatch.")
-            return arr
-        if name_q in draws:
-            q = np.asarray(draws[name_q], float)
-            if q.shape[0] != S_draws:
-                raise ValueError(f"{name_q} length mismatch.")
-            return np.sign(q) * np.sqrt(np.abs(q))
-        raise ValueError(f"Neither '{name_s}' nor '{name_q}' found in draws.")
-
-    s_alpha = _get_signed_sd("s_alpha", "Q_alpha")
-    s_beta = _get_signed_sd("s_beta", "Q_beta")
-    s_gamma = _get_signed_sd("s_gamma", "Q_gamma") if K_gamma > 0 else np.zeros(S_draws)
-
-    # Static seasonal baselines gamma0
-    if K_gamma > 0:
-        if "gamma0" not in draws:
-            raise ValueError("draws must contain 'gamma0' when period>1.")
-        gamma0 = np.asarray(draws["gamma0"], float)  # (S, K_gamma)
-        if gamma0.shape != (S_draws, K_gamma):
-            raise ValueError("gamma0 shape mismatch.")
+    # process variances (prefer Q_*; else use s_*^2)
+    if all(k in draws for k in ("Q_alpha", "Q_beta", "Q_gamma")):
+        Q_alpha_all = np.asarray(draws["Q_alpha"], float)
+        Q_beta_all = np.asarray(draws["Q_beta"], float)
+        Q_gamma_all = np.asarray(draws["Q_gamma"], float)
     else:
-        gamma0 = np.zeros((S_draws, 0), float)
+        s_alpha = np.asarray(draws.get("s_alpha"), float)
+        s_beta = np.asarray(draws.get("s_beta"), float)
+        s_gamma = np.asarray(draws.get("s_gamma"), float)
+        if s_alpha.size != S_all or s_beta.size != S_all or s_gamma.size != S_all:
+            raise ValueError("Need either Q_alpha/Q_beta/Q_gamma or s_alpha/s_beta/s_gamma in posterior.")
+        Q_alpha_all = s_alpha * s_alpha
+        Q_beta_all = s_beta * s_beta
+        Q_gamma_all = s_gamma * s_gamma
 
-    T_total = T + max(horizon, 0)
-    S_design_all = _build_season_design(T_total, period)  # (T_total, K_gamma)
-    R_gamma = _season_rotation_matrix(K_gamma)            # (K_gamma, K_gamma)
+    # optional subsample
+    if n_draws is not None and 1 <= int(n_draws) < S_all:
+        idx = rng.choice(S_all, size=int(n_draws), replace=False)
+        idx.sort()
+    else:
+        idx = np.arange(S_all)
 
-    rng = np.random.default_rng(seed)
+    sigma = sigma_all[idx]
+    xi = xi_all[idx]
+    x = x_all[idx, :, :]
+    gamma0 = gamma0_all[idx, :]
+    Q_alpha = Q_alpha_all[idx]
+    Q_beta = Q_beta_all[idx]
+    Q_gamma = Q_gamma_all[idx]
+    S = int(idx.size)
 
-    mu_all = np.zeros((S_draws, T_total), float)
-    mu_all[:, :T] = mu_draws  # historical
+    # build dates if possible
+    dates_full = _try_build_dates(meta, T=T, h=int(h), period=period)
+    if dates_full is not None:
+        x_full = _year_float_from_dates(dates_full)
+        x_train = x_full[:T]
+        x_fore = x_full[T:]
 
-    for s in range(S_draws):
-        x_last = x_draws[s, T - 1, :]
+        if period == 12:
+            season_idx_fore = (dates_full[T:].month.values - 1).astype(int)  # 0..11
+        else:
+            season_idx_fore = (np.arange(T, T + h) % period).astype(int)
 
-        alpha_curr = float(x_last[idx_alpha])
-        beta_curr = float(x_last[idx_beta])
-        gamma_curr = (
-            x_last[idx_g_start: idx_g_start + K_gamma].astype(float).copy()
-            if K_gamma > 0 else np.zeros(0, float)
-        )
+        years_full = dates_full.year.values.astype(int)   # length T+h
+        months_full = dates_full.month.values.astype(int) # length T+h
+    else:
+        x_train = np.arange(T, dtype=float)
+        x_fore = np.arange(T, T + h, dtype=float)
+        season_idx_fore = (np.arange(T, T + h) % period).astype(int)
+        years_full = None
+        months_full = None
 
-        s_a = float(s_alpha[s])
-        s_b = float(s_beta[s])
-        s_g = float(s_gamma[s]) if K_gamma > 0 else 0.0
-        gamma0_s = gamma0[s, :] if K_gamma > 0 else np.zeros(0, float)
+    # state layout: [alpha, beta, g1..g_{p-1}]
+    idx_alpha = 0
+    idx_beta = 1
+    idx_g_start = 2
+    K = int(period - 1)
 
-        for h in range(horizon):
-            t = T + h
+    # --- simulate future mu_t on model scale, and fine predictive y ---
+    mu_fore = np.zeros((S, h), float)
+    y_fore_samples_model = np.zeros((S * rep_per_draw, h), float)
 
-            eps_alpha = rng.normal(0.0, max(abs(s_a), 1e-16))
-            eps_beta = rng.normal(0.0, max(abs(s_b), 1e-16))
+    for s in range(S):
+        alpha_t = float(x[s, -1, idx_alpha])
+        beta_t = float(x[s, -1, idx_beta])
+        gvec = np.asarray(x[s, -1, idx_g_start:idx_g_start + K], float).copy()
 
-            alpha_next = alpha_curr + beta_curr + eps_alpha
-            beta_next = beta_curr + eps_beta
+        sd_a = math.sqrt(max(float(Q_alpha[s]), 0.0))
+        sd_b = math.sqrt(max(float(Q_beta[s]), 0.0))
+        sd_g = math.sqrt(max(float(Q_gamma[s]), 0.0))
 
-            if K_gamma > 0:
-                eps_gamma = rng.normal(0.0, max(abs(s_g), 1e-16), size=K_gamma)
-                gamma_next = R_gamma @ gamma_curr + eps_gamma
+        # one latent path per posterior draw (keeps forecast dependence structure simple)
+        for ell in range(h):
+            alpha_t = alpha_t + beta_t + rng.normal(0.0, sd_a)
+            beta_t = beta_t + rng.normal(0.0, sd_b)
+
+            if K > 0:
+                gnew = _season_rotate(gvec)
+                gnew[0] = gnew[0] + rng.normal(0.0, sd_g)  # innovation only in first seasonal component
+                gvec = gnew
+                g1 = float(gvec[0])
+                base = _baseline_effect(int(season_idx_fore[ell]), gamma0[s, :])
             else:
-                gamma_next = gamma_curr
+                g1 = 0.0
+                base = 0.0
 
-            g1_next = gamma_next[0] if K_gamma > 0 else 0.0
-            base_next = float(S_design_all[t, :] @ gamma0_s) if K_gamma > 0 else 0.0
-            mu_all[s, t] = alpha_next + g1_next + base_next
+            mu_fore[s, ell] = alpha_t + g1 + base
 
-            alpha_curr, beta_curr, gamma_curr = alpha_next, beta_next, gamma_next
+        # draw y from observation model
+        for r in range(int(rep_per_draw)):
+            uu = rng.uniform(size=h)
+            y_fore_samples_model[s * rep_per_draw + r, :] = gev_ppf(
+                uu, mu_fore[s, :], float(sigma[s]), float(xi[s])
+            )
 
-    return mu_all, sigma, xi
+    # backtransform for plotting/original scale
+    if minima:
+        y_obs = -y_model
+        y_fore_samples = -y_fore_samples_model
+    else:
+        y_obs = y_model
+        y_fore_samples = y_fore_samples_model
+
+    # observed in model scale (for combining with future max blocks via max(m0, Z_future))
+    y_obs_model = y_model
+
+    lo_q, hi_q = _tail_quantiles(alpha)
+
+    # =============================================================================
+    # Annual aggregation (ALWAYS produced)
+    # =============================================================================
+    if dates_full is not None and years_full is not None:
+        # calendar-year blocks
+        year_labels = years_full  # length T+h
+        uniq_years = sorted(set(int(v) for v in year_labels))
+
+        yrs, obs_list, med_list, lo_list, hi_list = [], [], [], [], []
+        for yy in uniq_years:
+            idx_all = np.where(year_labels == yy)[0]
+            idx_train = idx_all[idx_all < T]
+            idx_fore = idx_all[idx_all >= T]
+
+            if idx_train.size == 0 and idx_fore.size == 0:
+                continue
+
+            # observed annual block value (training only)
+            obs_val = float(np.max(y_obs[idx_train])) if idx_train.size > 0 else float("nan")
+
+            # aligned padding when no forecast in that year
+            if idx_fore.size == 0:
+                yrs.append(int(yy))
+                obs_list.append(obs_val)
+                med_list.append(float("nan"))
+                lo_list.append(float("nan"))
+                hi_list.append(float("nan"))
+                continue
+
+            # combine already-observed part of the block (if any) with future part
+            m0 = float(np.max(y_obs_model[idx_train])) if idx_train.size > 0 else -float("inf")
+            pos = (idx_fore - T).astype(int)
+
+            draws_block = np.zeros((S * rep_per_draw_max,), float)
+            for s in range(S):
+                mus = mu_fore[s, pos]
+                for r in range(int(rep_per_draw_max)):
+                    zf = _sample_max_product_cdf(rng, mus, float(sigma[s]), float(xi[s]))
+                    draws_block[s * rep_per_draw_max + r] = max(m0, float(zf))
+
+            draws_plot = -draws_block if minima else draws_block
+
+            yrs.append(int(yy))
+            obs_list.append(obs_val)
+            med_list.append(float(np.quantile(draws_plot, 0.5)))
+            lo_list.append(float(np.quantile(draws_plot, lo_q)))
+            hi_list.append(float(np.quantile(draws_plot, hi_q)))
+
+        annual = {
+            "years": np.asarray(yrs, int),
+            "obs": np.asarray(obs_list, float),
+            "med": np.asarray(med_list, float),
+            "lo": np.asarray(lo_list, float),
+            "hi": np.asarray(hi_list, float),
+        }
+    else:
+        # fallback: define "years" as blocks of length=period
+        n_total = T + h
+        year_id = np.arange(n_total, dtype=int) // int(period)
+        uniq_years = sorted(set(int(v) for v in year_id))
+
+        yrs, obs_list, med_list, lo_list, hi_list = [], [], [], [], []
+        for yy in uniq_years:
+            idx_all = np.where(year_id == yy)[0]
+            idx_train = idx_all[idx_all < T]
+            idx_fore = idx_all[idx_all >= T]
+
+            if idx_train.size == 0 and idx_fore.size == 0:
+                continue
+
+            obs_val = float(np.max(y_obs[idx_train])) if idx_train.size > 0 else float("nan")
+
+            if idx_fore.size == 0:
+                yrs.append(int(yy))
+                obs_list.append(obs_val)
+                med_list.append(float("nan"))
+                lo_list.append(float("nan"))
+                hi_list.append(float("nan"))
+                continue
+
+            m0 = float(np.max(y_obs_model[idx_train])) if idx_train.size > 0 else -float("inf")
+            pos = (idx_fore - T).astype(int)
+
+            draws_block = np.zeros((S * rep_per_draw_max,), float)
+            for s in range(S):
+                mus = mu_fore[s, pos]
+                for r in range(int(rep_per_draw_max)):
+                    zf = _sample_max_product_cdf(rng, mus, float(sigma[s]), float(xi[s]))
+                    draws_block[s * rep_per_draw_max + r] = max(m0, float(zf))
+
+            draws_plot = -draws_block if minima else draws_block
+
+            yrs.append(int(yy))
+            obs_list.append(obs_val)
+            med_list.append(float(np.quantile(draws_plot, 0.5)))
+            lo_list.append(float(np.quantile(draws_plot, lo_q)))
+            hi_list.append(float(np.quantile(draws_plot, hi_q)))
+
+        annual = {
+            "years": np.asarray(yrs, int),
+            "obs": np.asarray(obs_list, float),
+            "med": np.asarray(med_list, float),
+            "lo": np.asarray(lo_list, float),
+            "hi": np.asarray(hi_list, float),
+        }
+
+    # =============================================================================
+    # Meteorological seasons (ONLY for monthly data with dates)
+    # =============================================================================
+    seasons: Dict[str, Any] = {}
+    if period == 12 and dates_full is not None and years_full is not None and months_full is not None:
+        labels: List[Tuple[int, str]] = []
+        for dt in dates_full:
+            sy = _season_year(int(dt.year), int(dt.month))
+            sl = _season_label(int(dt.month))
+            labels.append((sy, sl))
+
+        # sort season blocks chronologically
+        order = {"DJF": 0, "MAM": 1, "JJA": 2, "SON": 3}
+        uniq = _sorted_unique(labels)
+        uniq = sorted(uniq, key=lambda x: (int(x[0]) * 4 + order[str(x[1])]))
+
+        season_years: List[int] = []
+        season_names: List[str] = []
+        season_x: List[float] = []
+        obs_vals: List[float] = []
+        med_vals: List[float] = []
+        lo_vals: List[float] = []
+        hi_vals: List[float] = []
+
+        for (sy, sl) in uniq:
+            idx_all = np.array([i for i, lab in enumerate(labels) if lab == (sy, sl)], dtype=int)
+            idx_train = idx_all[idx_all < T]
+            idx_fore = idx_all[idx_all >= T]
+
+            if idx_train.size == 0 and idx_fore.size == 0:
+                continue
+
+            obs_val = float(np.max(y_obs[idx_train])) if idx_train.size > 0 else float("nan")
+
+            # aligned padding when no forecast in that season-block
+            if idx_fore.size == 0:
+                season_years.append(int(sy))
+                season_names.append(str(sl))
+                season_x.append(float(sy) + float(order[str(sl)]) / 4.0)
+
+                obs_vals.append(obs_val)
+                med_vals.append(float("nan"))
+                lo_vals.append(float("nan"))
+                hi_vals.append(float("nan"))
+                continue
+
+            m0 = float(np.max(y_obs_model[idx_train])) if idx_train.size > 0 else -float("inf")
+            pos = (idx_fore - T).astype(int)
+
+            draws_block = np.zeros((S * rep_per_draw_max,), float)
+            for s in range(S):
+                mus = mu_fore[s, pos]
+                for r in range(int(rep_per_draw_max)):
+                    zf = _sample_max_product_cdf(rng, mus, float(sigma[s]), float(xi[s]))
+                    draws_block[s * rep_per_draw_max + r] = max(m0, float(zf))
+
+            draws_plot = -draws_block if minima else draws_block
+
+            season_years.append(int(sy))
+            season_names.append(str(sl))
+            season_x.append(float(sy) + float(order[str(sl)]) / 4.0)
+
+            obs_vals.append(obs_val)
+            med_vals.append(float(np.quantile(draws_plot, 0.5)))
+            lo_vals.append(float(np.quantile(draws_plot, lo_q)))
+            hi_vals.append(float(np.quantile(draws_plot, hi_q)))
+
+        seasons = {
+            "season_x": np.asarray(season_x, float),         # sequential axis for seasonal_all plot
+            "season_year": np.asarray(season_years, int),
+            "season_name": np.asarray(season_names, object),
+            "obs": np.asarray(obs_vals, float),
+            "med": np.asarray(med_vals, float),
+            "lo": np.asarray(lo_vals, float),
+            "hi": np.asarray(hi_vals, float),
+        }
+
+    return {
+        "period": int(period),
+        "T": int(T),
+        "h": int(h),
+        "minima": bool(minima),
+        "dates_full": dates_full,  # may be None (not npz-serializable; kept for interactive use)
+        "x_train": np.asarray(x_train, float),
+        "x_fore": np.asarray(x_fore, float),
+        "y_obs": np.asarray(y_obs, float),
+        "y_fore_samples": np.asarray(y_fore_samples, float),
+        "mu_fore": np.asarray(mu_fore, float),  # model scale
+        "annual": annual,
+        "seasons": seasons,
+    }
 
 
-# ---------------------------------------------------------------------
-# Return levels / return periods (block + yearly)
-# ---------------------------------------------------------------------
-def compute_return_levels_block(
-    mu_all: np.ndarray,
-    sigma: np.ndarray,
-    xi: np.ndarray,
-    Ns: List[float],
-) -> Dict[float, np.ndarray]:
-    """
-    Block return levels: z_{N,t} with G_t(z_{N,t}) = 1 - 1/N.
+# =============================================================================
+# Plotting (only observed + forecast median/band)
+# =============================================================================
+def _plot_fine(fc: Dict[str, Any], out_path: str, *, title: str, alpha: float) -> None:
+    y_obs = np.asarray(fc["y_obs"], float)
+    x_train = np.asarray(fc["x_train"], float)
+    x_fore = np.asarray(fc["x_fore"], float)
+    y_fore = np.asarray(fc["y_fore_samples"], float)
 
-    Returns:
-      dict[N] -> zN (S, T_total)
-    """
-    S_draws, T_total = mu_all.shape
-    sigma_exp = np.repeat(sigma[:, None], T_total, axis=1)
-    xi_exp = np.repeat(xi[:, None], T_total, axis=1)
-
-    out: Dict[float, np.ndarray] = {}
-    for N in Ns:
-        zN = _gev_return_level_block(mu_all, sigma_exp, xi_exp, N=float(N))
-        out[float(N)] = zN
-    return out
-
-def compute_return_levels_yearly(
-    mu_all: np.ndarray,
-    sigma: np.ndarray,
-    xi: np.ndarray,
-    Ns_year: List[float],
-    blocks_per_year: int,
-    max_iter: int = 80,
-) -> Dict[float, np.ndarray]:
-    """
-    Annual (coarse-grained) return levels for annual maxima M_j = max_{t in year j} Y_t:
-
-        P(M_j > z_{N,j}^{ann}) = 1/N
-        <=> prod_{t in year j} G_t(z_{N,j}^{ann}) = 1 - 1/N.
-
-    Uses monotone bisection (vectorized over draws and years).
-
-    Returns:
-      dict[N] -> z_ann (S, Y_total), where Y_total = floor(T_total / blocks_per_year).
-    """
-    if blocks_per_year < 1:
-        raise ValueError("blocks_per_year must be >= 1.")
-
-    S_draws, T_total = mu_all.shape
-    Y_total = T_total // blocks_per_year
-    if Y_total <= 0:
-        raise ValueError("Not enough blocks to form a single year.")
-
-    # Truncate to full years for grouping
-    T_use = Y_total * blocks_per_year
-    mu_y = mu_all[:, :T_use].reshape(S_draws, Y_total, blocks_per_year)
-
-    sig_y = sigma[:, None, None]
-    xi_y = xi[:, None, None]
-
-    # Helpful summaries for bracketing
-    mu_min = np.min(mu_y, axis=2)  # (S, Y)
-    mu_max = np.max(mu_y, axis=2)  # (S, Y)
-
-    # Base brackets
-    lo0 = mu_min - 20.0 * sigma[:, None]
-
-    # Upper brackets depend on sign of xi (finite endpoint when xi<0)
-    tol = 1e-8
-    xi_s = xi[:, None]  # (S, 1)
-    neg_xi = xi_s < -tol
-
-    # endpoint per block when xi<0: mu - sigma/xi
-    # (sigma/xi is negative, so mu - sigma/xi > mu)
-    endpoints = mu_y - (sigma[:, None, None] / np.clip(xi[:, None, None], -np.inf, -tol))
-    hi0 = mu_max + 20.0 * sigma[:, None]  # default for xi>=0
-    if np.any(neg_xi):
-        hi0[neg_xi] = np.max(endpoints[neg_xi[:, :, None]], axis=2) - 1e-10  # near max endpoint
-
-    def _prod_cdf(z_sy: np.ndarray) -> np.ndarray:
-        # z_sy: (S,Y) -> broadcast to (S,Y,B)
-        F = _gev_cdf(z_sy[:, :, None], mu_y, sig_y, xi_y)
-        return np.prod(F, axis=2)
-
-    out: Dict[float, np.ndarray] = {}
-    for N in Ns_year:
-        N = float(N)
-        target = 1.0 - 1.0 / max(N, 1.0 + 1e-12)
-        target = float(np.clip(target, 1e-12, 1.0 - 1e-12))
-
-        lo = lo0.copy()
-        hi = hi0.copy()
-
-        # Ensure hi brackets the target when xi>=0 by expanding upward if needed
-        # (for xi<0, hi is already near the endpoint -> prod ~ 1)
-        for k in range(15):
-            prod_hi = _prod_cdf(hi)
-            bad = (prod_hi < target) & (~neg_xi)  # only expand for nonnegative xi
-            if not np.any(bad):
-                break
-            hi[bad] += (2.0 ** k) * 10.0 * sigma[bad[:, 0]]  # sigma broadcasted per draw
-
-        # Bisection
-        for _ in range(max_iter):
-            mid = 0.5 * (lo + hi)
-            prod_mid = _prod_cdf(mid)
-            go_up = prod_mid < target  # need larger z -> move lo up
-            lo[go_up] = mid[go_up]
-            hi[~go_up] = mid[~go_up]
-
-        out[N] = hi  # (S,Y)
-
-    return out
-
-
-def compute_return_periods_block(
-    mu_all: np.ndarray,
-    sigma: np.ndarray,
-    xi: np.ndarray,
-    us: List[float],
-) -> Dict[float, np.ndarray]:
-    """
-    Block return periods for fixed thresholds u:
-
-        p_t(u) = P(Y_t > u) = 1 - G_t(u)
-        R_t(u) = 1 / p_t(u)
-
-    Returns:
-      dict[u] -> R_t(u) (S, T_total)
-    """
-    S_draws, T_total = mu_all.shape
-    sigma_exp = np.repeat(sigma[:, None], T_total, axis=1)
-    xi_exp = np.repeat(xi[:, None], T_total, axis=1)
-
-    out: Dict[float, np.ndarray] = {}
-    for u in us:
-        u = float(u)
-        u_arr = np.full((S_draws, T_total), u)
-        F_u = _gev_cdf(u_arr, mu_all, sigma_exp, xi_exp)
-        p_exc = np.clip(1.0 - F_u, 1e-12, 1.0)
-        out[u] = 1.0 / p_exc
-    return out
-
-
-def compute_return_periods_yearly(
-    mu_all: np.ndarray,
-    sigma: np.ndarray,
-    xi: np.ndarray,
-    us: List[float],
-    blocks_per_year: int,
-) -> Dict[float, np.ndarray]:
-    """
-    Yearly exceedance probabilities and return periods for fixed thresholds u.
-
-    For each year j (group of blocks_per_year consecutive blocks),
-        p_j(u) = 1 - ∏_{t in year j} G_t(u),
-        R_j(u) = 1 / p_j(u).
-
-    Returns:
-      dict[u] -> R_j(u) of shape (S, Y_total), Y_total = floor(T_total / blocks_per_year).
-    """
-    if blocks_per_year < 1:
-        raise ValueError("blocks_per_year must be >= 1.")
-    S_draws, T_total = mu_all.shape
-    Y_total = T_total // blocks_per_year
-    T_use = Y_total * blocks_per_year
-
-    sigma_exp = np.repeat(sigma[:, None], T_use, axis=1)
-    xi_exp = np.repeat(xi[:, None], T_use, axis=1)
-    mu_use = mu_all[:, :T_use]
-
-    out: Dict[float, np.ndarray] = {}
-    for u in us:
-        u = float(u)
-        u_arr = np.full((S_draws, T_use), u)
-        F_u = _gev_cdf(u_arr, mu_use, sigma_exp, xi_exp)  # (S, T_use)
-        F_y = F_u.reshape(S_draws, Y_total, blocks_per_year)  # (S,Y,B)
-        prod_F = np.prod(F_y, axis=2)  # (S,Y)
-        p_y = np.clip(1.0 - prod_F, 1e-12, 1.0)
-        out[u] = 1.0 / p_y
-    return out
-
-
-# ---------------------------------------------------------------------
-# Summaries + plotting
-# ---------------------------------------------------------------------
-def summarize_ribbon(arr_2d: np.ndarray, level: float = 0.9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    lo = (1 - level) / 2.0
-    hi = 1.0 - lo
-    return (
-        np.quantile(arr_2d, 0.5, axis=0),
-        np.quantile(arr_2d, lo, axis=0),
-        np.quantile(arr_2d, hi, axis=0),
-    )
-
-
-def plot_return_level_ribbon(
-    z: np.ndarray,
-    label: str,
-    level: float,
-    hist_len: int,
-    xlab: str,
-    title: str,
-    save_path: Optional[str] = None,
-    show: bool = True,
-):
-    """
-    z: (S, L) return level trajectory (block or yearly).
-    hist_len: number of historical indices (blocks or years) for shading forecast region.
-    """
-    _, L = z.shape
-    ctr, lo, hi = summarize_ribbon(z, level=level)
-    t = np.arange(L)
+    lo, hi = _tail_quantiles(alpha)
+    med = np.quantile(y_fore, 0.5, axis=0)
+    qlo = np.quantile(y_fore, lo, axis=0)
+    qhi = np.quantile(y_fore, hi, axis=0)
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-    ax.plot(t, ctr, lw=1.6, label=f"median {label}")
-    ax.fill_between(t, lo, hi, alpha=0.25, label=f"{int(round(level * 100))}% band")
+    ax.plot(x_train, y_obs, lw=1.2, label="observed")
 
-    if hist_len < L:
-        ax.axvspan(hist_len - 0.5, L - 0.5, color="grey", alpha=0.15, label="forecast")
+    ax.fill_between(x_fore, qlo, qhi, alpha=0.2, label="forecast band")
+    ax.plot(x_fore, med, lw=2.0, label="forecast median")
+
+    if x_fore.size:
+        ax.axvline(x_fore[0], lw=1.0, alpha=0.7)
 
     ax.set_title(title)
-    ax.set_xlabel(xlab)
-    ax.set_ylabel("return level")
+    ax.grid(True, alpha=0.3)
     ax.legend()
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"[save] {save_path}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
 
 
-def plot_return_period_ribbon(
-    R: np.ndarray,
-    label: str,
-    level: float,
-    hist_len: int,
-    xlab: str,
-    title: str,
-    save_path: Optional[str] = None,
-    show: bool = True,
-):
-    """
-    R: (S, L) return period trajectory (block or yearly).
-    """
-    _, L = R.shape
-    ctr, lo, hi = summarize_ribbon(R, level=level)
-    t = np.arange(L)
+def _plot_annual(annual: Dict[str, np.ndarray], out_path: str, *, title: str) -> None:
+    years = np.asarray(annual["years"], int)
+    obs = np.asarray(annual["obs"], float)
+    med = np.asarray(annual["med"], float)
+    lo = np.asarray(annual["lo"], float)
+    hi = np.asarray(annual["hi"], float)
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 4))
-    ax.plot(t, ctr, lw=1.6, label=f"median {label}")
-    ax.fill_between(t, lo, hi, alpha=0.25, label=f"{int(round(level * 100))}% band")
-    ax.set_yscale("log")
 
-    if hist_len < L:
-        ax.axvspan(hist_len - 0.5, L - 0.5, color="grey", alpha=0.15, label="forecast")
+    mask_obs = np.isfinite(obs)
+    ax.plot(years[mask_obs], obs[mask_obs], lw=1.5, label="observed")
 
-    ax.set_xlabel(xlab)
-    ax.set_ylabel("return period (log scale)")
+    mask_fc = np.isfinite(med)
+    if np.any(mask_fc):
+        ax.fill_between(years[mask_fc], lo[mask_fc], hi[mask_fc], alpha=0.2, label="forecast band")
+        ax.plot(years[mask_fc], med[mask_fc], lw=2.0, label="forecast median")
+        ax.axvline(years[mask_fc][0], lw=1.0, alpha=0.7)
+
     ax.set_title(title)
+    ax.grid(True, alpha=0.3)
     ax.legend()
-    plt.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
-        print(f"[save] {save_path}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
+def _plot_seasonal_all(seasons: Dict[str, Any], out_path: str, *, title: str) -> None:
+    sx = np.asarray(seasons["season_x"], float)
+    obs = np.asarray(seasons["obs"], float)
+    med = np.asarray(seasons["med"], float)
+    lo = np.asarray(seasons["lo"], float)
+    hi = np.asarray(seasons["hi"], float)
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+
+    mask_obs = np.isfinite(obs)
+    ax.plot(sx[mask_obs], obs[mask_obs], lw=1.3, label="observed")
+
+    mask_fc = np.isfinite(med)
+    if np.any(mask_fc):
+        ax.fill_between(sx[mask_fc], lo[mask_fc], hi[mask_fc], alpha=0.2, label="forecast band")
+        ax.plot(sx[mask_fc], med[mask_fc], lw=2.0, label="forecast median")
+        ax.axvline(sx[mask_fc][0], lw=1.0, alpha=0.7)
+
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+def _plot_season_by_name(seasons: Dict[str, Any], season_name: str, out_path: str, *, title: str) -> None:
+    sy = np.asarray(seasons["season_year"], int)
+    sn = np.asarray(seasons["season_name"], object)
+    obs = np.asarray(seasons["obs"], float)
+    med = np.asarray(seasons["med"], float)
+    lo = np.asarray(seasons["lo"], float)
+    hi = np.asarray(seasons["hi"], float)
+
+    mask_name = np.array([str(x) == season_name for x in sn], dtype=bool)
+    if not np.any(mask_name):
+        return
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 4))
+
+    mask_obs = mask_name & np.isfinite(obs)
+    ax.plot(sy[mask_obs], obs[mask_obs], lw=1.3, label="observed")
+
+    mask_fc = mask_name & np.isfinite(med)
+    if np.any(mask_fc):
+        ax.fill_between(sy[mask_fc], lo[mask_fc], hi[mask_fc], alpha=0.2, label="forecast band")
+        ax.plot(sy[mask_fc], med[mask_fc], lw=2.0, label="forecast median")
+        ax.axvline(sy[mask_fc][0], lw=1.0, alpha=0.7)
+
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+
+
+# =============================================================================
+# CLI (mirrors plotter: --target optional, else find_latest_run(--root))
+# =============================================================================
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
         description=(
-            "Compute time-varying return levels and return periods from a structural DGEV posterior, "
-            "including (i) block-scale 'instantaneous' quantities and (ii) yearly coarse-grained quantities."
+            "DGEV posterior predictive forecasting (fine + annual + meteorological seasons).\n"
+            "Latest posterior discovery mirrors dgev_laplace_plotter.py:\n"
+            "  - if --target omitted, uses find_latest_run(root=--root)\n"
+            "  - load_posterior(run_path) provides draws/meta/npz_path\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--target",
-        type=str,
-        default=None,
-        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.",
-    )
-    parser.add_argument(
-        "--root",
-        type=str,
-        default="results/simulations/DGEV_NCP_LASSO",
-        help="Search root when --target is omitted.",
-    )
-    parser.add_argument(
-        "--horizon",
-        type=int,
-        default=0,
-        help="Forecast horizon H in blocks (H=0 → no forecasting).",
-    )
-    parser.add_argument(
-        "--blocks-per-year",
-        type=int,
-        default=None,
-        help="Override number of blocks per calendar year for coarse-graining (default: meta['period']).",
-    )
-    parser.add_argument(
-        "--rl-N",
-        type=str,
-        default="20,50,100",
-        help="Comma-separated return periods N for return levels (computed both block-scale and yearly).",
-    )
-    parser.add_argument(
-        "--rp-u",
-        type=str,
-        default="10,20",
-        help="Comma-separated thresholds u for return periods (computed both block-scale and yearly).",
-    )
 
-    parser.add_argument("--yearly", dest="yearly", action="store_true", help="Compute yearly coarse-grained quantities.")
-    parser.add_argument("--block-only", dest="yearly", action="store_false", help="Skip yearly coarse-graining.")
-    parser.set_defaults(yearly=True)
+    parser.add_argument("--target", type=str, default=None,
+                        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.")
+    parser.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO",
+                        help="Search root if --target is omitted.")
 
-    parser.add_argument(
-        "--level",
-        type=float,
-        default=0.90,
-        help="Credible band level for ribbons.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=123,
-        help="Random seed for forecasting innovations.",
-    )
-    parser.add_argument("--show", dest="show", action="store_true", help="Show figures interactively.")
-    parser.add_argument("--no-show", dest="show", action="store_false", help="Do not show figures.")
-    parser.set_defaults(show=True)
+    parser.add_argument("--h", type=int, default=60, help="Forecast horizon in native block units.")
+    parser.add_argument("--alpha", type=float, default=0.1, help="Band tail prob (alpha=0.1 -> 80% band).")
+    parser.add_argument("--n-draws", type=int, default=None, help="Subsample this many posterior draws (default all).")
+    parser.add_argument("--rep-per-draw", type=int, default=1, help="Fine predictive replicates per posterior draw.")
+    parser.add_argument("--rep-per-draw-max", type=int, default=1, help="Block-max replicates per posterior draw.")
+    parser.add_argument("--seed", type=int, default=40)
+    parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
 
-    parser.add_argument(
-        "--out",
-        type=str,
-        default=None,
-        help="Directory to save figures and derived arrays. Default: <run>/returns",
-    )
+    parser.add_argument("--out", type=str, default=None,
+                        help="Output dir. Default: <run>/forecasts")
 
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--minima", action="store_true", help="Force minima=True (back-transform stored negated series).")
+    g.add_argument("--maxima", action="store_true", help="Force minima=False (no back-transform).")
+
+    parser.add_argument("--save-npz", action="store_true", default=True, help="Save forecast_summary.npz")
     args = parser.parse_args()
 
-    Ns = _parse_csv_floats(args.rl_N) or []
-    us = _parse_csv_floats(args.rp_u) or []
-
-    # Resolve run path via posterior_bundle
     run_path = args.target
     if run_path is None:
-        print(f"[info] --target not provided; searching latest posterior under --root={args.root!r} ...")
+        print(f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ...")
         run_path = find_latest_run(root=args.root)
         if run_path is None:
             print(f"[error] No 'posterior.npz' found under {args.root!r}. Provide --target or change --root.")
@@ -690,142 +883,109 @@ if __name__ == "__main__":
     bundle = load_posterior(run_path)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    out_dir = args.out or os.path.join(os.path.dirname(npz_path), "returns")
+    out_dir = args.out or os.path.join(os.path.dirname(npz_path), "forecasts")
     _ensure_dir(out_dir)
-    print(f"[info] saving outputs to: {out_dir}")
+    print(f"[info] saving forecasts to: {out_dir}")
 
-    # Forecast μ, get σ, ξ
-    print(f"[info] forecasting horizon H={int(args.horizon)} blocks ...")
-    mu_all, sigma, xi = forecast_mu_and_params(
+    # minima override (like plotter)
+    if args.minima:
+        minima = True
+    elif args.maxima:
+        minima = False
+    else:
+        minima = _detect_minima_from_meta(meta)
+        if minima:
+            print("[info] minima=True detected from meta → back-transforming forecasts for plotting.")
+
+    rng = np.random.default_rng(int(args.seed))
+
+    fc = forecast_from_bundle(
         draws=draws,
         meta=meta,
-        horizon=int(args.horizon),
-        seed=int(args.seed),
+        h=int(args.h),
+        rng=rng,
+        n_draws=args.n_draws,
+        rep_per_draw=int(args.rep_per_draw),
+        rep_per_draw_max=int(args.rep_per_draw_max),
+        alpha=float(args.alpha),
+        minima=bool(minima),
     )
-    S_draws, T_total = mu_all.shape
-    T_hist = int(draws["mu"].shape[1])
 
-    # Coarse-graining settings
-    season_period = int(meta.get("period", 1))
-    blocks_per_year = int(args.blocks_per_year) if args.blocks_per_year is not None else season_period
-    if blocks_per_year < 1:
-        raise ValueError("blocks_per_year must be >= 1.")
-    Y_total = T_total // blocks_per_year
-    Y_hist = T_hist // blocks_per_year
+    ext_word = "min" if fc["minima"] else "max"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # -----------------------------------------------------------------
-    # 1) Return levels (block + yearly)
-    # -----------------------------------------------------------------
-    if Ns:
-        # Block
-        print(f"[info] computing BLOCK return levels for N ∈ {Ns} ...")
-        rl_block = compute_return_levels_block(mu_all, sigma, xi, Ns=Ns)
+    # fine forecast plot
+    _plot_fine(
+        fc,
+        os.path.join(out_dir, f"forecast_fine_{stamp}.png"),
+        title=f"DGEV fine forecast (h={int(args.h)})",
+        alpha=float(args.alpha),
+    )
 
-        for N in Ns:
-            N = float(N)
-            zN = rl_block[N]
-            np.savez_compressed(
-                os.path.join(out_dir, f"return_levels_block_N{int(round(N))}.npz"),
-                z=zN,
-                N=N,
-                T_total=T_total,
-                T_hist=T_hist,
-            )
-            plot_return_level_ribbon(
-                z=zN,
-                label=f"z_N (N={N:g})",
-                level=float(args.level),
-                hist_len=T_hist,
-                xlab="time index (blocks)",
-                title=f"Block return level z_N(t), N={N:g}",
-                save_path=os.path.join(out_dir, f"return_levels_block_N{int(round(N))}.png"),
-                show=bool(args.show),
+    # annual plot (always available)
+    _plot_annual(
+        fc["annual"],
+        os.path.join(out_dir, f"forecast_annual_{ext_word}_{stamp}.png"),
+        title=f"DGEV annual-{ext_word} forecast",
+    )
+
+    # seasonal plots only if computed
+    seasons = fc.get("seasons", {})
+    if seasons:
+        _plot_seasonal_all(
+            seasons,
+            os.path.join(out_dir, f"forecast_seasonal_all_{ext_word}_{stamp}.png"),
+            title=f"DGEV seasonal-{ext_word} forecast (all seasons sequential)",
+        )
+        for s in ["DJF", "MAM", "JJA", "SON"]:
+            _plot_season_by_name(
+                seasons,
+                s,
+                os.path.join(out_dir, f"forecast_seasonal_{s}_{ext_word}_{stamp}.png"),
+                title=f"DGEV seasonal-{ext_word} forecast ({s})",
             )
 
-        # Yearly
-        if args.yearly and blocks_per_year >= 1:
-            print(f"[info] computing YEARLY return levels for N ∈ {Ns} (blocks_per_year={blocks_per_year}) ...")
-            rl_year = compute_return_levels_yearly(
-                mu_all, sigma, xi, Ns_year=Ns, blocks_per_year=blocks_per_year
-            )
+    # save NPZ summary (dates_full is not saved; everything else is)
+    if args.save_npz:
+        npz_out = os.path.join(out_dir, f"forecast_summary_{stamp}.npz")
+        payload: Dict[str, Any] = {
+            "period": np.asarray([fc["period"]], int),
+            "T": np.asarray([fc["T"]], int),
+            "h": np.asarray([fc["h"]], int),
+            "minima": np.asarray([fc["minima"]], bool),
+            "x_train": np.asarray(fc["x_train"], float),
+            "x_fore": np.asarray(fc["x_fore"], float),
+            "y_obs": np.asarray(fc["y_obs"], float),
+            "y_fore_samples": np.asarray(fc["y_fore_samples"], float),
+            "mu_fore": np.asarray(fc["mu_fore"], float),
+        }
+        for k, v in fc["annual"].items():
+            payload[f"annual_{k}"] = np.asarray(v)
+        if seasons:
+            for k, v in seasons.items():
+                payload[f"seasons_{k}"] = np.asarray(v)
 
-            for N in Ns:
-                N = float(N)
-                zAnn = rl_year[N]  # (S, Y_total)
-                np.savez_compressed(
-                    os.path.join(out_dir, f"return_levels_yearly_N{int(round(N))}.npz"),
-                    z=zAnn,
-                    N=N,
-                    blocks_per_year=blocks_per_year,
-                    Y_total=Y_total,
-                    Y_hist=Y_hist,
-                )
-                plot_return_level_ribbon(
-                    z=zAnn,
-                    label=f"z_N^ann (N={N:g})",
-                    level=float(args.level),
-                    hist_len=Y_hist,
-                    xlab="year index",
-                    title=f"Annual return level (coarse-grained), N={N:g}",
-                    save_path=os.path.join(out_dir, f"return_levels_yearly_N{int(round(N))}.png"),
-                    show=bool(args.show),
-                )
+        np.savez_compressed(npz_out, **payload)
 
-    # -----------------------------------------------------------------
-    # 2) Return periods for thresholds (block + yearly)
-    # -----------------------------------------------------------------
-    if us:
-        print(f"[info] computing BLOCK return periods for thresholds u ∈ {us} ...")
-        rp_block = compute_return_periods_block(mu_all, sigma, xi, us=us)
+        meta_out = {
+            "source_run_path": str(run_path),
+            "npz_path": str(npz_path),
+            "created": stamp,
+            "alpha": float(args.alpha),
+            "seed": int(args.seed),
+            "n_draws": None if args.n_draws is None else int(args.n_draws),
+            "rep_per_draw": int(args.rep_per_draw),
+            "rep_per_draw_max": int(args.rep_per_draw_max),
+            "minima_used": bool(minima),
+            "notes": {
+                "seasonal_grouping": "meteorological seasons only when period==12 and dates are available",
+                "annual_grouping": "calendar-year if dates available else blocks of length=period",
+                "plot_policy": "observed + forecast median + forecast band only (no fit ribbons)",
+            },
+        }
+        with open(npz_out.replace(".npz", ".meta.json"), "w", encoding="utf-8") as f:
+            json.dump(meta_out, f, indent=2)
 
-        for u in us:
-            u = float(u)
-            R_t = rp_block[u]
-            np.savez_compressed(
-                os.path.join(out_dir, f"return_periods_block_u{u:g}.npz"),
-                R=R_t,
-                u=u,
-                T_total=T_total,
-                T_hist=T_hist,
-            )
-            plot_return_period_ribbon(
-                R=R_t,
-                label=f"R_t(u={u:g})",
-                level=float(args.level),
-                hist_len=T_hist,
-                xlab="time index (blocks)",
-                title=f"Block return period for threshold u={u:g}",
-                save_path=os.path.join(out_dir, f"return_periods_block_u{u:g}.png"),
-                show=bool(args.show),
-            )
+        print(f"[save] {npz_out}")
 
-        if args.yearly and blocks_per_year >= 1:
-            if Y_total <= 0:
-                print("[warn] not enough blocks to form yearly aggregation; skipping yearly return periods.")
-            else:
-                print(f"[info] computing YEARLY return periods for thresholds u ∈ {us} (blocks_per_year={blocks_per_year}) ...")
-                rp_year = compute_return_periods_yearly(mu_all, sigma, xi, us=us, blocks_per_year=blocks_per_year)
-
-                for u in us:
-                    u = float(u)
-                    R_y = rp_year[u]  # (S, Y_total)
-                    np.savez_compressed(
-                        os.path.join(out_dir, f"return_periods_yearly_u{u:g}.npz"),
-                        R=R_y,
-                        u=u,
-                        blocks_per_year=blocks_per_year,
-                        Y_total=Y_total,
-                        Y_hist=Y_hist,
-                    )
-                    plot_return_period_ribbon(
-                        R=R_y,
-                        label=f"R_j(u={u:g})",
-                        level=float(args.level),
-                        hist_len=Y_hist,
-                        xlab="year index",
-                        title=f"Annual return period (coarse-grained) for threshold u={u:g}",
-                        save_path=os.path.join(out_dir, f"return_periods_yearly_u{u:g}.png"),
-                        show=bool(args.show),
-                    )
-
-    print("[done] block + yearly return levels/periods computed and saved.")
+    print("[done] forecasts written.")

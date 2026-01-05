@@ -8,7 +8,7 @@ import os
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import warnings
@@ -39,6 +39,22 @@ except ImportError:
         parse_date,
         parse_csv_floats,
     )
+
+
+# =============================================================================
+# Small metadata helpers
+# =============================================================================
+def _iso_or_str(x: Any) -> str:
+    """
+    Best-effort conversion for dates to an ISO-like string for metadata.
+    Works with datetime/date-like objects from parse_date(), Periods, strings, etc.
+    """
+    if x is None:
+        return ""
+    try:
+        return str(x.isoformat())  # datetime/date
+    except Exception:
+        return str(x)
 
 
 # =============================================================================
@@ -123,6 +139,7 @@ class DGEVLaplaceNCP:
       - overflow-safe progress + loglike handling
       - block-level reject/restore so "bad" draws never poison the chain
       - last-good snapshot rescue
+      - start_date metadata persistence (optional)
     """
 
     def __init__(
@@ -130,6 +147,7 @@ class DGEVLaplaceNCP:
         y: np.ndarray,
         period: int,
         *,
+        start_date: Optional[Any] = None,
         alpha0: float = 0.0,
         beta0: float = 0.0,
         gamma0: Optional[Sequence[float]] = None,  # length p-1 (newest-first)
@@ -153,6 +171,9 @@ class DGEVLaplaceNCP:
             raise ValueError("y must have length >= 1")
         if self.period < 2:
             raise ValueError("period must be >= 2")
+
+        # optional metadata (e.g. simulation start date or data start date)
+        self.start_date = None if start_date is None else _iso_or_str(start_date)
 
         self.priors = priors
         self.cfg = cfg
@@ -247,12 +268,25 @@ class DGEVLaplaceNCP:
         self.true_gamma_t: Optional[np.ndarray] = None
 
     # --------------------- truth overlays (optional) --------------------- #
-    def set_truth(self, *, sigma: Optional[float] = None, xi: Optional[float] = None, Q: Optional[Tuple[float, float, float]] = None) -> None:
+    def set_truth(
+        self,
+        *,
+        sigma: Optional[float] = None,
+        xi: Optional[float] = None,
+        Q: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
         self.true_sigma = None if sigma is None else float(sigma)
         self.true_xi = None if xi is None else float(xi)
         self.true_Q = None if Q is None else np.asarray(Q, float)
 
-    def set_truth_paths(self, *, mu: Optional[np.ndarray] = None, alpha: Optional[np.ndarray] = None, beta: Optional[np.ndarray] = None, gamma: Optional[np.ndarray] = None) -> None:
+    def set_truth_paths(
+        self,
+        *,
+        mu: Optional[np.ndarray] = None,
+        alpha: Optional[np.ndarray] = None,
+        beta: Optional[np.ndarray] = None,
+        gamma: Optional[np.ndarray] = None,
+    ) -> None:
         self.true_mu_t = None if mu is None else np.asarray(mu, float)
         self.true_alpha_t = None if alpha is None else np.asarray(alpha, float)
         self.true_beta_t = None if beta is None else np.asarray(beta, float)
@@ -462,7 +496,7 @@ class DGEVLaplaceNCP:
         )
 
     # ----------------------------- JOINT regression update (FS style) ----------------------------- #
-    def update_theta_fs(self, *, z_mu: np.ndarray, R_t: np.ndarray) -> None:
+    def update_delta(self, *, z_mu: np.ndarray, R_t: np.ndarray) -> None:
         T = self.T
         t_c = self._t1 - self._tbar
 
@@ -513,8 +547,7 @@ class DGEVLaplaceNCP:
         tb = float(self._tbar)
 
         Sigma_ab = np.array(
-            [[P0a + (tb * tb) * P0b, tb * P0b],
-             [tb * P0b,              P0b]],
+            [[P0a + (tb * tb) * P0b, tb * P0b], [tb * P0b, P0b]],
             dtype=float,
         )
         Sigma_ab = symmetrize(Sigma_ab) + 1e-15 * np.eye(2)
@@ -523,8 +556,10 @@ class DGEVLaplaceNCP:
 
         if self.K_gamma > 0:
             Pg = max(float(self.priors.P0_gamma), 1e-12)
-            prior_prec[idx_gamma0 : idx_gamma0 + self.K_gamma,
-                       idx_gamma0 : idx_gamma0 + self.K_gamma] = (1.0 / Pg) * np.eye(self.K_gamma)
+            prior_prec[
+                idx_gamma0 : idx_gamma0 + self.K_gamma,
+                idx_gamma0 : idx_gamma0 + self.K_gamma,
+            ] = (1.0 / Pg) * np.eye(self.K_gamma)
 
         eps = 1e-16
         prior_prec[idx_s_alpha, idx_s_alpha] = 1.0 / max(self.sigma2_eff * self.tau_alpha, eps)
@@ -706,12 +741,12 @@ class DGEVLaplaceNCP:
                 # hard rescue: restore last good
                 self._restore(last_good)
 
-            # (C) theta regression draw: retry/restore if insane
-            ok_theta = self._try_block(lambda: self.update_theta_fs(z_mu=z_mu, R_t=R_t))
+            # (C) delta regression draw
+            ok_theta = self._try_block(lambda: self.update_delta(z_mu=z_mu, R_t=R_t))
             if not ok_theta:
                 self._restore(last_good)
 
-            # (D) sign switches (always safe, but could push s over cap; handle)
+            # (D) sign switches
             snap_before_sign = self._pack()
             self.random_sign_switches()
             self._refresh_cp_from_ncp()
@@ -810,6 +845,8 @@ class DGEVLaplaceNCP:
             "ffbs_C0_scale": float(self._ffbs_C0_scale),
             "ffbs_C0_A": float(self._ffbs_C0_A),
             "sigma2_eff": float(self.sigma2_eff),
+            # NEW: persist start_date (if provided)
+            "start_date": self.start_date,
             "safety": {
                 "max_tries_block": int(self.cfg.max_tries_block),
                 "s_cap": float(self.cfg.s_cap),
@@ -908,6 +945,7 @@ def main() -> None:
 
     args = p.parse_args()
     start_date = parse_date(args.start_date)
+    start_date_meta = _iso_or_str(start_date)
 
     K = int(args.period) - 1
     m0_season = parse_csv_floats(args.m0_season, expected_len=K) or ([2.0] * K)
@@ -973,6 +1011,7 @@ def main() -> None:
     sampler = DGEVLaplaceNCP(
         y=y,
         period=int(args.period),
+        start_date=start_date,  # NEW: pass through so save_posterior writes it
         alpha0=float(args.m0_level),
         beta0=float(args.m0_trend),
         gamma0=gamma0_init,
@@ -1020,6 +1059,8 @@ def main() -> None:
         out_npz_path=os.path.join(out_dir, "posterior.npz"),
         extra_meta={
             "elapsed_seconds": float(elapsed),
+            # also store explicitly in run meta (handy if you later change sampler fields)
+            "start_date": start_date_meta,
             "lasso_priors": {"a_lambda": priors.a_lambda, "b_lambda": priors.b_lambda},
         },
     )

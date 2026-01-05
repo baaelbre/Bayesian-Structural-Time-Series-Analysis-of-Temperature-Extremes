@@ -748,16 +748,16 @@ if __name__ == "__main__":
     )
 
     # Simulation
-    p.add_argument("--T", type=int, default=1000)
-    p.add_argument("--period", type=int, default=4)
+    p.add_argument("--T", type=int, default=500)
+    p.add_argument("--period", type=int, default=12)
     p.add_argument("--start-date", type=str, default="2000-01-01")
     p.add_argument("--sigma", type=float, default=2.0)
     p.add_argument("--q-level", type=float, default=0.001)
-    p.add_argument("--q-trend", type=float, default=0.0000002)
+    p.add_argument("--q-trend", type=float, default=0.000002)
     p.add_argument("--q-season", type=float, default=0.00005)
-    p.add_argument("--m0-level", type=float, default=3.0)
+    p.add_argument("--m0-level", type=float, default=0.0)
     p.add_argument("--v0-level", type=float, default=0.05)
-    p.add_argument("--m0-trend", type=float, default=0.1)
+    p.add_argument("--m0-trend", type=float, default=0.001)
     p.add_argument("--v0-trend", type=float, default=0.05)
     p.add_argument("--m0-season", type=str, default=None)  # csv or None
     p.add_argument("--v0-season", type=str, default=None)  # csv or None
@@ -775,9 +775,9 @@ if __name__ == "__main__":
     p.add_argument("--prior-b-lambda", type=float, default=0.001)
 
     # Sampler
-    p.add_argument("--n-iter", type=int, default=10000)
-    p.add_argument("--burn", type=int, default=5000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=40)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=1)
@@ -797,8 +797,8 @@ if __name__ == "__main__":
     # ---- simulation seasonal settings ----
     start_date = _parse_date(args.start_date)
     K = int(args.period) - 1
-    m0_season = _parse_csv_floats(args.m0_season, expected_len=K) or ([5.0] * K)
-    v0_season = _parse_csv_floats(args.v0_season, expected_len=K) or ([0.25] * K)
+    m0_season = _parse_csv_floats(args.m0_season, expected_len=K) or ([1.0] * K)
+    v0_season = _parse_csv_floats(args.v0_season, expected_len=K) or ([0.05] * K)
 
     mts = Mean_Time_Series(
         sigma=float(args.sigma),

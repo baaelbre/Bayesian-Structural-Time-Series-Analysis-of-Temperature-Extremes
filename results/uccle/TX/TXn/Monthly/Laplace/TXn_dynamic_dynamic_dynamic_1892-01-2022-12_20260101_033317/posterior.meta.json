@@ -86,6 +86,8 @@
   ],
   "model": "DGEV_LAPLACE_NCP_LASSO_DUMMIES",
   "data_transform": "negate",
+  "start_date": "1892-01-01",
+  "end_date": "2022-12-01",
   "model_sign": -1.0,
   "scale_note": "All stored states/\u03bc/etc. are on the MODEL scale (z=y*sign).",
   "knobs": {
