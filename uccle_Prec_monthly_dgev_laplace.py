@@ -405,10 +405,10 @@ def main() -> None:
     p.add_argument("--prior-xi-upper", type=float, default=0.5)
 
     # --- priors (baselines) ---
-    p.add_argument("--prior-m0-alpha", type=float, default=0.0)
-    p.add_argument("--prior-P0-alpha", type=float, default=10.0)
+    p.add_argument("--prior-m0-alpha", type=float, default=12.0)
+    p.add_argument("--prior-P0-alpha", type=float, default=5.0)
     p.add_argument("--prior-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-P0-beta", type=float, default=10.0)
+    p.add_argument("--prior-P0-beta", type=float, default=0.1)
     p.add_argument(
         "--prior-m0-gamma",
         type=str,
@@ -422,8 +422,8 @@ def main() -> None:
     p.add_argument("--prior-b-lambda", type=float, default=0.0005)
 
     # --- sampler config ---
-    p.add_argument("--n-iter", type=int, default=20000)
-    p.add_argument("--burn", type=int, default=5000)
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=_str2bool, default=True)

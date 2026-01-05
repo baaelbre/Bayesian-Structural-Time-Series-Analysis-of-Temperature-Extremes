@@ -234,12 +234,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--target", type=str, default=None,
                    help="Run directory or posterior .npz. If provided, overrides --series/--root.")
-    p.add_argument("--series", type=str, choices=["TXm", "TNm", "Precm"], default="TXm",
+    p.add_argument("--series", type=str, choices=["TXm", "TNm", "Precm"], default="TNm",
                    help="Series code when searching by default roots (ignored if --target is given).")
     p.add_argument("--root", type=str, default=None,
                    help="Search root when --target is omitted (defaults to Uccle layout).")
 
-    p.add_argument("--level", type=float, default=0.90, help="Credible band level.")
+    p.add_argument("--level", type=float, default=0.95, help="Credible band level.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Directory to save figures (default: <run>/figures).")
 

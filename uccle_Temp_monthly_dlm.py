@@ -326,7 +326,7 @@ def main() -> None:
 
     # data / series
     p.add_argument("--data-dir", type=str, default="data")
-    p.add_argument("--series", type=str, default="TXm", choices=["TXm", "TNm"])
+    p.add_argument("--series", type=str, default="TNm", choices=["TXm", "TNm"])
     p.add_argument("--all", action="store_true", help="Run both TXm and TNm.")
     p.add_argument("--txm-csv", type=str, default="TXm.csv")
     p.add_argument("--tnm-csv", type=str, default="TNm.csv")
@@ -336,8 +336,8 @@ def main() -> None:
     p.add_argument("--plots", default=True)
 
     # sampler
-    p.add_argument("--n-iter", type=int, default=20000)
-    p.add_argument("--burn", type=int, default=10000)
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
     p.add_argument("--thin", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", default=True)
@@ -349,7 +349,7 @@ def main() -> None:
     p.add_argument("--prior-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-P0-alpha", type=float, default=10.0)
     p.add_argument("--prior-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-P0-beta", type=float, default=10.0)
+    p.add_argument("--prior-P0-beta", type=float, default=1e-5)
     p.add_argument("--prior-m0-gamma", type=str, default=None, help="CSV floats length 11 (period-1), else zeros")
     p.add_argument("--prior-P0-gamma", type=float, default=5.0)
     p.add_argument("--prior-a-lambda", type=float, default=0.001) # put to 2,0.05 for more shrinkage
