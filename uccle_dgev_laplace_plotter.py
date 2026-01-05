@@ -1,4 +1,4 @@
-# uccle_dgev_laplace_plotter.py
+# %% simulator/uccle_dgev_laplace_plotter.py
 from __future__ import annotations
 """
 Uccle DGEV Laplace Plotter (TXx, TXn, TNx, TNn, Precx; Seasonal / Monthly)
@@ -10,16 +10,20 @@ Uccle wrapper around the generic Laplace DGEV plotter:
 
 Key features
 ------------
-- Same figures + CLI interface style as simulator.dgev_laplace_plotter.py:
-    --target / --root / --level / --interval / --show / --out
-    --minima / --maxima
-    --skip-overview / --skip-traceacf / --skip-states / --skip-quick
-    --overview-kw / --traceacf-kw / --states-kw / --quick-kw (repeatable K=V)
+- Mirrors simulator/dlm_plotter.py CLI style as closely as possible:
+    --target / --root / --level / --show / --out / --start-date
+    --skip-overview / --skip-traceacf / --skip-states / --skip-quick / --skip-qhist
+    --overview-kw / --traceacf-kw / --states-kw / --quick-kw / --qhist-kw (repeatable K=V; nested via dots)
+    optional: --print-level-slope / --times, --print-static (if supported by DGEVPlotter)
 - Uccle-specific default root selection via --series and --agg when --target is omitted.
-- Robust "latest run" discovery even if files are named posterior_*.npz (not necessarily posterior.npz).
-- Ensures TNn and TXn are treated as minima series (negated convention) by:
-    (i) injecting meta['series']=<series> (if missing), and
-    (ii) defaulting minima=True for series in {TXn, TNn} unless user forces --maxima.
+- Robust "latest run" discovery:
+    1) optimization.posterior_bundle.find_latest_run (expects posterior.npz)
+    2) fallback recursive search for posterior*.npz (find_latest_posterior_npz)
+- Ensures TNn and TXn are treated as minima series by default unless user forces --maxima.
+- Styling to match Uccle DLM plotter conventions:
+    * TX* series: red line + red band
+    * TN* series: blue line + blue band
+    * State component plots: NO titles by default + NO legend by default
 
 Default Uccle Laplace roots
 ---------------------------
@@ -36,33 +40,29 @@ Default Uccle Laplace roots
 
 Examples
 --------
-# latest Seasonal TXx Laplace run (ETI ribbons)
+# latest Seasonal TXx Laplace run
 python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal --show
 
-# monthly TNn (minima series), HPD ribbons:
-python -u uccle_dgev_laplace_plotter.py --series TNn --agg Monthly --interval hpd --show
+# monthly TNn (minima series)
+python -u uccle_dgev_laplace_plotter.py --series TNn --agg Monthly --show
 
-# explicit run directory or posterior .npz
+# explicit run dir or posterior .npz
 python -u uccle_dgev_laplace_plotter.py --target path/to/run_or_posterior.npz
 
 # override kwargs
 python -u uccle_dgev_laplace_plotter.py --series TXx --agg Seasonal \
-  --states-kw center=mean --states-kw slope_scale=120 \
+  --states-kw center=mean --states-kw slope_scale=40 \
   --traceacf-kw max_lag=400
 """
 
 import os
-import re
 import sys
 import argparse
-from pathlib import Path
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List
+import inspect
+from typing import Any, Dict, Optional, List
 
 # Make project root importable
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
-import numpy as np
 
 from simulator.dgev_laplace_plotter import DGEVPlotter  # type: ignore
 
@@ -70,22 +70,32 @@ from simulator.dgev_laplace_plotter import DGEVPlotter  # type: ignore
 # I/O helpers: posterior loader
 # ---------------------------------------------------------------------
 try:
-    from optimization.posterior_bundle import load_posterior  # type: ignore
+    from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
 except Exception as e:
     raise ImportError(
-        "Could not import optimization.posterior_bundle.load_posterior.\n"
+        "Could not import optimization.posterior_bundle.load_posterior/find_latest_run.\n"
         "Make sure optimization/posterior_bundle.py is on PYTHONPATH."
+    ) from e
+
+# ---------------------------------------------------------------------
+# Shared utils (same file as dlm_plotter.py uses)
+# ---------------------------------------------------------------------
+try:
+    from simulator.utils import (  # type: ignore
+        _ensure_dir,
+        find_latest_posterior_npz,
+        _parse_kv_list,
+    )
+except Exception as e:
+    raise ImportError(
+        "Could not import simulator.utils.\n"
+        "Make sure simulator/utils.py is on PYTHONPATH."
     ) from e
 
 
 # ---------------------------------------------------------------------------
-# Small utils
+# Uccle path + styling helpers
 # ---------------------------------------------------------------------------
-def _ensure_dir(p: Optional[str]) -> None:
-    if p:
-        os.makedirs(p, exist_ok=True)
-
-
 def _parse_agg(agg: str) -> str:
     a = str(agg).strip().lower()
     if a.startswith("s"):
@@ -117,102 +127,45 @@ def uccle_root(series: str, agg: str) -> str:
     return mapping[s]
 
 
-def _extract_ts_from_path(path_str: str) -> Optional[float]:
+def uccle_color(series: str) -> str:
+    s = str(series).strip()
+    if s.startswith("TX"):
+        return "tab:red"
+    if s.startswith("TN"):
+        return "tab:blue"
+    if s.startswith("Prec"):
+        return "tab:green"
+    return "C0"
+
+
+def default_slope_scale(series: str, agg: str) -> float:
+    # convert per-step slope to per-decade:
+    # monthly step: 120 months / decade; seasonal step (quarterly): 40 seasons / decade
+    agg_dir = _parse_agg(agg)
+    return 120.0 if agg_dir == "Monthly" else 40.0
+
+
+def _filter_kwargs_for(fn, kw: Dict[str, Any], *, label: str) -> Dict[str, Any]:
     """
-    Extract YYYYMMDD_HHMMSS from a path (common in your run directory names),
-    return epoch seconds. None if not found/parsable.
+    Filter kw dict to only parameters accepted by fn (robust against plotter API changes).
     """
-    m = re.search(r"(\d{8})_(\d{6})", path_str)
-    if not m:
-        return None
     try:
-        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-        return dt.timestamp()
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
     except Exception:
-        return None
+        return kw
 
-
-def find_latest_posterior_npz(root: str) -> Optional[str]:
-    """
-    Recursively search for posterior*.npz under `root` and return the latest.
-
-    Preference:
-      1) largest YYYYMMDD_HHMMSS found in the *path*
-      2) fallback: largest modification time
-    """
-    rp = Path(root)
-    if not rp.exists():
-        return None
-
-    cands = list(rp.rglob("posterior*.npz"))
-    if not cands:
-        cands = [p for p in rp.rglob("*.npz") if "posterior" in p.name.lower()]
-    if not cands:
-        return None
-
-    def key(p: Path) -> Tuple[int, float]:
-        ts = _extract_ts_from_path(str(p))
-        if ts is not None:
-            return (1, ts)
-        return (0, p.stat().st_mtime)
-
-    best = max(cands, key=key)
-    return str(best)
-
-
-# ---------------------------------------------------------------------------
-# CLI kw override parsing (same as generic plotter)
-# ---------------------------------------------------------------------------
-def _parse_value(raw: str):
-    import ast
-
-    s = raw.strip()
-    low = s.lower()
-    if low in ("none", "null"):
-        return None
-    if low in ("true", "false"):
-        return low == "true"
-    try:
-        return ast.literal_eval(s)
-    except Exception:
-        return s
-
-
-def _set_nested(d: dict, key: str, value):
-    parts = [p for p in key.split(".") if p]
-    cur = d
-    for p in parts[:-1]:
-        if p not in cur or not isinstance(cur[p], dict):
-            cur[p] = {}
-        cur = cur[p]
-    cur[parts[-1]] = value
-
-
-def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for it in items:
-        if "=" not in it:
-            raise ValueError(f"Expected K=V, got: {it!r}")
-        k, v = it.split("=", 1)
-        k = k.strip()
-        val = _parse_value(v)
-        if "." in k:
-            _set_nested(out, k, val)
-        else:
-            out[k] = val
+    out = {k: v for k, v in kw.items() if k in allowed}
+    dropped = sorted(set(kw.keys()) - set(out.keys()))
+    if dropped:
+        print(f"[info] {label}: dropping unsupported kwargs: {dropped}")
     return out
 
 
 # ---------------------------------------------------------------------------
 # Bundle resolution
 # ---------------------------------------------------------------------------
-def resolve_bundle(
-    *,
-    target: Optional[str],
-    series: str,
-    agg: str,
-    root: Optional[str],
-) -> Any:
+def resolve_bundle(*, target: Optional[str], series: str, agg: str, root: Optional[str]) -> Any:
     """
     Returns PosteriorBundle from load_posterior() (NOT a tuple).
     """
@@ -220,37 +173,43 @@ def resolve_bundle(
         return load_posterior(target)
 
     search_root = root or uccle_root(series, agg)
-    print(f"[info] --target not provided; searching latest posterior under: {search_root!r}")
+    print(f"[info] --target not provided; searching for latest run under: {search_root!r}")
 
-    npz = find_latest_posterior_npz(search_root)
-    if npz is None:
-        print(
-            f"[error] No posterior .npz found under {search_root!r}.\n"
-            f"  → Provide --target or check that your Laplace run wrote posterior*.npz."
-        )
-        raise SystemExit(1)
+    # Prefer the "run directory" locator (posterior.npz), else fallback to newest posterior*.npz
+    run_path = find_latest_run(root=search_root)
+    if run_path is None:
+        npz = find_latest_posterior_npz(search_root)
+        if npz is None:
+            print(
+                f"[error] No posterior runs found under {search_root!r}.\n"
+                f"  → Provide --target or check that your Laplace run wrote posterior*.npz."
+            )
+            raise SystemExit(1)
+        print(f"[info] find_latest_run found nothing; using latest npz: {npz}")
+        return load_posterior(npz)
 
-    print(f"[info] using latest posterior: {npz}")
-    return load_posterior(npz)
+    print(f"[info] Using latest run: {run_path}")
+    return load_posterior(run_path)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Uccle wrapper for the Laplace DGEV plotter.\n"
-            "If --target is omitted, we search the default Uccle Laplace root derived from --series and --agg."
+            "If --target is omitted, we search the default Uccle Laplace root derived from --series and --agg.\n"
+            "Use --<section>-kw K=V (repeatable) to override kwargs; nested dicts via dots."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Uccle selectors
-    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="Precx")
+    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNx")
     p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
 
-    # Same “core” args as the generic plotter
+    # Core args (mirrors dlm_plotter style)
     p.add_argument(
         "--target",
         type=str,
@@ -263,51 +222,56 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Search root if --target is omitted. If not provided, uses the Uccle default root for (--series, --agg).",
     )
-    p.add_argument("--level", type=float, default=0.90, help="Credible mass for ribbons.")
-    p.add_argument("--interval", type=str, default="hpd", choices=["eti", "hpd"], help="Credible interval type for ribbons (ETI or HPD).")
+    p.add_argument("--level", type=float, default=0.90, help="Credible band mass/level.")
+    p.add_argument("--interval", type=str, default="hpd", choices=["eti", "hpd"], help="Credible interval type (ETI or HPD).")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
+    p.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Override meta start_date (YYYY-MM-DD) for building a calendar axis (if plotter supports it).",
+    )
 
+    # minima/maxima override
     g = p.add_mutually_exclusive_group()
     g.add_argument("--minima", action="store_true", help="Force minima=True (back-transform negated location-scale quantities).")
     g.add_argument("--maxima", action="store_true", help="Force minima=False (no back-transform).")
 
+    # Skip toggles (include qhist to mirror dlm_plotter)
     p.add_argument("--skip-overview", action="store_true", help="Skip overview figure.")
     p.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
     p.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
     p.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
+    p.add_argument("--skip-qhist", action="store_true", help="Skip separate log10(Q) histogram (if supported).")
 
-    # Kw overrides (same pattern as the generic plotter)
-    p.add_argument(
-        "--overview-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
-    )
-    p.add_argument(
-        "--traceacf-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
-    )
-    p.add_argument(
-        "--states-kw",
-        action="append",
-        default=["slope_scale=120", "center=median"],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
-    )
-    p.add_argument(
-        "--quick-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
-    )
+    # Kw overrides
+    p.add_argument("--overview-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_overview(...). Repeatable.")
+    p.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable.")
+    p.add_argument("--states-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_states_separate(...). Repeatable.")
+    p.add_argument("--quick-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.quick_report(...). Repeatable.")
+    p.add_argument("--qhist-kw", action="append", default=[], metavar="K=V", help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable.")
 
-    # Backward-compatible alias (older uccle plotter used --skip-traces)
+    # Optional printing (only used if plotter implements it)
+    gg = p.add_mutually_exclusive_group()
+    gg.add_argument(
+        "--print-level-slope", dest="print_level_slope", action="store_true", default=True,
+        help="Print level/slope summaries at times given by --times (if supported)."
+    )
+    gg.add_argument(
+        "--no-print-level-slope", dest="print_level_slope", action="store_false",
+        help="Disable printing of level/slope summaries."
+    )
+    p.add_argument("--times", type=str, default="start,mid,end", help="Comma-separated times for level/slope printing.")
+
+    p.add_argument("--print-static", action="store_true", default=True, help="Print summaries for static parameters (if supported).")
+    p.add_argument("--static-level", type=float, default=None, help="Credible level for static params (defaults to --level).")
+    p.add_argument("--static-center", type=str, default="median", help="Center for static summaries: median or mean.")
+    p.add_argument("--static-digits", type=int, default=4, help="Digits for static summary printing.")
+    p.add_argument("--static-max-cols", type=int, default=None, help="Max columns to print per vector parameter (None = all).")
+    p.add_argument("--static-no-diag", action="store_true", default=False, help="Disable ESS/Geweke diagnostics in static summary (if supported).")
+
+    # Backward-compatible alias
     p.add_argument("--skip-traces", action="store_true", default=False, help=argparse.SUPPRESS)
 
     return p
@@ -326,14 +290,18 @@ def main() -> None:
     meta: Dict[str, Any] = bundle.meta if isinstance(bundle.meta, dict) else {}
     npz_path: str = bundle.npz_path
 
-    # Inject Uccle context for minima detection heuristics
+    # Inject Uccle context for minima detection and labeling
     meta = dict(meta)
     meta.setdefault("series", args.series)
     meta.setdefault("agg", args.agg)
+    meta.setdefault("start_date", "1892-01-01")  # only used if missing
+
+    if args.start_date:
+        meta["start_date"] = str(args.start_date)
 
     # Choose minima override:
     # - explicit flags win
-    # - else: enforce minima for TNn/TXn by default (user request)
+    # - else: enforce minima for TXn/TNn by default
     minima_override: Optional[bool]
     if args.minima:
         minima_override = True
@@ -351,31 +319,85 @@ def main() -> None:
     print(f"[info] Posterior source: {npz_path}")
     print(f"[info] Saving figures to: {out_dir}")
 
-    # Instantiate plotter (interval controls ribbons; per-figure overrides can still be passed via *-kw)
+    # Instantiate plotter
     plotter = DGEVPlotter(
         draws=draws,
         meta=meta,
         level=float(args.level),
         minima=minima_override,
-        interval=args.interval,
+        interval=str(args.interval),
     )
 
+    # Parse kwargs
     overview_kw = _parse_kv_list(args.overview_kw)
     traceacf_kw = _parse_kv_list(args.traceacf_kw)
     states_kw = _parse_kv_list(args.states_kw)
     quick_kw = _parse_kv_list(args.quick_kw)
+    qhist_kw = _parse_kv_list(args.qhist_kw)
 
+    # Defaults to match DLM Uccle conventions
+    col = uccle_color(args.series)
+    slope_sc = default_slope_scale(args.series, args.agg)
+
+    # Apply defaults only if user didn't override
+    overview_kw.setdefault("color", col)
+    quick_kw.setdefault("color", col)
+    states_kw.setdefault("color", col)
+
+    states_kw.setdefault("slope_scale", slope_sc)
+
+    # state plots: NO titles + NO legend by default (matches Uccle DLM plotter)
+    states_kw.setdefault("title_level", "")
+    states_kw.setdefault("title_slope", "")
+    states_kw.setdefault("title_seasonality", "")
+    states_kw.setdefault("show_legend", False)
+
+    # (Optional) printing, only if plotter supports the methods
+    if args.print_level_slope and hasattr(plotter, "print_level_slope_at"):
+        raw_times = [s.strip() for s in str(args.times).split(",") if s.strip() != ""]
+        times: List[Any] = []
+        for rt in raw_times:
+            times.append(int(rt) if rt.isdigit() else rt)
+
+        try:
+            plotter.print_level_slope_at(times=times, slope_scale=slope_sc)  # type: ignore[attr-defined]
+        except TypeError:
+            # older API: no slope_scale
+            plotter.print_level_slope_at(times=times)  # type: ignore[attr-defined]
+
+    if args.print_static and hasattr(plotter, "print_static_params"):
+        try:
+            plotter.print_static_params(  # type: ignore[attr-defined]
+                level=args.static_level,
+                center=args.static_center,
+                digits=int(args.static_digits),
+                max_vector_cols=args.static_max_cols,
+                include_diagnostics=(not args.static_no_diag),
+            )
+        except TypeError:
+            # older API: accept fewer kwargs
+            plotter.print_static_params()  # type: ignore[attr-defined]
+
+    # Call plots (filter kwargs for robustness)
     if not args.skip_overview:
-        plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
+        kw = _filter_kwargs_for(plotter.figure_overview, overview_kw, label="overview")
+        plotter.figure_overview(save_dir=out_dir, show=args.show, **kw)
 
     if not args.skip_traceacf:
-        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **traceacf_kw)
+        kw = _filter_kwargs_for(plotter.figure_trace_acf_core, traceacf_kw, label="traceacf")
+        plotter.figure_trace_acf_core(save_dir=out_dir, show=args.show, **kw)
 
     if not args.skip_states:
-        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **states_kw)
+        kw = _filter_kwargs_for(plotter.figure_states_separate, states_kw, label="states")
+        plotter.figure_states_separate(save_dir=out_dir, show=args.show, **kw)
 
     if not args.skip_quick:
-        plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
+        kw = _filter_kwargs_for(plotter.quick_report, quick_kw, label="quick")
+        plotter.quick_report(save_dir=out_dir, show=args.show, **kw)
+
+    if not args.skip_qhist and hasattr(plotter, "figure_process_variances_hist"):
+        kw = _filter_kwargs_for(plotter.figure_process_variances_hist, qhist_kw, label="qhist")
+        plotter.figure_process_variances_hist(save_dir=out_dir, show=args.show, **kw)  # type: ignore[attr-defined]
 
     print("[done] Uccle DGEV Laplace plots written.")
 

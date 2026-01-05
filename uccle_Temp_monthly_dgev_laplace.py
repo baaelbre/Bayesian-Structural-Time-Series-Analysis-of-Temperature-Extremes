@@ -289,7 +289,7 @@ def run_one(
     print(f"{series}: run time {elapsed:.2f} seconds")
 
     # Save posterior (MODEL scale)
-    out_npz = outdir / f"posterior_{series}_{date_tag}_{modes_tag}.npz"
+    out_npz = outdir / f"posterior.npz"
     sampler.save_posterior(
         out_npz_path=str(out_npz),
         extra_meta={
@@ -398,8 +398,8 @@ def main() -> None:
     # --- priors (baselines) (means interpreted on ORIGINAL scale; converted internally if negated) ---
     p.add_argument("--prior-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-P0-alpha", type=float, default=10.0)
-    p.add_argument("--prior-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-P0-beta", type=float, default=1e-5)
+    p.add_argument("--prior-m0-beta", type=float, default=0.1/120)
+    p.add_argument("--prior-P0-beta", type=float, default=1e-3)
     p.add_argument(
         "--prior-m0-gamma",
         type=str,

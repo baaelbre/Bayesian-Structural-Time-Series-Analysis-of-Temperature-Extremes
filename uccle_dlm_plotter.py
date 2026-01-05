@@ -5,9 +5,10 @@ Uccle DLM Plotter (TXm, TNm, Precm; Monthly)
 ===========================================
 
 Thin wrapper around:
-    simulator/dlm_plotter.DLMPlotter
+    simulator.dlm_plotter.DLMPlotter
 
-Key requirements:
+Key requirements
+----------------
 - Uccle is always monthly and starts at 1892-01-01 (calendar index forced).
 - TX* series are always red (line + shading).
 - TN* series are always blue (line + shading).
@@ -17,6 +18,14 @@ Key requirements:
 - Robust run discovery:
     1) optimization.posterior_bundle.find_latest_run (expects posterior.npz)
     2) fallback recursive search for posterior*.npz and pick most recent
+- Prints level/slope summaries at calendar years 1892, 1950, 2020 (January of each year).
+- NEW: prints credible intervals and estimates for (all) static parameters via
+  plotter.print_static_params(...), by default.
+
+Notes
+-----
+- For temperature DLMs where slope is on "per month" scale, we keep your default
+  state kw: slope_scale=120 (≈ per decade) unless overridden.
 """
 
 import os
@@ -227,19 +236,29 @@ def build_argparser() -> argparse.ArgumentParser:
             "Uccle DLM Plotter (TXm/TNm/Precm; Monthly)\n"
             "Uses the generic Gaussian DLMPlotter.\n"
             "Calendar origin is forced to 1892-01-01 monthly.\n"
+            "Prints level/slope summaries at user-chosen years (January).\n"
+            "Prints static parameter summaries (median/CI) by default.\n"
             "Use --<section>-kw K=V (repeatable) to override plot kwargs.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--target", type=str, default=None,
-                   help="Run directory or posterior .npz. If provided, overrides --series/--root.")
-    p.add_argument("--series", type=str, choices=["TXm", "TNm", "Precm"], default="TNm",
-                   help="Series code when searching by default roots (ignored if --target is given).")
-    p.add_argument("--root", type=str, default=None,
-                   help="Search root when --target is omitted (defaults to Uccle layout).")
+    p.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="Run directory or posterior .npz. If provided, overrides --series/--root.",
+    )
+    p.add_argument(
+        "--series",
+        type=str,
+        choices=["TXm", "TNm", "Precm"],
+        default="TNm",
+        help="Series code when searching by default roots (ignored if --target is given).",
+    )
+    p.add_argument("--root", type=str, default=None, help="Search root when --target is omitted (defaults to Uccle layout).")
 
-    p.add_argument("--level", type=float, default=0.95, help="Credible band level.")
+    p.add_argument("--level", type=float, default=0.9, help="Credible band level.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Directory to save figures (default: <run>/figures).")
 
@@ -252,10 +271,59 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
     p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
 
-    p.add_argument("--overview-kw", action="append", default=[], metavar="K=V",
-                   help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.")
-    p.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V",
-                   help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.")
+    p.add_argument(
+        "--summary-years",
+        type=str,
+        default="1892,1950,2020",
+        help="Comma-separated calendar years (January) at which to print level/slope summaries.",
+    )
+
+    # ---- static parameter printing ----
+    p.add_argument(
+        "--print-static",
+        action="store_true",
+        default=True,
+        help="Print static parameter summaries (median/CI).",
+    )
+    p.add_argument(
+        "--no-print-static",
+        action="store_true",
+        default=False,
+        help="Disable printing static parameter summaries.",
+    )
+    p.add_argument("--static-level", type=float, default=None, help="Credible level for static params (default: --level).")
+    p.add_argument("--static-center", type=str, default="median", choices=["median", "mean"], help="Center for summaries.")
+    p.add_argument("--static-digits", type=int, default=4, help="Digits for printed static summaries.")
+    p.add_argument(
+        "--static-max-cols",
+        type=int,
+        default=None,
+        help="Max columns to print for vector parameters (default: print all).",
+    )
+    p.add_argument("--static-no-diag", action="store_true", default=False, help="Disable ESS/Geweke diagnostics in printing.")
+    p.add_argument(
+        "--print-log-process",
+        action="store_true",
+        default=True,
+        help="Also print log10(|s_*|) and log10(Q) in the static summary.",
+    )
+    p.add_argument("--log-eps", type=float, default=1e-20, help="Epsilon floor before log10 for process-noise printing.")
+
+    # ---- kwargs overrides for plotting ----
+    p.add_argument(
+        "--overview-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--traceacf-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
+    )
     p.add_argument(
         "--states-kw",
         action="append",
@@ -269,10 +337,20 @@ def build_argparser() -> argparse.ArgumentParser:
         metavar="K=V",
         help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
     )
-    p.add_argument("--quick-kw", action="append", default=[], metavar="K=V",
-                   help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.")
-    p.add_argument("--qhist-kw", action="append", default=[], metavar="K=V",
-                   help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable.")
+    p.add_argument(
+        "--quick-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
+    )
+    p.add_argument(
+        "--qhist-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable.",
+    )
 
     return p
 
@@ -302,6 +380,42 @@ def main() -> None:
 
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
+    # ---- PRINT SUMMARY at chosen years (January of each year) ----
+    years: List[int] = []
+    for tok in str(args.summary_years).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            years.append(int(tok))
+        except Exception:
+            raise ValueError(f"--summary-years expects comma-separated integers, got {args.summary_years!r}")
+    if years:
+        times = [f"{y}-01" for y in years]  # January of that year
+        try:
+            plotter.print_level_slope_at(times=times, slope_scale=120)
+        except Exception as e:
+            print(f"[warn] could not print level/slope summaries at {times}: {e}")
+
+    # ---- PRINT STATIC PARAMS (median/CI) ----
+    do_print_static = bool(args.print_static) and (not bool(args.no_print_static))
+    if do_print_static:
+        try:
+            plotter.print_static_params(
+                level=(float(args.static_level) if args.static_level is not None else None),
+                center=str(args.static_center),
+                digits=int(args.static_digits),
+                max_vector_cols=(int(args.static_max_cols) if args.static_max_cols is not None else None),
+                include_diagnostics=(not bool(args.static_no_diag)),
+                include_log_process=bool(args.print_log_process),
+                log_eps=float(args.log_eps),
+            )
+        except AttributeError:
+            print("[warn] DLMPlotter has no method print_static_params(...). Did you update simulator/dlm_plotter.py?")
+        except Exception as e:
+            print(f"[warn] could not print static parameter summaries: {e}")
+
+    # ---- parse kw overrides ----
     overview_kw = _parse_kv_list(args.overview_kw)
     traceacf_kw = _parse_kv_list(args.traceacf_kw)
     states_kw = _parse_kv_list(args.states_kw)

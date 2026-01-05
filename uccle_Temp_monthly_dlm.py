@@ -338,7 +338,7 @@ def main() -> None:
     # sampler
     p.add_argument("--n-iter", type=int, default=5000)
     p.add_argument("--burn", type=int, default=1000)
-    p.add_argument("--thin", type=int, default=2)
+    p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", default=True)
     p.add_argument("--progress-every", type=int, default=10)
@@ -346,14 +346,14 @@ def main() -> None:
     # priors
     p.add_argument("--prior-a-sigma", type=float, default=2.0)
     p.add_argument("--prior-b-sigma", type=float, default=2.0)
-    p.add_argument("--prior-m0-alpha", type=float, default=0.0)
-    p.add_argument("--prior-P0-alpha", type=float, default=10.0)
-    p.add_argument("--prior-m0-beta", type=float, default=0.0)
-    p.add_argument("--prior-P0-beta", type=float, default=1e-5)
+    p.add_argument("--prior-m0-alpha", type=float, default=5.0)
+    p.add_argument("--prior-P0-alpha", type=float, default=1.0)
+    p.add_argument("--prior-m0-beta", type=float, default=0.08/120)
+    p.add_argument("--prior-P0-beta", type=float, default=1e-6)
     p.add_argument("--prior-m0-gamma", type=str, default=None, help="CSV floats length 11 (period-1), else zeros")
     p.add_argument("--prior-P0-gamma", type=float, default=5.0)
-    p.add_argument("--prior-a-lambda", type=float, default=0.001) # put to 2,0.05 for more shrinkage
-    p.add_argument("--prior-b-lambda", type=float, default=0.001) # standard: 0.001, 0.001
+    p.add_argument("--prior-a-lambda", type=float, default=2) # put to 2,0.05 for more shrinkage
+    p.add_argument("--prior-b-lambda", type=float, default=0.05) # standard: 0.001, 0.001
 
     # initials
     p.add_argument("--sigma-init", type=float, default=None, help="If omitted: 0.3*sd(y)")
