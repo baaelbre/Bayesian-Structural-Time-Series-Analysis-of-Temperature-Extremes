@@ -37,8 +37,8 @@
     "xi_upper": 0.5,
     "m0_alpha": 0.0,
     "P0_alpha": 10.0,
-    "m0_beta": 0.0016666666666666668,
-    "P0_beta": 1e-06,
+    "m0_beta": 0.0008333333333333334,
+    "P0_beta": 0.001,
     "m0_gamma": [
       1.0,
       0.8660254037844387,
@@ -67,11 +67,11 @@
     "laplace_z_clip": 1000000.0,
     "reject_restore_enabled": true
   },
-  "series": "TNx",
-  "label": "TNx_monthly",
+  "series": "TXx",
+  "label": "TXx_monthly",
   "date_tag": "1892-01-2022-12",
-  "elapsed_seconds": 2586.304756164551,
-  "timestamp": "2026-01-05T21:25:00.255095",
+  "elapsed_seconds": 2645.591679096222,
+  "timestamp": "2026-01-05T23:26:18.221095",
   "index_type": "PeriodIndex",
   "index_values_preview": [
     "1892-01",

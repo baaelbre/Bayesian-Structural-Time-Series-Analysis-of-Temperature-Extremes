@@ -206,7 +206,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     # Uccle selectors
-    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNx")
+    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNn")
     p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
 
     # Core args (mirrors dlm_plotter style)

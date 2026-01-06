@@ -135,11 +135,6 @@ class DGEVLaplaceNCP:
     Structural DGEV with Laplace pseudo-obs + NCP FFBS + FS joint regression step,
     plus exact MH for (logsigma, xi).
 
-    This rewrite adds:
-      - overflow-safe progress + loglike handling
-      - block-level reject/restore so "bad" draws never poison the chain
-      - last-good snapshot rescue
-      - start_date metadata persistence (optional)
     """
 
     def __init__(

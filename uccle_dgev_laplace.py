@@ -297,6 +297,7 @@ def run_one(
             "label": f"{series}_monthly",
             "period": int(period),
             "date_tag": date_tag,
+            "start_date": str(idx[0]) if len(idx) > 0 else None,
             "elapsed_seconds": float(elapsed),
             "timestamp": datetime.now().isoformat(),
             "index_type": type(idx).__name__,
@@ -398,8 +399,8 @@ def main() -> None:
     # --- priors (baselines) (means interpreted on ORIGINAL scale; converted internally if negated) ---
     p.add_argument("--prior-m0-alpha", type=float, default=0.0)
     p.add_argument("--prior-P0-alpha", type=float, default=10.0)
-    p.add_argument("--prior-m0-beta", type=float, default=0.1/120)
-    p.add_argument("--prior-P0-beta", type=float, default=1e-3)
+    p.add_argument("--prior-m0-beta", type=float, default=0.3/120)
+    p.add_argument("--prior-P0-beta", type=float, default=1e-6)
     p.add_argument(
         "--prior-m0-gamma",
         type=str,
@@ -413,8 +414,8 @@ def main() -> None:
     p.add_argument("--prior-b-lambda", type=float, default=0.0005)
 
     # --- sampler config ---
-    p.add_argument("--n-iter", type=int, default=20000)
-    p.add_argument("--burn", type=int, default=5000)
+    p.add_argument("--n-iter", type=int, default=1000)
+    p.add_argument("--burn", type=int, default=500)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--progress", type=_str2bool, default=True)
