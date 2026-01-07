@@ -1,16 +1,19 @@
-# %% simulator/dlm_gof.py
+# %% simulator/dgev_laplace_gof.py
 from __future__ import annotations
 """
-DLM Goodness-of-Fit (Gaussian structural models)
-==============================================
+DGEV (Laplace-NCP) Goodness-of-Fit
+=================================
 
-Implements the diagnostic workflow described in your manuscript (Section "Model diagnostics"):
+Mirrors simulator/dlm_gof.py but for the *dynamic GEV* model fitted via the Laplace-NCP
+approximate Gibbs sampler (optimization/dgev_laplace.py).
+
+Diagnostics implemented (as in your manuscript "Model diagnostics"):
 
 1) PITs (probability integral transforms)
-   For the Gaussian DLM,
-     Y_t | mu_t, sigma ~ Normal(mu_t, sigma^2)
-   so for posterior draws (mu_t^{(m)}, sigma^{(m)}),
-     u_t^{(m)} = Phi( (y_t - mu_t^{(m)}) / sigma^{(m)} ).
+   For the DGEV observation equation,
+       Y_t | (mu_t, sigma, xi) ~ GEV(mu_t, sigma, xi)
+   so for posterior draws (mu_t^{(m)}, sigma^{(m)}, xi^{(m)}),
+       u_t^{(m)} = F_GEV(y_t ; mu_t^{(m)}, sigma^{(m)}, xi^{(m)}).
 
    Outputs:
    - PIT histogram with posterior median + credible band (over posterior draws)
@@ -20,13 +23,14 @@ Implements the diagnostic workflow described in your manuscript (Section "Model 
    - PIT histogram: NO title, NO legend
    - PIT PP plot:   NO title, NO legend
 
-2) Posterior predictive assessment (Gaetan & Grigoletto-style)
-   Using the KS distance of PITs to Uniform(0,1) as discrepancy K(·).
+2) Posterior predictive assessment (Gelman-style; Gaetan & Grigoletto-style discrepancy)
+   Discrepancy: KS distance of PITs to Uniform(0,1), K(·).
 
    For each posterior draw m:
-     K_obs^{(m)} = KS( {u_t^{(m)}}_{t=1}^T , U(0,1) )
-     simulate y_rep^{(m)} ~ p(y | x^{(m)}, eta^{(m)})  (pointwise)
-     compute u_rep^{(m)} similarly and K_rep^{(m)}.
+       K_obs^{(m)} = KS( {u_t^{(m)}} , U(0,1) )
+       Generate PITs under the fitted model:
+           u_rep^{(m)} ~ iid Uniform(0,1) of length T_eff
+       K_rep^{(m)} = KS( u_rep^{(m)}, U(0,1) )
 
    Output:
    - scatter plot of (K_obs^{(m)}, K_rep^{(m)}) with 45° line
@@ -45,18 +49,24 @@ Robust posterior discovery mirrors simulator/dlm_plotter.py:
 Expected posterior bundle content
 --------------------------------
 Required:
-  - draws['mu'] : (S, T) posterior draws of mu_t
-  - draws['y']  : (T,)   observed series on model scale
+  - draws['mu']    : (S, T) posterior draws of mu_t  (location trajectory on MODEL scale)
+  - draws['y']     : (T,)   observed series on MODEL scale
 
 Needed for PIT:
-  - draws['sigma'] : (S,) posterior draws of observation SD,
-    or draws['sigma2'] : (S,) posterior draws of variance.
+  - draws['sigma'] : (S,) posterior draws of observation scale (>0)
+  - draws['xi']    : (S,) posterior draws of shape
+    (Optionally accept draws['sigma2'] and take sqrt.)
+
+Notes
+-----
+- This GOF works on the MODEL scale stored in posterior.npz. If you modeled minima via
+  z_t=-y_t, then draws['y'] should already be that transformed series, and the PITs are
+  for the fitted model.
 
 CLI
 ---
-python -m simulator.dlm_gof --target <run_or_npz> --out <dir> --show
-python -m simulator.dlm_gof --root results/... (auto-picks latest)
-
+python -m simulator.dgev_laplace_gof --target <run_or_npz> --out <dir> --show
+python -m simulator.dgev_laplace_gof --root results/... (auto-picks latest)
 """
 
 import os
@@ -65,7 +75,7 @@ import math
 import json
 import argparse
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -93,44 +103,10 @@ except Exception as e:
 
 
 # =============================================================================
-# Math helpers (module-level so wrappers can reuse)
+# Helpers (module-level so wrappers can reuse)
 # =============================================================================
-_SQRT2 = float(math.sqrt(2.0))
-
-
-def _norm_cdf(x: np.ndarray) -> np.ndarray:
-    """
-    Standard Normal CDF (vectorized).
-
-    Tries SciPy's erf; falls back to a SciPy-free approximation if SciPy is unavailable.
-    """
-    x = np.asarray(x, float)
-    try:
-        from scipy.special import erf as _erf  # type: ignore
-        return 0.5 * (1.0 + _erf(x / _SQRT2))
-    except Exception:
-        # Abramowitz & Stegun (7.1.26) approximation for Φ(x)
-        a1 = 0.319381530
-        a2 = -0.356563782
-        a3 = 1.781477937
-        a4 = -1.821255978
-        a5 = 1.330274429
-        p = 0.2316419
-
-        ax = np.abs(x)
-        t = 1.0 / (1.0 + p * ax)
-        pdf = 0.3989422804014327 * np.exp(-0.5 * ax * ax)
-        poly = ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t
-        cdf_pos = 1.0 - pdf * poly
-        cdf = np.where(x >= 0.0, cdf_pos, 1.0 - cdf_pos)
-        return np.clip(cdf, 0.0, 1.0)
-
-
 def _ks_to_uniform(u: np.ndarray) -> float:
-    """
-    One-sample Kolmogorov–Smirnov distance to U(0,1):
-      D = sup_u |F_n(u) - u|.
-    """
+    """One-sample Kolmogorov–Smirnov distance to U(0,1)."""
     v = np.asarray(u, float).ravel()
     v = v[np.isfinite(v)]
     n = int(v.size)
@@ -179,12 +155,78 @@ def _draw_subsample_index(S: int, *, max_draws: Optional[int], rng: np.random.Ge
     return idx
 
 
-# =============================================================================
-# Core computations (kept as functions, used by the class)
-# =============================================================================
-def compute_pit_draws(*, y: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _gev_cdf(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray) -> np.ndarray:
     """
-    Compute posterior PIT draws u^{(m)}_t = Phi((y_t - mu^{(m)}_t)/sigma^{(m)}).
+    Vectorized GEV CDF F(y; mu, sigma, xi) with draw-wise (row-wise) Gumbel handling.
+
+    Shapes:
+      y     : (T_eff,) or (1,T_eff)
+      mu    : (S,T_eff)
+      sigma : (S,1) or (S,)
+      xi    : (S,1) or (S,)
+
+    Returns:
+      F : (S,T_eff) in [0,1]
+    """
+    y = np.asarray(y, float)
+    mu = np.asarray(mu, float)
+    sigma = np.asarray(sigma, float)
+    xi = np.asarray(xi, float)
+
+    # Ensure sigma is (S,1)
+    if sigma.ndim == 1:
+        sigma = sigma[:, None]
+    sigma = np.clip(sigma, 1e-12, None)
+
+    # Ensure xi is (S,) for row-wise decisions
+    xi_vec = xi.reshape(-1)
+
+    z = (y - mu) / sigma  # (S,T_eff) via broadcasting
+    S, T = z.shape
+
+    eps = 1e-6
+    is_gumbel = (np.abs(xi_vec) < eps)  # (S,)
+
+    F = np.empty((S, T), dtype=float)
+
+    # --- Gumbel draws (xi ~ 0): F = exp(-exp(-z))
+    if np.any(is_gumbel):
+        zg = z[is_gumbel, :]
+        t = np.exp(np.clip(-zg, -700.0, 700.0))
+        F[is_gumbel, :] = np.exp(-t)
+
+    # --- Non-Gumbel draws
+    if np.any(~is_gumbel):
+        zn = z[~is_gumbel, :]                          # (S_n,T)
+        xin = xi_vec[~is_gumbel][:, None]              # (S_n,1)
+
+        t = 1.0 + xin * zn                              # (S_n,T)
+        valid = t > 0.0
+
+        # Outside support:
+        #   xi > 0 and t<=0  => y below lower bound => F=0
+        #   xi < 0 and t<=0  => y above upper bound => F=1
+        Finv = np.where(xin > 0.0, 0.0, 1.0)            # (S_n,1) broadcast
+        Fn = np.broadcast_to(Finv, t.shape).astype(float)
+
+        # For valid region: F = exp(-(t)^(-1/xi))
+        tv = np.where(valid, t, 1.0)                    # safe filler where invalid
+        logpow = (-1.0 / xin) * np.log(tv)              # (S_n,T)
+        pow_ = np.exp(np.clip(logpow, -700.0, 700.0))   # (S_n,T)
+        Fn = np.where(valid, np.exp(-pow_), Fn)
+
+        F[~is_gumbel, :] = Fn
+
+    return np.clip(F, 0.0, 1.0)
+
+# =============================================================================
+# Core computations
+# =============================================================================
+def compute_pit_draws(
+    *, y: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute posterior PIT draws u^{(m)}_t = F_GEV(y_t; mu^{(m)}_t, sigma^{(m)}, xi^{(m)}).
 
     Returns:
       u    : (S, T_eff)
@@ -193,6 +235,7 @@ def compute_pit_draws(*, y: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> Tu
     y = np.asarray(y, float).ravel()
     mu = np.asarray(mu, float)
     sigma = np.asarray(sigma, float).ravel()
+    xi = np.asarray(xi, float).ravel()
 
     if mu.ndim != 2:
         raise ValueError("mu must be (S,T)")
@@ -201,22 +244,24 @@ def compute_pit_draws(*, y: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> Tu
         raise ValueError(f"y has length {y.size} but mu has T={T}")
     if sigma.size != S:
         raise ValueError(f"sigma has length {sigma.size} but mu has S={S}")
+    if xi.size != S:
+        raise ValueError(f"xi has length {xi.size} but mu has S={S}")
 
     mask = np.isfinite(y)
     if not np.any(mask):
         raise ValueError("y has no finite values; cannot compute PITs")
 
-    y_eff = y[mask][None, :]                       # (1, T_eff)
-    mu_eff = mu[:, mask]                           # (S, T_eff)
-    sig_eff = np.clip(sigma, 1e-12, None)[:, None] # (S, 1)
+    y_eff = y[mask][None, :]  # (1, T_eff)
+    mu_eff = mu[:, mask]      # (S, T_eff)
+    sig_eff = np.clip(sigma, 1e-12, None)[:, None]  # (S,1)
+    xi_eff = xi[:, None]      # (S,1)
 
-    z = (y_eff - mu_eff) / sig_eff
-    u = _norm_cdf(z)
+    u = _gev_cdf(y_eff, mu_eff, sig_eff, xi_eff)
     return np.clip(u, 0.0, 1.0), mask
 
 
 # =============================================================================
-# Class interface (for reuse by Uccle wrappers)
+# Class interface (mirrors DLMGoodnessOfFit)
 # =============================================================================
 @dataclass(slots=True)
 class GOFConfig:
@@ -230,19 +275,17 @@ class GOFConfig:
     skip_ppc: bool = False
     show: bool = False
     json_name: str = "gof_results.json"
-    json_full: bool = False  # store ks arrays
-    color: Optional[str] = None  # if set: used for PIT median/band and PPC points
+    json_full: bool = False
+    color: Optional[str] = None
 
 
-class DLMGoodnessOfFit:
+class DGEVLaplaceGoodnessOfFit:
     """
-    Reusable goodness-of-fit runner.
+    Reusable goodness-of-fit runner for DGEV Laplace-NCP posterior bundles.
 
-    Typical usage (generic):
-        gof = DLMGoodnessOfFit(level=0.9, bins=20, color=None)
+    Typical usage:
+        gof = DGEVLaplaceGoodnessOfFit(level=0.9, bins=20, color=None)
         out = gof.run_from_target(target=None, root="results/...", out_dir=None)
-
-    Wrappers (e.g. Uccle) can pass a fixed color and override meta.
     """
 
     def __init__(self, *, level: float = 0.90, bins: int = 20, color: Optional[str] = None) -> None:
@@ -326,8 +369,8 @@ class DLMGoodnessOfFit:
         return out, meta2
 
     @staticmethod
-    def extract_core_arrays(draws: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Extract (mu_all, y, sigma_all) from bundle draws."""
+    def extract_core_arrays(draws: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Extract (mu_all, y, sigma_all, xi_all) from bundle draws."""
         if "mu" not in draws:
             raise KeyError("draws must contain 'mu' of shape (S,T).")
         if "y" not in draws:
@@ -337,7 +380,6 @@ class DLMGoodnessOfFit:
         y = np.asarray(draws["y"], float).ravel()
         if mu_all.ndim != 2:
             raise ValueError("draws['mu'] must be 2D (S,T).")
-
         S_all, T = mu_all.shape
         if y.size != T:
             raise ValueError(f"draws['y'] has length {y.size} but draws['mu'] has T={T}.")
@@ -351,26 +393,32 @@ class DLMGoodnessOfFit:
             s2 = np.asarray(draws["sigma2"], float).ravel()
             if s2.ndim == 1 and s2.shape[0] == S_all:
                 sigma_all = np.sqrt(np.clip(s2, 0.0, None))
-
         if sigma_all is None:
-            raise KeyError("Need draws['sigma'] or draws['sigma2'] aligned with draws['mu'].")
+            raise KeyError("Need draws['sigma'] (or draws['sigma2']) aligned with draws['mu'].")
 
-        return mu_all, y, sigma_all
+        if "xi" not in draws:
+            raise KeyError("draws must contain 'xi' of shape (S,).")
+        xi_all = np.asarray(draws["xi"], float).ravel()
+        if xi_all.ndim != 1 or xi_all.shape[0] != S_all:
+            raise ValueError("draws['xi'] must be (S,) aligned with draws['mu'].")
+
+        return mu_all, y, sigma_all, xi_all
 
     @staticmethod
     def subsample_aligned(
         mu_all: np.ndarray,
         sigma_all: np.ndarray,
+        xi_all: np.ndarray,
         *,
         max_draws: Optional[int],
         rng: np.random.Generator,
-    ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-        """Aligned subsample of (mu, sigma) along axis 0. Returns (mu, sigma, idx_used)."""
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        """Aligned subsample along axis 0. Returns (mu, sigma, xi, idx_used)."""
         S_all = int(mu_all.shape[0])
         idx = _draw_subsample_index(S_all, max_draws=max_draws, rng=rng)
         if idx is None:
-            return mu_all, sigma_all, None
-        return mu_all[idx, :], sigma_all[idx], idx
+            return mu_all, sigma_all, xi_all, None
+        return mu_all[idx, :], sigma_all[idx], xi_all[idx], idx
 
     # --------------------
     # plotting
@@ -420,6 +468,7 @@ class DLMGoodnessOfFit:
         else:
             ax.fill_between(mids, dens_lo, dens_hi, alpha=0.25, step="mid")
             ax.step(mids, dens_med, where="mid", lw=2.0)
+
         ax.axhline(1.0, lw=1.2, ls="--", color="k", alpha=0.7)
 
         ax.set_xlim(0.0, 1.0)
@@ -476,6 +525,7 @@ class DLMGoodnessOfFit:
         else:
             ax.fill_between(p, q_lo, q_hi, alpha=0.25)
             ax.plot(p, q_med, lw=2.0)
+
         ax.plot([0, 1], [0, 1], ls="--", lw=1.2, color="k", alpha=0.7)
 
         ax.set_xlim(0.0, 1.0)
@@ -510,7 +560,7 @@ class DLMGoodnessOfFit:
         """
         PPC KS scatter:
           K_obs^{(m)} = KS(u_obs^{(m)}, U(0,1))
-          K_rep^{(m)} = KS(Phi(eps), U(0,1)) with eps ~ N(0,1) iid
+          K_rep^{(m)} = KS(U_rep, U(0,1)) with U_rep ~ iid Uniform(0,1)
 
         Styling: NO title/legend, x="K_obs", y="K_rep".
         """
@@ -524,8 +574,7 @@ class DLMGoodnessOfFit:
 
         for m in range(S):
             ks_obs[m] = _ks_to_uniform(U[m])
-            eps = rng.standard_normal(T_eff)
-            u_rep = _norm_cdf(eps)
+            u_rep = rng.random(T_eff)
             ks_rep[m] = _ks_to_uniform(u_rep)
 
         finite = np.isfinite(ks_obs) & np.isfinite(ks_rep)
@@ -580,15 +629,17 @@ class DLMGoodnessOfFit:
 
         rng = np.random.default_rng(int(cfg.seed))
 
-        mu_all, y, sigma_all = self.extract_core_arrays(draws)
+        mu_all, y, sigma_all, xi_all = self.extract_core_arrays(draws)
 
         # optional subsample (aligned)
-        mu, sigma, idx_used = self.subsample_aligned(mu_all, sigma_all, max_draws=cfg.max_draws, rng=rng)
+        mu, sigma, xi, idx_used = self.subsample_aligned(
+            mu_all, sigma_all, xi_all, max_draws=cfg.max_draws, rng=rng
+        )
         if idx_used is not None:
             print(f"[info] subsampled draws: S={mu.shape[0]} (from {mu_all.shape[0]})")
 
         # PIT draws
-        u_obs, mask = compute_pit_draws(y=y, mu=mu, sigma=sigma)
+        u_obs, mask = compute_pit_draws(y=y, mu=mu, sigma=sigma, xi=xi)
         S, T_eff = u_obs.shape
         n_missing = int(np.sum(~mask))
         print(f"[info] PIT draws computed: S={S}, T_eff={T_eff} (dropped {n_missing} non-finite y)")
@@ -685,11 +736,11 @@ class DLMGoodnessOfFit:
 # =============================================================================
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Goodness-of-fit diagnostics for Gaussian DLM posterior bundles (PIT + posterior predictive KS).",
+        description="Goodness-of-fit diagnostics for DGEV Laplace-NCP posterior bundles (PIT + posterior predictive KS).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--target", type=str, default=None, help="Run directory or posterior.npz path.")
-    p.add_argument("--root", type=str, default="results/simulations/DLM", help="Search root if --target omitted.")
+    p.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO", help="Search root if --target omitted.")
     p.add_argument("--out", type=str, default=None, help="Directory to save figures (default: <run>/gof).")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
 
@@ -708,7 +759,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--json-name", type=str, default="gof_results.json", help="Filename for JSON summary.")
     p.add_argument("--json-full", action="store_true", help="Also store ks_obs/ks_rep arrays in JSON (large).")
 
-    # Optional single-color override (useful for wrappers; generic default is matplotlib)
     p.add_argument("--color", type=str, default=None, help="Optional matplotlib color for PIT/KS points.")
 
     return p
@@ -732,7 +782,7 @@ def main() -> None:
         color=(None if args.color in (None, "", "None", "none") else str(args.color)),
     )
 
-    runner = DLMGoodnessOfFit(level=cfg.level, bins=cfg.bins, color=cfg.color)
+    runner = DGEVLaplaceGoodnessOfFit(level=cfg.level, bins=cfg.bins, color=cfg.color)
     runner.run_from_target(target=args.target, root=str(args.root), out_dir=args.out, cfg=cfg)
 
     print("[done] GOF diagnostics written.")

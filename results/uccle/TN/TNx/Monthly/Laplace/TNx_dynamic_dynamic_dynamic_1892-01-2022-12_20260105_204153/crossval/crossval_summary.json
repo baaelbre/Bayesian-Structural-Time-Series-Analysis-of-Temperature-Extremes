@@ -1,0 +1,38 @@
+[
+  {
+    "split_label": "p0p6",
+    "split_idx": 943,
+    "T_train": 944,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.9333333333333333,
+    "rmse": 1.8019784312992306,
+    "mae": 1.437126807776365,
+    "avg_width": 6.625720430728049,
+    "split_dir": "results/uccle/TN/TNx/Monthly/Laplace/TNx_dynamic_dynamic_dynamic_1892-01-2022-12_20260105_204153/crossval/cv_split_p0p6_t943_h120"
+  },
+  {
+    "split_label": "p0p8",
+    "split_idx": 1257,
+    "T_train": 1258,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.95,
+    "rmse": 1.7441312366305655,
+    "mae": 1.4039766792772792,
+    "avg_width": 6.6227041283442825,
+    "split_dir": "results/uccle/TN/TNx/Monthly/Laplace/TNx_dynamic_dynamic_dynamic_1892-01-2022-12_20260105_204153/crossval/cv_split_p0p8_t1257_h120"
+  },
+  {
+    "split_label": "p0p9",
+    "split_idx": 1414,
+    "T_train": 1415,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.8833333333333333,
+    "rmse": 2.0156631200229156,
+    "mae": 1.6043631359240322,
+    "avg_width": 6.635712575465478,
+    "split_dir": "results/uccle/TN/TNx/Monthly/Laplace/TNx_dynamic_dynamic_dynamic_1892-01-2022-12_20260105_204153/crossval/cv_split_p0p9_t1414_h120"
+  }
+]

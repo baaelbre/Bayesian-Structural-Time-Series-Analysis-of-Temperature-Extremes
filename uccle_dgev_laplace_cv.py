@@ -6,41 +6,20 @@ Uccle DGEV Laplace Cross-Validation (TXx, TXn, TNx, TNn, Precx; Seasonal / Month
 
 Thin wrapper around simulator.dgev_laplace_cv.DGEVCrossValidator with Uccle defaults.
 
-Uccle defaults / conventions
+Key fix vs earlier versions:
 ----------------------------
-- Forced origin: start_date = 1892-01-01 (unless --start-date overrides)
-- Aggregation:
-    * Monthly  -> period = 12
-    * Seasonal -> period = 4
-- Robust run discovery:
-    1) optimization.posterior_bundle.find_latest_run (posterior.npz runs)
-    2) fallback recursive search for posterior*.npz (simulator.utils.find_latest_posterior_npz)
-- IMPORTANT: Your optimizer stores FFBS knobs under meta['knobs'].
-  DGEVCrossValidator expects them as top-level meta keys, so we lift:
-    ffbs_C0_scale, ffbs_C0_A, ffbs_jitter (if present), sigma2_eff
-
-Plot conventions (Uccle-style)
------------------------------
-- Observations (train + held-out): black
-- Forecast median + credible band: TX* red, TN* blue (else C0)
-- No title, no legend
-
-Outputs (default: <run>/crossval)
----------------------------------
-<run>/crossval/
-  cv_split_<label>_t<idx>_h<H>/
-      forecast_fine.png
-      metrics.json
-      forecast_payload.npz
-  crossval_summary.csv
-  crossval_summary.json
+When searching "latest", we IGNORE CV/crossval folders and we ONLY accept posterior*.npz
+files that have a matching posterior*.meta.json next to them. This prevents accidentally
+loading fold posteriors that don't carry metadata json (and would crash load_posterior).
 """
 
 import os
 import sys
+import re
 import argparse
 from datetime import datetime
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 
@@ -48,14 +27,14 @@ import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
-from simulator.utils import _ensure_dir, _parse_date_ymd, find_latest_posterior_npz  # type: ignore
+from simulator.utils import _ensure_dir, _parse_date_ymd  # type: ignore
 
 from simulator.dgev_laplace_cv import DGEVCrossValidator  # type: ignore
 from optimization.dgev_laplace_2 import Priors, SamplerConfig  # type: ignore
 
 
 # =============================================================================
-# Uccle paths / discovery
+# Uccle path mapping (MATCHES uccle_dgev_laplace_plotter.py)
 # =============================================================================
 def _parse_agg(agg: str) -> str:
     a = str(agg).strip().lower()
@@ -66,11 +45,10 @@ def _parse_agg(agg: str) -> str:
     raise ValueError(f"Unknown aggregation {agg!r} (use Seasonal or Monthly).")
 
 
-def default_root(series: str, agg: str) -> str:
+def uccle_root(series: str, agg: str) -> str:
     base = "results/uccle"
     s = str(series).strip()
     agg_dir = _parse_agg(agg)
-
     mapping = {
         "TXx": os.path.join(base, "TX", "TXx", agg_dir, "Laplace"),
         "TXn": os.path.join(base, "TX", "TXn", agg_dir, "Laplace"),
@@ -83,29 +61,131 @@ def default_root(series: str, agg: str) -> str:
     return mapping[s]
 
 
+# =============================================================================
+# Robust discovery that avoids CV folders and requires posterior.meta.json
+# =============================================================================
+_SKIP_DIRNAMES = {
+    "cv",
+    "crossval",
+    "cross-validation",
+    "forecast",
+    "figures",
+    "gof",
+    "plots",
+}
+
+
+def _is_in_skipped_dir(p: Path) -> bool:
+    parts = [x.lower() for x in p.parts]
+    return any(x in _SKIP_DIRNAMES for x in parts)
+
+
+def _extract_ts_from_path(path_str: str) -> Optional[float]:
+    m = re.search(r"(\d{8})_(\d{6})", path_str)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _meta_path_for_npz(npz_path: Path) -> Path:
+    # posterior.npz -> posterior.meta.json
+    # posterior_foo.npz -> posterior_foo.meta.json
+    return npz_path.with_suffix(".meta.json")
+
+
+def find_latest_posterior_npz_with_meta(root: str) -> Optional[str]:
+    root_p = Path(root)
+    if not root_p.exists():
+        return None
+
+    cands: List[Path] = []
+    for npz in root_p.rglob("posterior*.npz"):
+        if _is_in_skipped_dir(npz):
+            continue
+        meta = _meta_path_for_npz(npz)
+        if not meta.exists():
+            continue
+        cands.append(npz)
+
+    if not cands:
+        return None
+
+    def key(p: Path) -> Tuple[int, float]:
+        ts = _extract_ts_from_path(str(p))
+        if ts is not None:
+            return (1, ts)
+        return (0, p.stat().st_mtime)
+
+    return str(max(cands, key=key))
+
+
+def _validate_target_has_meta(target: str) -> None:
+    t = Path(target)
+    if t.is_dir():
+        npz = t / "posterior.npz"
+        meta = t / "posterior.meta.json"
+        if npz.exists() and not meta.exists():
+            raise FileNotFoundError(
+                f"Target directory contains posterior.npz but not posterior.meta.json:\n  {t}"
+            )
+        return
+    if t.is_file() and t.suffix.lower() == ".npz":
+        meta = _meta_path_for_npz(t)
+        if not meta.exists():
+            raise FileNotFoundError(
+                f"Target npz exists but metadata json is missing:\n  npz:  {t}\n  meta: {meta}"
+            )
+
+
 def resolve_bundle(*, target: Optional[str], series: str, agg: str, root: Optional[str]) -> Any:
+    """
+    Return PosteriorBundle from load_posterior().
+    Discovery is identical in *spirit* to the plotter, but with an extra safety check:
+    we ignore CV-like folders and require posterior.meta.json.
+    """
     if target:
+        _validate_target_has_meta(target)
         return load_posterior(target)
 
-    search_root = root or default_root(series, agg)
-    print(f"[info] searching latest posterior run under: {search_root!r}")
+    search_root = root or uccle_root(series, agg)
+    print(f"[info] --target not provided; searching for latest VALID run under: {search_root!r}")
 
+    # 1) Try find_latest_run, but reject if it's inside CV/ or missing meta
     run_path = find_latest_run(root=search_root)
     if run_path is not None:
-        print(f"[info] using latest run: {run_path}")
-        return load_posterior(run_path)
+        rp = Path(str(run_path))
+        # If find_latest_run returns a folder, check folder/meta; if it's a file, check sidecar meta.
+        if not _is_in_skipped_dir(rp):
+            try:
+                _validate_target_has_meta(str(rp))
+                print(f"[info] Using latest run (validated): {run_path}")
+                return load_posterior(run_path)
+            except FileNotFoundError:
+                print(f"[warn] find_latest_run returned a run without meta (skipping): {run_path}")
+        else:
+            print(f"[warn] find_latest_run returned a CV-like path (skipping): {run_path}")
 
-    npz_path = find_latest_posterior_npz(search_root)
-    if npz_path is None:
+    # 2) Fallback: scan posterior*.npz that HAVE meta and are not in CV-like dirs
+    npz = find_latest_posterior_npz_with_meta(search_root)
+    if npz is None:
         raise SystemExit(
-            f"[error] No posterior runs found under {search_root!r}.\n"
-            f"  → Tried find_latest_run() (posterior.npz runs) and recursive search (posterior*.npz)."
+            f"[error] No VALID posterior found under {search_root!r}.\n"
+            f"  → Need posterior*.npz WITH matching posterior*.meta.json.\n"
+            f"  → Also skipping folders named: {sorted(_SKIP_DIRNAMES)}\n"
+            f"  → Provide --target explicitly to a run directory if needed."
         )
 
-    print(f"[info] find_latest_run found nothing; using latest npz: {npz_path}")
-    return load_posterior(npz_path)
+    print(f"[info] Using latest npz with metadata: {npz}")
+    return load_posterior(npz)
 
 
+# =============================================================================
+# Misc helpers
+# =============================================================================
 def _parse_date_optional(s: Optional[str]) -> Optional[datetime]:
     if s is None:
         return None
@@ -119,7 +199,7 @@ def _default_ylabel(series: str) -> str:
     s = str(series).strip()
     if s.startswith(("TX", "TN")):
         return "T (°C)"
-    if s.startswith(("Prec", "PREC")):
+    if s.lower().startswith("prec"):
         return "Prec (mm)"
     return "y"
 
@@ -133,14 +213,14 @@ def build_argparser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # discovery
+    # discovery (plotter-style)
     p.add_argument("--target", type=str, default=None, help="Run dir or posterior.npz. If omitted, uses latest under --root.")
-    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TNn")
+    p.add_argument("--series", type=str, choices=["TXx", "TXn", "TNx", "TNn", "Precx"], default="TXn")
     p.add_argument("--agg", type=str, choices=["Seasonal", "Monthly"], default="Monthly")
     p.add_argument("--root", type=str, default=None, help="Search root when --target is omitted (defaults to Uccle layout).")
 
     # CV spec
-    p.add_argument("--splits", type=str, default="0.6,0.8,0.9", help="Comma-separated split specs (idx, fraction, or date).")
+    p.add_argument("--splits", type=str, default="0.6", help="Comma-separated split specs (idx, fraction, or date).")
     p.add_argument("--horizon", type=int, default=None, help="Forecast horizon in steps (months or seasons).")
 
     # plot / output
@@ -154,8 +234,8 @@ def build_argparser() -> argparse.ArgumentParser:
     # start date (Uccle default if omitted)
     p.add_argument("--start-date", type=str, default=None, help="Override start date (YYYY / YYYY-MM / YYYY-MM-DD).")
 
-    # per-split MCMC (mirrors uccle_dlm_crossval)
-    p.add_argument("--n-iter", type=int, default=4000)
+    # per-split MCMC
+    p.add_argument("--n-iter", type=int, default=5000)
     p.add_argument("--burn", type=int, default=1000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed-mcmc", type=int, default=40)
@@ -170,7 +250,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--prior-a-lambda", type=float, default=None)
     p.add_argument("--prior-b-lambda", type=float, default=None)
 
-    # DGEV FFBS knobs (optional overrides; otherwise read from meta/knobs)
+    # FFBS knobs (optional overrides; otherwise read from meta/knobs)
     p.add_argument("--ffbs-C0-scale", type=float, default=None)
     p.add_argument("--ffbs-C0-A", type=float, default=None)
     p.add_argument("--ffbs-jitter", type=float, default=None)
@@ -191,22 +271,21 @@ def main() -> None:
     agg_dir = _parse_agg(args.agg)
     period = 12 if agg_dir == "Monthly" else 4
 
-    # Force Uccle origin + agg context, but keep other meta fields from the run
+    # meta injection (keep run meta; fill defaults)
     meta = dict(meta)
-    meta["start_date"] = "1892-01-01"
-    meta["freq"] = agg_dir
-    meta["agg"] = agg_dir
-    meta["period"] = int(period)
-    meta["series"] = str(args.series)  # drives TX/TN coloring + minima detection
+    meta["series"] = str(args.series)
+    meta["agg"] = str(args.agg)
+    meta.setdefault("start_date", "1892-01-01")
+    meta["period"] = int(meta.get("period", period) or period)
 
-    # IMPORTANT: lift knobs saved by your optimizer from meta['knobs'] to top-level keys
+    # IMPORTANT: lift knobs from meta['knobs'] to top-level keys
     knobs = meta.get("knobs", None)
     if isinstance(knobs, dict):
         for k in ("ffbs_C0_scale", "ffbs_C0_A", "ffbs_jitter", "sigma2_eff"):
             if k not in meta and k in knobs:
                 meta[k] = knobs[k]
 
-    # start date: forced meta unless user overrides
+    # start date override (CLI wins)
     sd = _parse_date_optional(args.start_date) if args.start_date else _parse_date_optional(meta.get("start_date"))
 
     # output
@@ -282,7 +361,6 @@ def main() -> None:
         f"[info] series={args.series}, agg={agg_dir}, T={cv.y.size}, period={cv.period}, "
         f"start_date={cv.meta.get('start_date')}, minima={cv.minima}"
     )
-    # helpful: show the knobs the CV will use
     print(
         f"[info] knobs: ffbs_C0_scale={cv.meta.get('ffbs_C0_scale', None)} "
         f"ffbs_C0_A={cv.meta.get('ffbs_C0_A', None)} "

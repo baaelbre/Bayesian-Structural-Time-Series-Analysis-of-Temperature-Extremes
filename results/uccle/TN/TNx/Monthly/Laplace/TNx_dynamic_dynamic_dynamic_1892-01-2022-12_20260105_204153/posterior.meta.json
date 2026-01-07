@@ -60,7 +60,7 @@
   "ffbs_C0_scale": 1e-06,
   "ffbs_C0_A": 1e-06,
   "sigma2_eff": 1.0,
-  "start_date": "1892-01-01",
+  "start_date": null,
   "safety": {
     "max_tries_block": 25,
     "s_cap": 100000000.0,
