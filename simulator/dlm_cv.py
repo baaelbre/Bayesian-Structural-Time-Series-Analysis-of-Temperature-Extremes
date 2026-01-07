@@ -150,6 +150,7 @@ class DLMCrossValidator:
         seed_forecast: int = 123,
         window: int = 240,
         show: bool = False,
+        ylabel: str = "y ",
         path_hint: Optional[str] = None,
     ):
         self.y = np.asarray(y, float).ravel()
@@ -173,6 +174,7 @@ class DLMCrossValidator:
         self.seed_forecast = int(seed_forecast)
         self.window = int(window)
         self.show = bool(show)
+        self.ylabel = str(ylabel)
 
         # series inference for coloring
         self.path_hint = path_hint
@@ -198,6 +200,7 @@ class DLMCrossValidator:
         seed_forecast: int = 123,
         window: int = 240,
         show: bool = False,
+        ylabel: str = "y ",
         priors: Optional[Priors] = None,
         cfg: Optional[SamplerConfig] = None,
     ) -> "DLMCrossValidator":
@@ -222,6 +225,7 @@ class DLMCrossValidator:
             seed_forecast=seed_forecast,
             window=window,
             show=show,
+            ylabel=ylabel,
             path_hint=str(npz_path),
         )
 
@@ -533,7 +537,7 @@ class DLMCrossValidator:
                 y_future_actual=y_test,
                 split_x=fr.split_x,
                 title="",                 # ignored
-                ylabel="y (fine-scale)",
+                ylabel=self.ylabel,
                 save_path=os.path.join(split_dir, "forecast_fine.png"),
             )
 
@@ -661,7 +665,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--splits",
         type=str,
-        default="0.6,0.8,0.9",
+        default="0.6",
         help=(
             "Comma-separated split specs. Each item can be:\n"
             "  - an integer index (0-based), e.g. 900\n"
@@ -676,7 +680,7 @@ if __name__ == "__main__":
     p.add_argument("--seed-forecast", type=int, default=123, help="RNG seed for posterior predictive simulation.")
     p.add_argument("--window", type=int, default=240, help="Plot window: last N training points to show before split.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
-
+    p.add_argument("--ylabel", type=str, default="y", help="Y-axis label for forecast plots.")
     p.add_argument(
         "--start-date",
         type=str,
@@ -762,6 +766,7 @@ if __name__ == "__main__":
         seed_forecast=int(args.seed_forecast),
         window=int(args.window),
         show=bool(args.show),
+        ylabel=str(args.ylabel),
         priors=pri,
         cfg=cfg,
     )

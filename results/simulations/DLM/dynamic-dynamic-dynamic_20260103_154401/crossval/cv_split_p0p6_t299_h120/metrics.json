@@ -43,5 +43,6 @@
     "b_lambda": 0.001
   },
   "seed_forecast": 123,
-  "window": 240
+  "window": 240,
+  "series": ""
 }

@@ -149,7 +149,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=12 * 50, help="Plot window (last N training months).")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Output dir. Default: <run>/crossval")
-
+    p.add_argument("--ylabel", type=str, default="T (°C)", help="Y-axis label for forecast plots.")
+    
     # start date (Uccle default if omitted)
     p.add_argument("--start-date", type=str, default=None, help="Override start date (YYYY / YYYY-MM / YYYY-MM-DD).")
 
@@ -235,6 +236,7 @@ def main() -> None:
         seed_forecast=int(args.seed_forecast),
         window=int(args.window),
         show=bool(args.show),
+        ylabel=str(args.ylabel),
         path_hint=str(npz_path),
     )
 

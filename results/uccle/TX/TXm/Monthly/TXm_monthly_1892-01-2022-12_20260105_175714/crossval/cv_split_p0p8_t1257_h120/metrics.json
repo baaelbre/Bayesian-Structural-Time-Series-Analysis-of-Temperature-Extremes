@@ -43,5 +43,6 @@
     "b_lambda": 0.001
   },
   "seed_forecast": 123,
-  "window": 600
+  "window": 600,
+  "series": "TXm"
 }

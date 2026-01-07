@@ -1,0 +1,48 @@
+{
+  "npz_path": "results/simulations/DLM\\dynamic-dynamic-dynamic_20260103_154401\\posterior.npz",
+  "out_dir": "results/simulations/DLM\\dynamic-dynamic-dynamic_20260103_154401\\gof",
+  "seed": 123,
+  "S_total": 4000,
+  "S_used": 4000,
+  "T": 500,
+  "T_eff": 500,
+  "n_nonfinite_y": 0,
+  "level": 0.9,
+  "bins": 20,
+  "pit": {
+    "skipped": false,
+    "hist": {
+      "bins": 20,
+      "level": 0.9,
+      "max_abs_dev_from_uniform_density_median": 0.1200000000000001
+    },
+    "pp": {
+      "level": 0.9,
+      "max_abs_dev_from_45deg_median": 0.015291202835239992
+    }
+  },
+  "ppc": {
+    "skipped": false,
+    "p_B": 0.45825,
+    "ks_obs_summary": {
+      "n": 4000.0,
+      "mean": 0.0405462472672163,
+      "sd": 0.01301171072570954,
+      "min": 0.017691582902503,
+      "max": 0.2893843369577991,
+      "median": 0.038416443906991726,
+      "q05": 0.025270349089205172,
+      "q95": 0.062262387687498304
+    },
+    "ks_rep_summary": {
+      "n": 4000.0,
+      "mean": 0.03877064583813639,
+      "sd": 0.011657302427666995,
+      "min": 0.015497964502737605,
+      "max": 0.09830473611899815,
+      "median": 0.036943763683446346,
+      "q05": 0.022877911937333746,
+      "q95": 0.06026275712866926
+    }
+  }
+}

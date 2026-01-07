@@ -10,29 +10,5 @@
     "mae": 1.7802810780293017,
     "avg_width": 8.803232145374727,
     "split_dir": "results/simulations/DLM\\dynamic-dynamic-dynamic_20260103_154401\\crossval\\cv_split_p0p6_t299_h120"
-  },
-  {
-    "split_label": "p0p8",
-    "split_idx": 399,
-    "T_train": 400,
-    "H": 100,
-    "level": 0.9,
-    "coverage": 0.88,
-    "rmse": 2.3853475313550647,
-    "mae": 1.8799707973335054,
-    "avg_width": 7.7418397326078345,
-    "split_dir": "results/simulations/DLM\\dynamic-dynamic-dynamic_20260103_154401\\crossval\\cv_split_p0p8_t399_h100"
-  },
-  {
-    "split_label": "p0p9",
-    "split_idx": 449,
-    "T_train": 450,
-    "H": 50,
-    "level": 0.9,
-    "coverage": 0.84,
-    "rmse": 2.4510811863288127,
-    "mae": 1.92090421728888,
-    "avg_width": 7.136476510829836,
-    "split_dir": "results/simulations/DLM\\dynamic-dynamic-dynamic_20260103_154401\\crossval\\cv_split_p0p9_t449_h50"
   }
 ]

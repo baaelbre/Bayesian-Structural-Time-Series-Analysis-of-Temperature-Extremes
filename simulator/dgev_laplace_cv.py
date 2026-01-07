@@ -1,4 +1,4 @@
-# %% simulator/dgev_crossval.py
+# %% simulator/dgev_laplace_cv.py
 from __future__ import annotations
 """
 Rolling-origin cross-validation for the DGEV (Laplace NCP + Bayesian lasso sampler)
@@ -7,6 +7,12 @@ This mirrors simulator/dlm_crossval.py as closely as possible, but for the DGEV 
   - Robust run discovery like simulator/dlm_plotter.py:
       load_posterior/find_latest_run (+ fallback to newest posterior*.npz)
   - Re-fits the DGEV on training prefixes and produces fine-scale forecast fan charts
+
+Plot conventions (Uccle-style)
+-----------------------------
+- Observations (train + held-out): black
+- Forecast median + credible band: TX* red, TN* blue (else C0)
+- No title, no legend
 
 Reusable entry point:
     DGEVCrossValidator
@@ -18,7 +24,7 @@ Expected bundle content
 - draws['y'] : (T,) the observation series on *MODEL* scale (may be sign-flipped for minima)
 - meta['period'] optional (default 12)
 - meta['start_date'] optional (or pass --start-date) for date-like splits
-- meta may carry "minima"/"series"/"model_sign"/"data_transform" hints (used for plot-scale transforms)
+- meta may carry "minima"/"series"/"model_sign"/"data_transform" hints
 
 Outputs (default)
 -----------------
@@ -26,13 +32,14 @@ Outputs (default)
   cv_split_<label>_t<idx>_h<H>/
       forecast_fine.png
       metrics.json
-      forecast_payload.npz   (includes y_train/y_test on model+plot scale, y_future_draws, x axes, etc.)
+      forecast_payload.npz   (includes y_train/y_test on model scale, y_test_plot, y_future_draws, x axes, etc.)
   crossval_summary.csv
   crossval_summary.json
 """
 
 import os
 import sys
+import re
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -76,31 +83,42 @@ except Exception:
 try:
     from simulator.dgev_laplace_forecast import simulate_dgev_forecast  # type: ignore
 except Exception:
-    from dgev_forecast import simulate_dgev_forecast  # type: ignore
+    from dgev_laplace_forecast import simulate_dgev_forecast  # type: ignore
 
 
 TimeSpec = Union[int, float, str]
 
 
 # =============================================================================
-# Data containers
+# Color logic (mirrors uccle_dlm_plotter.py / dlm_crossval.py)
 # =============================================================================
-@dataclass(frozen=True)
-class SplitResult:
-    split_label: str
-    split_idx: int
-    T_train: int
-    H: int
-    level: float
-    coverage: float
-    rmse: float
-    mae: float
-    avg_width: float
-    split_dir: str
+def series_color(series: str) -> str:
+    s = str(series).upper()
+    if s.startswith("TX"):
+        return "red"
+    if s.startswith("TN"):
+        return "blue"
+    return "C0"
+
+
+def infer_series_code(meta: Dict[str, Any], path_hint: Optional[str] = None) -> str:
+    # Prefer explicit metadata
+    for k in ("series", "target", "name"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Fallback: infer from path
+    if path_hint:
+        m = re.search(r"\b(TX[a-zA-Z0-9]*|TN[a-zA-Z0-9]*|PREC[a-zA-Z0-9]*|PRECX)\b", path_hint.upper())
+        if m:
+            return m.group(1)
+
+    return ""
 
 
 # =============================================================================
-# Minima detection (mirrors simulator/dgev_forecast.py logic)
+# Minima detection (mirrors simulator/dgev_laplace_forecast style)
 # =============================================================================
 def _coerce_bool(x: Any) -> Optional[bool]:
     if x is None:
@@ -143,12 +161,31 @@ def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
     ser = meta.get("series", None)
     if isinstance(ser, str):
         ss = ser.strip()
+        # Your Uccle convention: TXn/TNn are minima (model runs on -y)
         if ss in {"TNn", "TXn"}:
             return True
-        if len(ss) >= 2 and ss.endswith("n") and ss[:-1].isalpha():
+        # heuristic: ends with n often denotes minima
+        if len(ss) >= 2 and ss.endswith("n"):
             return True
 
     return False
+
+
+# =============================================================================
+# Data containers
+# =============================================================================
+@dataclass(frozen=True)
+class SplitResult:
+    split_label: str
+    split_idx: int
+    T_train: int
+    H: int
+    level: float
+    coverage: float
+    rmse: float
+    mae: float
+    avg_width: float
+    split_dir: str
 
 
 # =============================================================================
@@ -168,6 +205,8 @@ class DGEVCrossValidator:
         seed_forecast: int = 123,
         window: int = 240,
         show: bool = False,
+        ylabel: str = "y",
+        path_hint: Optional[str] = None,
         # optional knobs to match original run meta if present
         ffbs_C0_scale: Optional[float] = None,
         ffbs_C0_A: Optional[float] = None,
@@ -195,11 +234,14 @@ class DGEVCrossValidator:
         self.seed_forecast = int(seed_forecast)
         self.window = int(window)
         self.show = bool(show)
+        self.ylabel = str(ylabel)
+
+        # series inference (for coloring)
+        self.path_hint = path_hint
+        self.series_code = infer_series_code(self.meta, self.path_hint)
 
         # DGEV-specific run knobs (try to mirror original run if present)
-        self.ffbs_C0_scale = float(
-            ffbs_C0_scale if ffbs_C0_scale is not None else self.meta.get("ffbs_C0_scale", 1e-6)
-        )
+        self.ffbs_C0_scale = float(ffbs_C0_scale if ffbs_C0_scale is not None else self.meta.get("ffbs_C0_scale", 1e-6))
         self.ffbs_C0_A = float(ffbs_C0_A if ffbs_C0_A is not None else self.meta.get("ffbs_C0_A", 1e-6))
         self.ffbs_jitter = float(ffbs_jitter if ffbs_jitter is not None else self.meta.get("ffbs_jitter", 1e-12))
         self.sigma2_eff = float(sigma2_eff if sigma2_eff is not None else self.meta.get("sigma2_eff", 1.0))
@@ -209,6 +251,8 @@ class DGEVCrossValidator:
         self.meta["layout"] = list(self.layout)
         if self.start_date_override is not None:
             self.meta["start_date"] = self.start_date_override.strftime("%Y-%m-%d")
+        if self.series_code and not isinstance(self.meta.get("series", None), str):
+            self.meta["series"] = str(self.series_code)
 
         # cached minima flag (used for held-out back-transform)
         self.minima = bool(_detect_minima_from_meta(self.meta))
@@ -225,6 +269,7 @@ class DGEVCrossValidator:
         seed_forecast: int = 123,
         window: int = 240,
         show: bool = False,
+        ylabel: str = "y",
         priors: Optional[Priors] = None,
         cfg: Optional[SamplerConfig] = None,
         ffbs_C0_scale: Optional[float] = None,
@@ -253,6 +298,8 @@ class DGEVCrossValidator:
             seed_forecast=seed_forecast,
             window=window,
             show=show,
+            ylabel=ylabel,
+            path_hint=str(npz_path),
             ffbs_C0_scale=ffbs_C0_scale,
             ffbs_C0_A=ffbs_C0_A,
             ffbs_jitter=ffbs_jitter,
@@ -294,6 +341,7 @@ class DGEVCrossValidator:
         layout = meta.get("layout", None)
         if isinstance(layout, (list, tuple)) and len(layout) >= 2:
             return list(layout)
+        # default: alpha, beta, g1..g_{p-1}
         return ["alpha", "beta"] + [f"g{k}" for k in range(1, int(period))]
 
     @staticmethod
@@ -385,7 +433,7 @@ class DGEVCrossValidator:
             sig0 = 1.0
 
         K = int(self.period) - 1
-        if self.priors.m0_gamma is not None:
+        if getattr(self.priors, "m0_gamma", None) is not None:
             g0 = np.asarray(self.priors.m0_gamma, float).ravel()
             gamma0_init = g0.copy() if g0.size == K else np.zeros((K,), float)
         else:
@@ -414,8 +462,7 @@ class DGEVCrossValidator:
             ffbs_jitter=float(self.ffbs_jitter),
             sigma2_eff=float(self.sigma2_eff),
         )
-        post = sampler.run()
-        post = dict(post)
+        post = dict(sampler.run())
         post["y"] = y_train.copy()
         return post
 
@@ -425,6 +472,8 @@ class DGEVCrossValidator:
         meta_train["layout"] = list(self.layout)
         if self.start_date_override is not None:
             meta_train["start_date"] = self.start_date_override.strftime("%Y-%m-%d")
+        if self.series_code:
+            meta_train["series"] = str(self.series_code)
 
         return simulate_dgev_forecast(
             draws=post_train,
@@ -472,24 +521,31 @@ class DGEVCrossValidator:
         y_future_draws: np.ndarray,
         y_future_actual: np.ndarray,
         split_x: Any,
-        title: str,
+        title: str,   # kept for API compatibility; ignored
         ylabel: str,
         save_path: str,
     ) -> None:
         med, lo, hi = self.summarize_ribbon(y_future_draws, level=self.level)
         y_true = np.asarray(y_future_actual, float).ravel()
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 3.9))
-        ax.plot(x_obs, y_obs, lw=1.2, label="observed (train)")
-        ax.plot(x_future, med, lw=1.6, label="forecast median")
-        ax.fill_between(x_future, lo, hi, alpha=0.25, label=f"forecast {int(round(self.level*100))}% band")
-        ax.plot(x_future, y_true, lw=1.3, linestyle="--", label="observed (held-out)")
+        col = series_color(self.series_code or infer_series_code(self.meta, self.path_hint))
 
-        ax.axvline(split_x, lw=1.0, alpha=0.8)
-        ax.set_title(title)
+        fig, ax = plt.subplots(1, 1, figsize=(12, 3.9))
+
+        # observations: black
+        ax.plot(x_obs, y_obs, lw=1.2, color="black")
+        ax.plot(x_future, y_true, lw=1.3, linestyle="--", color="black")
+
+        # forecast: colored median + colored band
+        ax.fill_between(x_future, lo, hi, alpha=0.25, color=col, linewidth=0)
+        ax.plot(x_future, med, lw=1.8, color=col)
+
+        ax.axvline(split_x, lw=1.0, alpha=0.8, color="black")
+
+        # no title / no legend
+        ax.set_title("")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="best")
 
         plt.tight_layout()
         _ensure_dir(os.path.dirname(save_path))
@@ -547,7 +603,7 @@ class DGEVCrossValidator:
             # fit on prefix (MODEL scale)
             post_train = self.fit_on_prefix(y_train_model)
 
-            # forecast (returns PLOT scale series and draws)
+            # forecast (expects PLOT scale series and draws)
             fr = self.forecast_from_posterior(post_train, horizon=H)
 
             # held-out actual on PLOT scale (match forecast output)
@@ -566,10 +622,6 @@ class DGEVCrossValidator:
             y_future_draws = np.asarray(fr.y_future)[:, :H]  # (S, H) PLOT scale
 
             # plot
-            ylabel = "y (fine-scale; plot scale)"
-            if minima:
-                ylabel += " [minima series]"
-
             self.plot_forecast_with_actual(
                 x_obs=x_obs,
                 y_obs=y_obs,
@@ -577,37 +629,15 @@ class DGEVCrossValidator:
                 y_future_draws=y_future_draws,
                 y_future_actual=y_test_plot,
                 split_x=fr.split_x,
-                title=f"DGEV crossval forecast (split={split_lab}, idx={split_idx}, h={H})",
-                ylabel=ylabel,
+                title="",  # ignored
+                ylabel=self.ylabel,
                 save_path=os.path.join(split_dir, "forecast_fine.png"),
             )
 
             # metrics (PLOT scale)
             m = self.compute_metrics(y_future_draws, y_test_plot)
 
-            # save forecast payload (docstring promised this)
-            y_train_plot = (-y_train_model) if minima else y_train_model
-            np.savez_compressed(
-                os.path.join(split_dir, "forecast_payload.npz"),
-                split_label=str(split_lab),
-                split_idx=int(split_idx),
-                T_train=int(T_train),
-                H=int(H),
-                level=float(self.level),
-                minima=bool(minima),
-                y_train_model=y_train_model,
-                y_test_model=y_test_model,
-                y_train_plot=y_train_plot,
-                y_test_plot=y_test_plot,
-                y_future_draws=y_future_draws,
-                x_obs=x_obs,
-                y_obs=y_obs,
-                x_future=x_future,
-                split_x=float(fr.split_x),
-                x_axis_full=np.asarray(fr.x_axis_full),
-            )
-
-            # write per-split metrics/config
+            # write per-split artifacts
             with open(os.path.join(split_dir, "metrics.json"), "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -624,6 +654,7 @@ class DGEVCrossValidator:
                         "priors": asdict(self.priors),
                         "seed_forecast": int(self.seed_forecast),
                         "window": int(self.window),
+                        "series": str(self.series_code),
                         "dgev_knobs": {
                             "ffbs_C0_scale": float(self.ffbs_C0_scale),
                             "ffbs_C0_A": float(self.ffbs_C0_A),
@@ -654,6 +685,32 @@ class DGEVCrossValidator:
                     split_dir=str(split_dir),
                 )
             )
+
+            # optional payload (mirror dlm_crossval style)
+            try:
+                y_train_plot = (-y_train_model) if minima else y_train_model
+                np.savez_compressed(
+                    os.path.join(split_dir, "forecast_payload.npz"),
+                    y_train_model=y_train_model,
+                    y_test_model=y_test_model,
+                    y_train_plot=y_train_plot,
+                    y_test_plot=y_test_plot,
+                    y_future_draws=y_future_draws,
+                    x_obs=x_obs,
+                    y_obs=y_obs,
+                    x_future=x_future,
+                    x_axis_full=np.asarray(fr.x_axis_full),
+                    split_x=float(fr.split_x),
+                    split_label=str(split_lab),
+                    split_idx=int(split_idx),
+                    T_train=int(T_train),
+                    H=int(H),
+                    level=float(self.level),
+                    minima=bool(minima),
+                    series=str(self.series_code),
+                )
+            except Exception as e:
+                print(f"[warn] could not write forecast_payload.npz: {e}")
 
         # combined summary
         if results:
@@ -699,7 +756,7 @@ def _parse_date_optional(s: Optional[str]) -> Optional[datetime]:
 
 def _parse_csv_floats(s: Optional[str], expected_len: Optional[int] = None) -> Optional[List[float]]:
     """
-    Minimal CSV float parser (mirrors optimization.utils_2.parse_csv_floats spirit).
+    Minimal CSV float parser.
     Accepts: "1,2,3" or "1 2 3" or "[1,2,3]".
     """
     if s is None:
@@ -732,13 +789,18 @@ if __name__ == "__main__":
 
     # Run discovery
     p.add_argument("--target", type=str, default=None, help="Run dir or posterior.npz. If omitted, uses latest under --root.")
-    p.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO", help="Search root when --target is omitted.")
+    p.add_argument(
+        "--root",
+        type=str,
+        default="results/simulations/DGEV_NCP_LASSO",
+        help="Search root when --target is omitted.",
+    )
 
     # Splits
     p.add_argument(
         "--splits",
         type=str,
-        default="0.6,0.8,0.9",
+        default="0.6",
         help=(
             "Comma-separated split specs. Each item can be:\n"
             "  - an integer index (0-based), e.g. 900\n"
@@ -753,6 +815,7 @@ if __name__ == "__main__":
     p.add_argument("--seed-forecast", type=int, default=123, help="RNG seed for posterior predictive simulation.")
     p.add_argument("--window", type=int, default=240, help="Plot window: last N training points to show before split.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
+    p.add_argument("--ylabel", type=str, default="y", help="Y-axis label for forecast plots.")
 
     p.add_argument(
         "--start-date",
@@ -769,7 +832,7 @@ if __name__ == "__main__":
     p.add_argument("--no-progress", action="store_true", default=False, help="Disable sampler progress prints.")
     p.add_argument("--progress-every", type=int, default=0, help="Sampler progress frequency (0 => ~2%).")
 
-    # DGEV safety knobs (SamplerConfig fields)
+    # DGEV safety knobs (SamplerConfig fields) — optional
     p.add_argument("--max-tries-block", type=int, default=None, help="Retry count for reject/restore blocks (optional).")
     p.add_argument("--s-cap", type=float, default=None, help="Cap on |s_*| (optional).")
     p.add_argument("--laplace-z-clip", type=float, default=None, help="Clip on Laplace pseudo shift (optional).")
@@ -801,7 +864,7 @@ if __name__ == "__main__":
 
     args = p.parse_args()
 
-    # Resolve run path like dlm_plotter
+    # Resolve run path like dlm_crossval
     run_path = DGEVCrossValidator.resolve_run_path(target=args.target, root=args.root)
     bundle = load_posterior(run_path)
     npz_path = bundle.npz_path
@@ -859,7 +922,6 @@ if __name__ == "__main__":
         progress=(not bool(args.no_progress)),
         progress_every=int(args.progress_every),
     )
-    # Optional safety overrides
     if args.max_tries_block is not None:
         cfg.max_tries_block = int(args.max_tries_block)
     if args.s_cap is not None:
@@ -880,6 +942,7 @@ if __name__ == "__main__":
         seed_forecast=int(args.seed_forecast),
         window=int(args.window),
         show=bool(args.show),
+        ylabel=str(args.ylabel),
         priors=pri,
         cfg=cfg,
         ffbs_C0_scale=args.ffbs_C0_scale,
@@ -890,7 +953,7 @@ if __name__ == "__main__":
 
     print(f"[info] using posterior: {bundle.npz_path}")
     print(f"[info] writing crossval outputs to: {out_dir}")
-    print(f"[info] T={cv.y.size}, period={cv.period}, minima={cv.minima}")
+    print(f"[info] T={cv.y.size}, period={cv.period}, series={cv.series_code!r}, minima={cv.minima}")
 
     cv.run(splits=splits, horizon=int(args.horizon))
     print("[done] cross-validation finished.")
