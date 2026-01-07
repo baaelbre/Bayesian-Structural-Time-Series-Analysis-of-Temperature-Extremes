@@ -12,11 +12,12 @@ Uccle defaults / conventions
 - Aggregation:
     * Monthly  -> period = 12
     * Seasonal -> period = 4
-- Robust run discovery (same philosophy as the Uccle plotter/DLM CV):
+- Robust run discovery:
     1) optimization.posterior_bundle.find_latest_run (posterior.npz runs)
     2) fallback recursive search for posterior*.npz (simulator.utils.find_latest_posterior_npz)
-- Minima handling:
-    * TXn and TNn are treated as minima series by default via meta['series'] (crossval detects this).
+- IMPORTANT: Your optimizer stores FFBS knobs under meta['knobs'].
+  DGEVCrossValidator expects them as top-level meta keys, so we lift:
+    ffbs_C0_scale, ffbs_C0_A, ffbs_jitter (if present), sigma2_eff
 
 Plot conventions (Uccle-style)
 -----------------------------
@@ -140,7 +141,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # CV spec
     p.add_argument("--splits", type=str, default="0.6,0.8,0.9", help="Comma-separated split specs (idx, fraction, or date).")
-    p.add_argument("--horizon", type=int, default=None, help="Forecast horizon in fine-scale steps (months or seasons).")
+    p.add_argument("--horizon", type=int, default=None, help="Forecast horizon in steps (months or seasons).")
 
     # plot / output
     p.add_argument("--level", type=float, default=0.90, help="Forecast band level.")
@@ -161,7 +162,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-progress", action="store_true", default=False)
     p.add_argument("--progress-every", type=int, default=0)
 
-    # small prior overrides (optional; keep it lean like the DLM wrapper)
+    # small prior overrides (optional)
     p.add_argument("--prior-a-sigma", type=float, default=None)
     p.add_argument("--prior-b-sigma", type=float, default=None)
     p.add_argument("--prior-xi-lower", type=float, default=None)
@@ -169,7 +170,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--prior-a-lambda", type=float, default=None)
     p.add_argument("--prior-b-lambda", type=float, default=None)
 
-    # (optional) DGEV sampler knobs used inside CV refits
+    # DGEV FFBS knobs (optional overrides; otherwise read from meta/knobs)
     p.add_argument("--ffbs-C0-scale", type=float, default=None)
     p.add_argument("--ffbs-C0-A", type=float, default=None)
     p.add_argument("--ffbs-jitter", type=float, default=None)
@@ -187,16 +188,23 @@ def main() -> None:
     if "y" not in draws:
         raise SystemExit("[error] posterior bundle must include draws['y'].")
 
-    # Force Uccle origin + aggregation-specific period
     agg_dir = _parse_agg(args.agg)
     period = 12 if agg_dir == "Monthly" else 4
 
+    # Force Uccle origin + agg context, but keep other meta fields from the run
     meta = dict(meta)
     meta["start_date"] = "1892-01-01"
     meta["freq"] = agg_dir
     meta["agg"] = agg_dir
     meta["period"] = int(period)
-    meta["series"] = str(args.series)  # <-- drives TX/TN coloring + minima detection in the CV class
+    meta["series"] = str(args.series)  # drives TX/TN coloring + minima detection
+
+    # IMPORTANT: lift knobs saved by your optimizer from meta['knobs'] to top-level keys
+    knobs = meta.get("knobs", None)
+    if isinstance(knobs, dict):
+        for k in ("ffbs_C0_scale", "ffbs_C0_A", "ffbs_jitter", "sigma2_eff"):
+            if k not in meta and k in knobs:
+                meta[k] = knobs[k]
 
     # start date: forced meta unless user overrides
     sd = _parse_date_optional(args.start_date) if args.start_date else _parse_date_optional(meta.get("start_date"))
@@ -205,7 +213,7 @@ def main() -> None:
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "crossval")
     _ensure_dir(out_dir)
 
-    # defaults that depend on agg (keep simple; still overridable)
+    # defaults depend on agg
     horizon_default = (12 * 10) if agg_dir == "Monthly" else (4 * 10)
     window_default = (12 * 50) if agg_dir == "Monthly" else (4 * 50)
 
@@ -249,7 +257,7 @@ def main() -> None:
         raise SystemExit("[error] --splits parsed to an empty list.")
 
     cv = DGEVCrossValidator(
-        y=np.asarray(draws["y"], float).ravel(),  # MODEL scale series (may already be sign-flipped for minima)
+        y=np.asarray(draws["y"], float).ravel(),  # MODEL scale series (TXn/TNn already negated by your runner)
         meta=meta,
         priors=pri,
         cfg=cfg,
@@ -261,6 +269,7 @@ def main() -> None:
         show=bool(args.show),
         ylabel=ylabel,
         path_hint=str(npz_path),
+        # optional overrides (if None, CV uses meta[...] which we lifted from meta['knobs'])
         ffbs_C0_scale=args.ffbs_C0_scale,
         ffbs_C0_A=args.ffbs_C0_A,
         ffbs_jitter=args.ffbs_jitter,
@@ -272,6 +281,13 @@ def main() -> None:
     print(
         f"[info] series={args.series}, agg={agg_dir}, T={cv.y.size}, period={cv.period}, "
         f"start_date={cv.meta.get('start_date')}, minima={cv.minima}"
+    )
+    # helpful: show the knobs the CV will use
+    print(
+        f"[info] knobs: ffbs_C0_scale={cv.meta.get('ffbs_C0_scale', None)} "
+        f"ffbs_C0_A={cv.meta.get('ffbs_C0_A', None)} "
+        f"ffbs_jitter={cv.meta.get('ffbs_jitter', None)} "
+        f"sigma2_eff={cv.meta.get('sigma2_eff', None)}"
     )
 
     cv.run(splits=splits, horizon=int(horizon))
