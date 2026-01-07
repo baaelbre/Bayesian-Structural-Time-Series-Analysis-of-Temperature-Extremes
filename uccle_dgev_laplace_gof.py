@@ -1,54 +1,74 @@
-# %% simulator/uccle_dlm_gof.py
+# %% simulator/uccle_dgev_laplace_gof.py
 from __future__ import annotations
-"""simulator/uccle_dlm_gof.py
+"""simulator/uccle_dgev_laplace_gof.py
 
-Uccle DLM Goodness-of-Fit (TXm, TNm; Monthly)
-=============================================
+Uccle DGEV Laplace-NCP Goodness-of-Fit (TXx, TXn, TNx, TNn, Precx; Monthly)
+===========================================================================
 
 Thin Uccle wrapper around:
-    simulator.dlm_gof (class-based)
+    simulator.dgev_laplace_gof (class-based)
 
 What this wrapper adds
 ----------------------
-- Uccle default result roots (matches run_uccle_dlm_lasso_monthly.py).
-- Robust latest-run discovery (delegated to simulator.dlm_gof.DLMGoodnessOfFit).
-- Optional post-hoc burn/thin (delegated to simulator.dlm_gof.DLMGoodnessOfFit).
+- Uccle default result roots (matches the Laplace runner layout, e.g. .../Monthly/Laplace).
+- Robust latest-run discovery (delegated to simulator.dgev_laplace_gof.DGEVLaplaceGoodnessOfFit).
+- Optional post-hoc burn/thin (delegated).
 - TX* plots are red; TN* plots are blue (PIT median/band and KS scatter points).
+  (Precipitation defaults to black.)
 - Forces Uccle monthly meta defaults (start_date=1892-01-01, period=12) for reporting.
 
 CLI examples
 ------------
-# Latest TNm run (default)
-python -m simulator.uccle_dlm_gof --series TNm
+# Latest TXn run (default root + TX coloring)
+python -m simulator.uccle_dgev_laplace_gof --series TXn
 
 # Specific run directory / posterior.npz
-python -m simulator.uccle_dlm_gof --target results/uccle/TN/TNm/Monthly/TNm_monthly_.../posterior.npz
+python -m simulator.uccle_dgev_laplace_gof --target results/uccle/TX/TXn/Monthly/Laplace/<run>/posterior.npz
 
 # Save elsewhere + show
-python -m simulator.uccle_dlm_gof --series TXm --out Figures/TXm/gof --show
+python -m simulator.uccle_dgev_laplace_gof --series TNx --out Figures/TNx/gof --show
 """
 
 import os
 import sys
 import argparse
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 # Make project root importable
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from simulator.dlm_gof import DLMGoodnessOfFit, GOFConfig  # type: ignore
+from simulator.dgev_laplace_gof import (  # type: ignore
+    DGEVLaplaceGoodnessOfFit,
+    GOFConfig,
+)
 
 
 # ---------------------------------------------------------------------
 # Uccle defaults
 # ---------------------------------------------------------------------
 def default_root(series: str) -> str:
+    """
+    Mirror the Laplace runner output layout.
+
+      TXx → results/uccle/TX/TXx/Monthly/Laplace
+      TXn → results/uccle/TX/TXn/Monthly/Laplace
+      TNx → results/uccle/TN/TNx/Monthly/Laplace
+      TNn → results/uccle/TN/TNn/Monthly/Laplace
+      Precx → results/uccle/Prec/Precx/Monthly/Laplace
+    """
     base = "results/uccle"
-    if series == "TXm":
-        return os.path.join(base, "TX", "TXm", "Monthly")
-    if series == "TNm":
-        return os.path.join(base, "TN", "TNm", "Monthly")
-    raise ValueError(f"Unknown series {series!r} for default root.")
+    s = str(series)
+
+    mapping = {
+        "TXx": os.path.join(base, "TX", "TXx", "Monthly", "Laplace"),
+        "TXn": os.path.join(base, "TX", "TXn", "Monthly", "Laplace"),
+        "TNx": os.path.join(base, "TN", "TNx", "Monthly", "Laplace"),
+        "TNn": os.path.join(base, "TN", "TNn", "Monthly", "Laplace"),
+        "Precx": os.path.join(base, "Prec", "Precx", "Monthly", "Laplace"),
+    }
+    if s not in mapping:
+        raise ValueError(f"Unknown series {s!r} for default root.")
+    return mapping[s]
 
 
 def series_color(series: str) -> str:
@@ -57,6 +77,8 @@ def series_color(series: str) -> str:
         return "red"
     if s.startswith("TN"):
         return "blue"
+    if s.startswith("PREC"):
+        return "black"
     return "C0"
 
 
@@ -65,12 +87,18 @@ def series_color(series: str) -> str:
 # ---------------------------------------------------------------------
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Uccle DLM GOF wrapper (PIT + PPC KS) using simulator.dlm_gof (class-based).",
+        description="Uccle DGEV Laplace-NCP GOF wrapper (PIT + PPC KS) using simulator.dgev_laplace_gof (class-based).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     p.add_argument("--target", type=str, default=None, help="Run directory or posterior.npz path.")
-    p.add_argument("--series", type=str, choices=["TXm", "TNm"], default="TNm", help="Series used for default root + colors.")
+    p.add_argument(
+        "--series",
+        type=str,
+        choices=["TXx", "TXn", "TNx", "TNn", "Precx"],
+        default="TNn",
+        help="Series used for default root + colors.",
+    )
     p.add_argument("--root", type=str, default=None, help="Search root if --target omitted (defaults to Uccle layout).")
 
     p.add_argument("--out", type=str, default=None, help="Directory to save figures + JSON (default: <run>/gof).")
@@ -106,6 +134,7 @@ def main() -> None:
         "freq": "Monthly",
         "period": 12,
         "series": str(args.series),
+        "model_family": "DGEV_LAPLACE_NCP",
     }
 
     cfg = GOFConfig(
@@ -123,7 +152,7 @@ def main() -> None:
         color=str(color),
     )
 
-    runner = DLMGoodnessOfFit(level=cfg.level, bins=cfg.bins, color=cfg.color)
+    runner = DGEVLaplaceGoodnessOfFit(level=cfg.level, bins=cfg.bins, color=cfg.color)
     runner.run_from_target(
         target=args.target,
         root=str(search_root),
@@ -132,7 +161,7 @@ def main() -> None:
         meta_override=meta_override,
     )
 
-    print("[done] Uccle DLM GOF written.")
+    print("[done] Uccle DGEV Laplace GOF written.")
 
 
 if __name__ == "__main__":

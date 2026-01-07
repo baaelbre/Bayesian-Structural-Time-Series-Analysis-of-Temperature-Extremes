@@ -5,34 +5,10 @@
     "T_train": 944,
     "H": 120,
     "level": 0.9,
-    "coverage": 0.8833333333333333,
-    "rmse": 2.379849670946664,
-    "mae": 1.8572970302400975,
-    "avg_width": 8.723760103532966,
-    "split_dir": "results/uccle/TX/TXn/Monthly/Laplace/TXn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_153120/crossval/cv_split_p0p6_t943_h120"
-  },
-  {
-    "split_label": "p0p8",
-    "split_idx": 1257,
-    "T_train": 1258,
-    "H": 120,
-    "level": 0.9,
-    "coverage": 0.8833333333333333,
-    "rmse": 2.5114536079805916,
-    "mae": 1.8620122439062896,
-    "avg_width": 8.594129553661029,
-    "split_dir": "results/uccle/TX/TXn/Monthly/Laplace/TXn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_153120/crossval/cv_split_p0p8_t1257_h120"
-  },
-  {
-    "split_label": "p0p9",
-    "split_idx": 1414,
-    "T_train": 1415,
-    "H": 120,
-    "level": 0.9,
-    "coverage": 0.9083333333333333,
-    "rmse": 2.497645306705665,
-    "mae": 1.8748280608319052,
-    "avg_width": 8.599053162616977,
-    "split_dir": "results/uccle/TX/TXn/Monthly/Laplace/TXn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_153120/crossval/cv_split_p0p9_t1414_h120"
+    "coverage": 0.8916666666666667,
+    "rmse": 2.386386560900479,
+    "mae": 1.8625009190087747,
+    "avg_width": 8.674734139011713,
+    "split_dir": "results/uccle\\TX\\TXn\\Monthly\\Laplace\\TXn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_153120\\crossval\\cv_split_p0p6_t943_h120"
   }
 ]

@@ -413,7 +413,7 @@ class DLMGoodnessOfFit:
         edges = np.linspace(0.0, 1.0, B + 1)
         mids = 0.5 * (edges[:-1] + edges[1:])
 
-        fig, ax = plt.subplots(1, 1, figsize=(8.5, 4.2))
+        fig, ax = plt.subplots(1, 1, figsize=(8.5, 6))
         if self.color:
             ax.fill_between(mids, dens_lo, dens_hi, alpha=0.25, step="mid", color=self.color)
             ax.step(mids, dens_med, where="mid", lw=2.0, color=self.color)
@@ -423,6 +423,7 @@ class DLMGoodnessOfFit:
         ax.axhline(1.0, lw=1.2, ls="--", color="k", alpha=0.7)
 
         ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0,2)
         ax.set_xlabel("PIT value")
         ax.set_ylabel("density")
         ax.grid(True, alpha=0.25)

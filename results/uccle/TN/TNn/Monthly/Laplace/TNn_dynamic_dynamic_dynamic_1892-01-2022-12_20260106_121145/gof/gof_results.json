@@ -1,0 +1,148 @@
+{
+  "npz_path": "results/uccle\\TN\\TNn\\Monthly\\Laplace\\TNn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_121145\\posterior.npz",
+  "out_dir": "results/uccle\\TN\\TNn\\Monthly\\Laplace\\TNn_dynamic_dynamic_dynamic_1892-01-2022-12_20260106_121145\\gof",
+  "seed": 123,
+  "S_total": 10000,
+  "S_used": 10000,
+  "T": 1572,
+  "T_eff": 1572,
+  "n_nonfinite_y": 0,
+  "level": 0.9,
+  "bins": 20,
+  "color": "blue",
+  "meta": {
+    "T": 1572,
+    "dim": 13,
+    "period": 12,
+    "layout": [
+      "alpha",
+      "beta",
+      "g1",
+      "g2",
+      "g3",
+      "g4",
+      "g5",
+      "g6",
+      "g7",
+      "g8",
+      "g9",
+      "g10",
+      "g11"
+    ],
+    "cfg": {
+      "n_iter": 20000,
+      "burn": 10000,
+      "thin": 1,
+      "random_seed": 42,
+      "progress": true,
+      "progress_every": 10,
+      "max_tries_block": 25,
+      "s_cap": 100000000.0,
+      "laplace_z_clip": 1000000.0,
+      "slice_w": 1.0,
+      "slice_m": 20
+    },
+    "priors": {
+      "a_sigma": 2.0,
+      "b_sigma": 2.0,
+      "xi_lower": -0.5,
+      "xi_upper": 0.5,
+      "m0_alpha": -0.0,
+      "P0_alpha": 10.0,
+      "m0_beta": -0.0008333333333333334,
+      "P0_beta": 1e-06,
+      "m0_gamma": [
+        -1.0,
+        -0.8660254037844387,
+        -0.5000000000000001,
+        -7.973605703445361e-17,
+        0.4999999999999998,
+        0.8660254037844387,
+        1.0,
+        0.8660254037844388,
+        0.5000000000000004,
+        1.6519330279501704e-16,
+        -0.5000000000000001
+      ],
+      "P0_gamma": 5.0,
+      "a_lambda": 2.0,
+      "b_lambda": 0.05
+    },
+    "time_center": 786.5,
+    "ffbs_C0_scale": 1e-06,
+    "ffbs_C0_A": 1e-06,
+    "sigma2_eff": 1.0,
+    "start_date": "1892-01-01",
+    "safety": {
+      "max_tries_block": 25,
+      "s_cap": 100000000.0,
+      "laplace_z_clip": 1000000.0,
+      "reject_restore_enabled": true
+    },
+    "series": "TNn",
+    "label": "TNn_monthly",
+    "date_tag": "1892-01-2022-12",
+    "elapsed_seconds": 10233.424794435501,
+    "timestamp": "2026-01-06T15:02:18.828920",
+    "index_type": "PeriodIndex",
+    "index_values_preview": [
+      "1892-01",
+      "1892-02",
+      "1892-03",
+      "1892-04",
+      "1892-05",
+      "1892-06",
+      "1892-07",
+      "1892-08",
+      "1892-09",
+      "1892-10"
+    ],
+    "model": "DGEV_LAPLACE_NCP_LASSO_DUMMIES",
+    "data_transform": "negate",
+    "model_sign": -1.0,
+    "scale_note": "All stored states/\u03bc/etc. are on the MODEL scale (z=y*sign).",
+    "knobs": {
+      "ffbs_C0_scale": 1e-06,
+      "ffbs_C0_A": 1e-06,
+      "sigma2_eff": 1.0
+    },
+    "freq": "Monthly",
+    "model_family": "DGEV_LAPLACE_NCP"
+  },
+  "pit": {
+    "skipped": false,
+    "hist": {
+      "bins": 20,
+      "level": 0.9,
+      "max_abs_dev_from_uniform_density_median": 0.3765903307888041
+    },
+    "pp": {
+      "level": 0.9,
+      "max_abs_dev_from_45deg_median": 0.04157749888738549
+    }
+  },
+  "ppc": {
+    "skipped": false,
+    "p_B": 0.0086,
+    "ks_obs_summary": {
+      "n": 10000.0,
+      "mean": 0.047680912449470134,
+      "sd": 0.008292085854547536,
+      "min": 0.022481334073045756,
+      "max": 0.1375245525302653,
+      "median": 0.046964484623922165,
+      "q05": 0.03533718199631878,
+      "q95": 0.062250043212946186
+    },
+    "ks_rep_summary": {
+      "n": 10000.0,
+      "mean": 0.021764077029737695,
+      "sd": 0.006650172617767936,
+      "min": 0.008368194923073446,
+      "max": 0.058439725015513866,
+      "median": 0.020706618402668894,
+      "q05": 0.01290273462458034,
+      "q95": 0.03411009909356233
+    }
+  }
+}
