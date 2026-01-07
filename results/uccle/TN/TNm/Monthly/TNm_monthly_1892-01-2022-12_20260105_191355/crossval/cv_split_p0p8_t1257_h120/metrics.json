@@ -1,0 +1,47 @@
+{
+  "split": {
+    "split_label": "p0p8",
+    "split_idx": 1257,
+    "T_train": 1258,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.9083333333333333,
+    "rmse": 1.5164472628619563,
+    "mae": 1.2353565470350352,
+    "avg_width": 5.599585325914592
+  },
+  "cfg": {
+    "n_iter": 4000,
+    "burn": 1000,
+    "thin": 1,
+    "random_seed": 40,
+    "progress": true,
+    "progress_every": 0
+  },
+  "priors": {
+    "a_sigma": 2.0,
+    "b_sigma": 2.0,
+    "m0_alpha": 5.0,
+    "P0_alpha": 1.0,
+    "m0_beta": 0.0006666666666666666,
+    "P0_beta": 1e-06,
+    "m0_gamma": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "P0_gamma": 5.0,
+    "a_lambda": 2.0,
+    "b_lambda": 0.05
+  },
+  "seed_forecast": 123,
+  "window": 600
+}

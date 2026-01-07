@@ -42,7 +42,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
 from simulator.utils import _ensure_dir, _parse_date_ymd  # type: ignore
 
-from simulator.dgev_crossval import DGEVCrossValidator  # type: ignore
+from simulator.dgev_laplace_cv import DGEVCrossValidator  # type: ignore
 from optimization.dgev_laplace_2 import Priors, SamplerConfig  # type: ignore
 
 

@@ -21,7 +21,7 @@ except ImportError:
 # =============================================================================
 # Priors & Config
 # =============================================================================
-@dataclass(slots=True)
+@dataclass
 class Priors:
     # Observation variance σ²: precision τ = 1/σ² ~ Gamma(a_sigma, b_sigma) (shape–rate)
     a_sigma: float = 2.0
@@ -42,7 +42,7 @@ class Priors:
     b_lambda: float = 1.0
 
 
-@dataclass(slots=True)
+@dataclass
 class SamplerConfig:
     n_iter: int = 5000
     burn: int = 1000

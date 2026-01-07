@@ -7,6 +7,12 @@ Rolling-origin cross-validation for the Gaussian DLM (Bayesian lasso sampler)
     load_posterior/find_latest_run (+ fallback to newest posterior*.npz)
 - Re-fits the DLM on training prefixes and produces fine-scale forecast fan charts
 
+Plot conventions (Uccle-style)
+-----------------------------
+- Observations (train + held-out): black
+- Forecast median + credible band: TX* red, TN* blue (else C0)
+- No title, no legend
+
 Reusable entry point:
     DLMCrossValidator
 
@@ -17,6 +23,7 @@ Expected bundle content
 - draws['y'] : (T,) the observation series
 - meta['period'] optional (default 12)
 - meta['start_date'] optional (or pass --start-date) for date-like splits
+- meta['series'] optional (e.g. "TXm"/"TNm") to control forecast colors
 
 Outputs (default)
 -----------------
@@ -31,6 +38,7 @@ Outputs (default)
 
 import os
 import sys
+import re
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -81,6 +89,34 @@ TimeSpec = Union[int, float, str]
 
 
 # =============================================================================
+# Color logic (mirrors uccle_dlm_plotter.py)
+# =============================================================================
+def series_color(series: str) -> str:
+    s = str(series).upper()
+    if s.startswith("TX"):
+        return "red"
+    if s.startswith("TN"):
+        return "blue"
+    return "C0"
+
+
+def infer_series_code(meta: Dict[str, Any], path_hint: Optional[str] = None) -> str:
+    # Prefer explicit metadata
+    for k in ("series", "target", "name"):
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # Fallback: infer from path
+    if path_hint:
+        m = re.search(r"\b(TX[a-zA-Z0-9]*|TN[a-zA-Z0-9]*|PREC[a-zA-Z0-9]*|PRECX)\b", path_hint.upper())
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+# =============================================================================
 # Data containers
 # =============================================================================
 @dataclass(frozen=True)
@@ -114,6 +150,7 @@ class DLMCrossValidator:
         seed_forecast: int = 123,
         window: int = 240,
         show: bool = False,
+        path_hint: Optional[str] = None,
     ):
         self.y = np.asarray(y, float).ravel()
         if self.y.size < 5:
@@ -137,11 +174,17 @@ class DLMCrossValidator:
         self.window = int(window)
         self.show = bool(show)
 
+        # series inference for coloring
+        self.path_hint = path_hint
+        self.series_code = infer_series_code(self.meta, self.path_hint)
+
         # ensure key meta fields
         self.meta["period"] = int(self.period)
         self.meta["layout"] = list(self.layout)
         if self.start_date_override is not None:
             self.meta["start_date"] = self.start_date_override.strftime("%Y-%m-%d")
+        if self.series_code and not isinstance(self.meta.get("series", None), str):
+            self.meta["series"] = str(self.series_code)
 
     # ----------------------------- constructors ----------------------------- #
     @classmethod
@@ -179,6 +222,7 @@ class DLMCrossValidator:
             seed_forecast=seed_forecast,
             window=window,
             show=show,
+            path_hint=str(npz_path),
         )
 
     @classmethod
@@ -334,6 +378,8 @@ class DLMCrossValidator:
         meta_train["layout"] = list(self.layout)
         if self.start_date_override is not None:
             meta_train["start_date"] = self.start_date_override.strftime("%Y-%m-%d")
+        if self.series_code:
+            meta_train["series"] = str(self.series_code)
 
         return simulate_dlm_forecast(
             draws=post_train,
@@ -381,24 +427,31 @@ class DLMCrossValidator:
         y_future_draws: np.ndarray,
         y_future_actual: np.ndarray,
         split_x: Any,
-        title: str,
+        title: str,   # kept for API compatibility; ignored
         ylabel: str,
         save_path: str,
     ) -> None:
         med, lo, hi = self.summarize_ribbon(y_future_draws, level=self.level)
         y_true = np.asarray(y_future_actual, float).ravel()
 
-        fig, ax = plt.subplots(1, 1, figsize=(12, 3.9))
-        ax.plot(x_obs, y_obs, lw=1.2, label="observed (train)")
-        ax.plot(x_future, med, lw=1.6, label="forecast median")
-        ax.fill_between(x_future, lo, hi, alpha=0.25, label=f"forecast {int(round(self.level*100))}% band")
-        ax.plot(x_future, y_true, lw=1.3, linestyle="--", label="observed (held-out)")
+        col = series_color(self.series_code or infer_series_code(self.meta, self.path_hint))
 
-        ax.axvline(split_x, lw=1.0, alpha=0.8)
-        ax.set_title(title)
+        fig, ax = plt.subplots(1, 1, figsize=(12, 3.9))
+
+        # observations: black
+        ax.plot(x_obs, y_obs, lw=1.2, color="black")
+        ax.plot(x_future, y_true, lw=1.3, linestyle="--", color="black")
+
+        # forecast: colored median + colored band
+        ax.fill_between(x_future, lo, hi, alpha=0.25, color=col, linewidth=0)
+        ax.plot(x_future, med, lw=1.8, color=col)
+
+        ax.axvline(split_x, lw=1.0, alpha=0.8, color="black")
+
+        # no title / no legend
+        ax.set_title("")
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="best")
 
         plt.tight_layout()
         _ensure_dir(os.path.dirname(save_path))
@@ -425,7 +478,7 @@ class DLMCrossValidator:
         _ensure_dir(self.out_dir)
 
         # map splits -> indices; de-duplicate; sort
-        mapped = {}
+        mapped: Dict[int, str] = {}
         for s in splits:
             idx, lab = self._time_to_index(s, T=T_full)
             mapped[int(idx)] = str(lab)
@@ -479,14 +532,14 @@ class DLMCrossValidator:
                 y_future_draws=y_future_draws,
                 y_future_actual=y_test,
                 split_x=fr.split_x,
-                title=f"DLM crossval forecast (split={split_lab}, idx={split_idx}, h={H})",
+                title="",                 # ignored
                 ylabel="y (fine-scale)",
                 save_path=os.path.join(split_dir, "forecast_fine.png"),
             )
 
             # metrics
             m = self.compute_metrics(y_future_draws, y_test)
-            
+
             # write per-split artifacts
             with open(os.path.join(split_dir, "metrics.json"), "w", encoding="utf-8") as f:
                 json.dump(
@@ -503,6 +556,7 @@ class DLMCrossValidator:
                         "priors": asdict(self.priors),
                         "seed_forecast": int(self.seed_forecast),
                         "window": int(self.window),
+                        "series": str(self.series_code),
                     },
                     f,
                     indent=2,
@@ -527,6 +581,20 @@ class DLMCrossValidator:
                     split_dir=str(split_dir),
                 )
             )
+
+            # optional payload
+            try:
+                np.savez_compressed(
+                    os.path.join(split_dir, "forecast_payload.npz"),
+                    y_train=y_train,
+                    y_test=y_test,
+                    y_future_draws=y_future_draws,
+                    x_obs=x_obs,
+                    y_obs=y_obs,
+                    x_future=x_future,
+                )
+            except Exception as e:
+                print(f"[warn] could not write forecast_payload.npz: {e}")
 
         # combined summary
         if results:
@@ -700,7 +768,7 @@ if __name__ == "__main__":
 
     print(f"[info] using posterior: {bundle.npz_path}")
     print(f"[info] writing crossval outputs to: {out_dir}")
-    print(f"[info] T={cv.y.size}, period={cv.period}")
+    print(f"[info] T={cv.y.size}, period={cv.period}, series={cv.series_code!r}")
 
     cv.run(splits=splits, horizon=int(args.horizon))
     print("[done] cross-validation finished.")

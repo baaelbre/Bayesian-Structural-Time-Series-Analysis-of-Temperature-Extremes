@@ -1,8 +1,8 @@
 # %% simulator/uccle_dlm_crossval.py
 from __future__ import annotations
 """
-Uccle DLM Cross-Validation (TXm, TNm; Monthly)
-=============================================
+Uccle DLM Cross-Validation (TXm, TNm, Precm; Monthly)
+====================================================
 
 Thin wrapper around simulator.dlm_crossval.DLMCrossValidator with Uccle defaults.
 
@@ -10,21 +10,15 @@ Uccle defaults / conventions
 ----------------------------
 - Monthly calendar: period=12
 - Forced origin: start_date = 1892-01-01 (unless --start-date overrides)
-- Robust run discovery (same as uccle_dlm_forecast.py):
+- Robust run discovery:
     1) optimization.posterior_bundle.find_latest_run (posterior.npz runs)
     2) fallback recursive search for posterior*.npz
 
-Uses the generic rolling-origin logic:
-- loads y from the posterior bundle (draws['y'])
-- for each split: refits DLM on prefix, forecasts H months, computes metrics,
-  writes per-split artifacts + global summary.
-
-Note
-----
-The base DLMCrossValidator plots include title + legend. This wrapper does NOT
-override plotting to keep things short; if you want "no title/legend" here too,
-I’ll do it with a tiny plot function swap (no class needed), but keeping base
-behavior is simplest.
+Plot conventions (Uccle-style)
+-----------------------------
+- Observations: black
+- Forecast median + band: TX* red, TN* blue
+- No title, no legend
 
 Outputs (default: <run>/crossval)
 ---------------------------------
@@ -32,6 +26,7 @@ Outputs (default: <run>/crossval)
   cv_split_<label>_t<idx>_h<H>/
       forecast_fine.png
       metrics.json
+      forecast_payload.npz
   crossval_summary.csv
   crossval_summary.json
 """
@@ -57,7 +52,7 @@ from optimization.dlm_3 import Priors, SamplerConfig  # type: ignore
 
 
 # =============================================================================
-# Uccle paths / discovery (copy of uccle_dlm_forecast.py logic)
+# Uccle paths / discovery
 # =============================================================================
 def default_root(series: str) -> str:
     base = "results/uccle"
@@ -184,11 +179,12 @@ def main() -> None:
     if "y" not in draws:
         raise SystemExit("[error] posterior bundle must include draws['y'].")
 
-    # Force Uccle monthly origin + period (matches uccle_dlm_forecast.py)
+    # Force Uccle monthly origin + period
     meta = dict(meta)
     meta["start_date"] = "1892-01-01"
     meta["freq"] = "Monthly"
     meta["period"] = 12
+    meta["series"] = str(args.series)  # <-- drives TX/TN coloring in dlm_crossval
 
     # start date: forced meta unless user overrides
     sd = _parse_date_optional(args.start_date) if args.start_date else _parse_date_optional(meta.get("start_date"))
@@ -228,7 +224,6 @@ def main() -> None:
     if not splits:
         raise SystemExit("[error] --splits parsed to an empty list.")
 
-    # build CV runner using the generic class
     cv = DLMCrossValidator(
         y=np.asarray(draws["y"], float).ravel(),
         meta=meta,
@@ -240,6 +235,7 @@ def main() -> None:
         seed_forecast=int(args.seed_forecast),
         window=int(args.window),
         show=bool(args.show),
+        path_hint=str(npz_path),
     )
 
     print(f"[info] using posterior: {npz_path}")
