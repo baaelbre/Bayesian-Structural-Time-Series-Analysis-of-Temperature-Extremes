@@ -10,29 +10,5 @@
     "mae": 3.3919851841479822,
     "avg_width": 14.325970574559626,
     "split_dir": "results/simulations/DGEV_NCP_LASSO\\dynamic-dynamic-dynamic_20251229_194759\\crossval\\cv_split_p0p6_t299_h120"
-  },
-  {
-    "split_label": "p0p8",
-    "split_idx": 399,
-    "T_train": 400,
-    "H": 100,
-    "level": 0.9,
-    "coverage": 0.93,
-    "rmse": 3.5021783752963582,
-    "mae": 2.8232304691017442,
-    "avg_width": 12.464464999701853,
-    "split_dir": "results/simulations/DGEV_NCP_LASSO\\dynamic-dynamic-dynamic_20251229_194759\\crossval\\cv_split_p0p8_t399_h100"
-  },
-  {
-    "split_label": "p0p9",
-    "split_idx": 449,
-    "T_train": 450,
-    "H": 50,
-    "level": 0.9,
-    "coverage": 0.88,
-    "rmse": 3.8347536216084293,
-    "mae": 3.284055057149224,
-    "avg_width": 11.796481071803115,
-    "split_dir": "results/simulations/DGEV_NCP_LASSO\\dynamic-dynamic-dynamic_20251229_194759\\crossval\\cv_split_p0p9_t449_h50"
   }
 ]

@@ -44,6 +44,7 @@
   },
   "seed_forecast": 123,
   "window": 240,
+  "series": "",
   "dgev_knobs": {
     "ffbs_C0_scale": 1e-06,
     "ffbs_C0_A": 1e-06,
