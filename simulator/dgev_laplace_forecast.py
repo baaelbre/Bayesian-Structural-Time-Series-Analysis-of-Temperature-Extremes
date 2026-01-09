@@ -2,6 +2,7 @@
 from __future__ import annotations
 """
 Posterior predictive forecasting for the DGEV (fine-scale + coarse-grained)
+=========================================================================
 
 This script mirrors simulator/dlm_forecast.py as closely as possible, but with a
 GEV observation model.
@@ -18,15 +19,33 @@ Coarse-graining per draw is correct because it samples from the push-forward of 
 fine-scale posterior predictive distribution under the aggregation map.
 
 Notes on minima:
-- Many of your DGEV runs model minima by sign-flipping the data and treating them as maxima.
+- Many DGEV runs model minima by sign-flipping the data and treating them as maxima.
 - This script auto-detects that from meta (like your plotter) and back-transforms for plotting.
+
+NEW: printing predictions (stdout)
+----------------------------------
+Print posterior predictive summaries (median + interval) for:
+  - fine scale (model time step),
+  - annual extremes,
+  - seasonal extremes (all seasons stacked; optional DJF/MAM/JJA/SON).
+
+Defaults:
+  --print-forecast enabled
+  --print-scales fine,annual,seasonal_all
+  - fine: first --print-horizon forecast steps (default 24)
+  - annual/seasonal: forecast points only
+
+Use --print-dates or --print-start/--print-end to select a window.
 """
 
 import os
 import sys
+import re
+import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple, Iterable
 
 import numpy as np
 import matplotlib
@@ -38,7 +57,7 @@ import matplotlib.pyplot as plt
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 # ---------------------------------------------------------------------
-# I/O helpers: posterior loader (same pattern as dlm_forecast.py)
+# I/O helpers: posterior loader
 # ---------------------------------------------------------------------
 try:
     from optimization.posterior_bundle import load_posterior, find_latest_run
@@ -58,9 +77,7 @@ def _ensure_dir(path: str) -> None:
 
 
 def _parse_date(s: Optional[str]) -> Optional[datetime]:
-    """
-    Accepts YYYY, YYYY-MM, YYYY-MM-DD.
-    """
+    """Accepts YYYY, YYYY-MM, YYYY-MM-DD."""
     if s is None:
         return None
     ss = str(s).strip()
@@ -73,12 +90,42 @@ def _parse_date(s: Optional[str]) -> Optional[datetime]:
         return datetime(parts[0], parts[1], 1)
     if len(parts) == 3:
         return datetime(parts[0], parts[1], parts[2])
-    raise ValueError("start-date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+    raise ValueError("date must be YYYY, YYYY-MM, or YYYY-MM-DD")
+
+
+def _parse_csv(s: Optional[str]) -> List[str]:
+    if s is None:
+        return []
+    return [x.strip() for x in str(s).split(",") if x.strip()]
 
 
 def _decimal_year_from_ym(y: int, m: int) -> float:
     # place month roughly at its center within the year
     return float(y) + (float(m) - 0.5) / 12.0
+
+
+def _ym_from_decimal_year(x: float) -> Tuple[int, int]:
+    """
+    Inverse of _decimal_year_from_ym (approximately).
+    If x = y + (m-0.5)/12, then m ~ round(12*(x-y) + 0.5).
+    """
+    y = int(np.floor(float(x)))
+    frac = float(x) - float(y)
+    m = int(np.round(frac * 12.0 + 0.5))
+    m = int(np.clip(m, 1, 12))
+    return y, m
+
+
+def _season_name_from_end_month(m: int) -> str:
+    if m == 2:
+        return "DJF"
+    if m == 5:
+        return "MAM"
+    if m == 8:
+        return "JJA"
+    if m == 11:
+        return "SON"
+    return "SEAS"
 
 
 def _summarize_ribbon(draws_2d: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -94,6 +141,289 @@ def _summarize_ribbon(draws_2d: np.ndarray, level: float) -> Tuple[np.ndarray, n
     return med, lo, hi
 
 
+# =============================================================================
+# Prediction printing helpers (median + interval)
+# =============================================================================
+def _clip_indices(idxs: Iterable[int], L: int) -> List[int]:
+    out: List[int] = []
+    for i in idxs:
+        ii = int(i)
+        if 0 <= ii < L:
+            out.append(ii)
+    return sorted(set(out))
+
+
+def _fine_index_from_date(dt: datetime, *, start_year: int, start_month: int, step_months: int) -> int:
+    diff_months = (dt.year - start_year) * 12 + (dt.month - start_month)
+    k = int(round(diff_months / float(step_months)))
+    return k
+
+
+def _fine_labels_from_axis(x_full: np.ndarray, *, has_calendar: bool) -> List[str]:
+    if not has_calendar:
+        # numeric index axis (or unknown); label by integer index
+        return [str(int(i)) for i in range(int(x_full.size))]
+    labels: List[str] = []
+    for x in x_full:
+        y, m = _ym_from_decimal_year(float(x))
+        labels.append(f"{y:04d}-{m:02d}")
+    return labels
+
+
+def _select_fine_indices(
+    *,
+    L_full: int,
+    T_obs: int,
+    H: int,
+    dates: List[str],
+    start: Optional[str],
+    end: Optional[str],
+    include_observed: bool,
+    print_horizon: int,
+    has_calendar: bool,
+    start_year: Optional[int],
+    start_month: Optional[int],
+    step_months: Optional[int],
+) -> List[int]:
+    """
+    Fine-scale selection logic:
+      - If no dates/window: print first `print_horizon` forecast steps (cap at H).
+        If print_horizon <= 0, print all H.
+      - If dates: select those times (calendar required).
+      - If window: select all times in [start,end] (calendar required).
+    """
+    if (not dates) and (start is None) and (end is None):
+        ph = int(print_horizon)
+        if ph <= 0:
+            ph = H
+        ph = min(ph, H)
+        return list(range(T_obs, min(L_full, T_obs + ph)))
+
+    if not has_calendar or start_year is None or start_month is None or step_months is None:
+        raise ValueError("Date-based printing for fine scale requires a calendar axis (need --start-date or meta['start_date']).")
+
+    if dates:
+        idxs: List[int] = []
+        for s in dates:
+            dt = _parse_date(s)
+            if dt is None:
+                continue
+            k = _fine_index_from_date(dt, start_year=start_year, start_month=start_month, step_months=step_months)
+            idxs.append(k)
+        idxs = _clip_indices(idxs, L_full)
+    else:
+        if start is None or end is None:
+            raise ValueError("For a fine-scale window, provide BOTH --print-start and --print-end.")
+        dt0 = _parse_date(start)
+        dt1 = _parse_date(end)
+        if dt0 is None or dt1 is None:
+            raise ValueError("Could not parse --print-start/--print-end.")
+        a = _fine_index_from_date(dt0, start_year=start_year, start_month=start_month, step_months=step_months)
+        b = _fine_index_from_date(dt1, start_year=start_year, start_month=start_month, step_months=step_months)
+        if b < a:
+            a, b = b, a
+        idxs = _clip_indices(range(a, b + 1), L_full)
+
+    if not include_observed:
+        idxs = [i for i in idxs if i >= T_obs]
+    return idxs
+
+
+def _select_by_years(
+    *,
+    x: np.ndarray,
+    forecast_mask: np.ndarray,
+    dates: List[str],
+    start: Optional[str],
+    end: Optional[str],
+    include_observed: bool,
+) -> List[int]:
+    """
+    For annual/seasonal series with x on (decimal) year scale.
+    - If no dates/window: select forecast points only (unless include_observed).
+    - If dates: select years matching dt.year.
+    - If window: select years in [y0,y1].
+    """
+    n = int(x.size)
+    if n == 0:
+        return []
+
+    years = np.floor(x).astype(int)
+
+    if (not dates) and (start is None) and (end is None):
+        if include_observed:
+            return list(range(n))
+        return np.where(forecast_mask)[0].astype(int).tolist()
+
+    if dates:
+        want = sorted({int(_parse_date(s).year) for s in dates if _parse_date(s) is not None})
+        idxs = [i for i in range(n) if int(years[i]) in want]
+    else:
+        if start is None or end is None:
+            raise ValueError("For a year-window, provide BOTH --print-start and --print-end.")
+        dt0 = _parse_date(start)
+        dt1 = _parse_date(end)
+        if dt0 is None or dt1 is None:
+            raise ValueError("Could not parse --print-start/--print-end.")
+        y0, y1 = sorted([int(dt0.year), int(dt1.year)])
+        idxs = [i for i in range(n) if y0 <= int(years[i]) <= y1]
+
+    if not include_observed:
+        idxs = [i for i in idxs if bool(forecast_mask[i])]
+    return idxs
+
+
+def _print_block(
+    *,
+    name: str,
+    labels: List[str],
+    x: np.ndarray,
+    draws: np.ndarray,  # (S, n)
+    is_forecast: List[bool],
+    level: float,
+    max_lines: int,
+) -> None:
+    n = int(x.size)
+    if n == 0:
+        print(f"\n[print] {name}: (no points selected)\n")
+        return
+
+    loq = (1.0 - level) / 2.0
+    hiq = 1.0 - loq
+    med = np.quantile(draws, 0.5, axis=0)
+    lo = np.quantile(draws, loq, axis=0)
+    hi = np.quantile(draws, hiq, axis=0)
+
+    print(f"\n[print] {name}: {n} points (median + {int(round(level*100))}% interval)")
+    print(f"{'label':>12s}  {'x':>10s}  {'median':>10s}  {'lo':>10s}  {'hi':>10s}  {'forecast':>9s}")
+    print("-" * 78)
+
+    n_show = min(n, int(max_lines))
+    for i in range(n_show):
+        print(
+            f"{labels[i]:>12s}  "
+            f"{float(x[i]):10.3f}  "
+            f"{float(med[i]):10.3f}  "
+            f"{float(lo[i]):10.3f}  "
+            f"{float(hi[i]):10.3f}  "
+            f"{str(bool(is_forecast[i])):>9s}"
+        )
+
+    if n_show < n:
+        print(f"... ({n - n_show} more rows truncated; increase --print-max-lines)")
+    print("")
+
+
+# =============================================================================
+# Robust run discovery (like your Uccle wrappers)
+# =============================================================================
+def _extract_ts_from_path(path_str: str) -> Optional[float]:
+    m = re.search(r"(\d{8})_(\d{6})", path_str)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def find_latest_posterior_npz(root: str) -> Optional[str]:
+    root_p = Path(root)
+    if not root_p.exists():
+        return None
+    cands = list(root_p.rglob("posterior*.npz"))
+    if not cands:
+        return None
+
+    def key(p: Path) -> Tuple[int, float]:
+        ts = _extract_ts_from_path(str(p))
+        if ts is not None:
+            return (1, ts)
+        return (0, p.stat().st_mtime)
+
+    return str(max(cands, key=key))
+
+
+def resolve_bundle(*, target: Optional[str], root: str) -> Any:
+    if target:
+        return load_posterior(target)
+
+    print(f"[info] searching latest posterior run under: {root!r}")
+    run_path = find_latest_run(root=root)
+    if run_path is not None:
+        print(f"[info] using latest run: {run_path}")
+        return load_posterior(run_path)
+
+    npz_path = find_latest_posterior_npz(root)
+    if npz_path is None:
+        print(
+            f"[error] No posterior runs found under {root!r}.\n"
+            f"  → Tried find_latest_run() (posterior.npz) and recursive search (posterior*.npz).\n"
+            f"  → Either run the sampler first, or provide --target."
+        )
+        raise SystemExit(1)
+
+    print(f"[info] find_latest_run found nothing; using latest npz: {npz_path}")
+    return load_posterior(npz_path)
+
+
+# =============================================================================
+# Post-processing: burn-in + thinning (post-hoc)
+# =============================================================================
+def apply_burn_thin(
+    draws: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    burn: int = 0,
+    thin: int = 1,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    burn = int(burn or 0)
+    thin = int(thin or 1)
+    if burn < 0:
+        raise ValueError(f"--burn must be >= 0, got {burn}")
+    if thin < 1:
+        raise ValueError(f"--thin must be >= 1, got {thin}")
+
+    n_samp: Optional[int] = None
+    for k in ("x", "sigma", "sigma2", "xi", "Q_alpha", "s_alpha", "gamma0"):
+        if k in draws and isinstance(draws[k], np.ndarray) and np.asarray(draws[k]).ndim >= 1:
+            n_samp = int(np.asarray(draws[k]).shape[0])
+            break
+    if n_samp is None:
+        print("[warn] could not infer chain length; skipping burn/thin.")
+        return draws, meta
+
+    if burn >= n_samp:
+        raise ValueError(f"--burn={burn} ≥ number of saved samples ({n_samp}).")
+
+    idx = slice(burn, None, thin)
+    n_used = int(math.ceil((n_samp - burn) / thin))
+    print(f"[info] post-processing chains: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}")
+
+    for k, v in list(draws.items()):
+        if not isinstance(v, np.ndarray):
+            continue
+        arr = np.asarray(v)
+        if arr.ndim >= 1 and arr.shape[0] == n_samp:
+            draws[k] = arr[idx, ...]
+
+    postproc = meta.get("postproc", {})
+    postproc.update(
+        {
+            "extra_burn": int(burn),
+            "thin": int(thin),
+            "n_samples_raw": int(n_samp),
+            "n_samples_used": int(n_used),
+        }
+    )
+    meta["postproc"] = postproc
+    return draws, meta
+
+
+# =============================================================================
+# Seasonal design / rotation helpers
+# =============================================================================
 def _build_season_design(L: int, period: int) -> np.ndarray:
     """
     Static seasonal design S[t,:] mapping gamma0 (length p-1) to seasonal baseline.
@@ -145,9 +475,7 @@ def _extract_state_indices(layout: List[str]) -> Tuple[int, int, int]:
 
 
 def _get_sigma(draws: Dict[str, np.ndarray], S: int) -> np.ndarray:
-    """
-    GEV scale parameter sigma: accept sigma or sigma2.
-    """
+    """GEV scale parameter sigma: accept sigma or sigma2."""
     if "sigma" in draws:
         sig = np.asarray(draws["sigma"], float).ravel()
     elif "sigma2" in draws:
@@ -204,9 +532,7 @@ def _coerce_bool(x: Any) -> Optional[bool]:
 
 
 def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
-    """
-    Same spirit as your plotter: check flags / transform hints / naming conventions.
-    """
+    """Same spirit as your plotter: check flags / transform hints / naming conventions."""
     if not isinstance(meta, dict):
         return False
 
@@ -279,6 +605,7 @@ class ForecastResult:
     start_year: Optional[int]
     start_month: Optional[int]
     minima: bool
+    period: int
 
 
 def simulate_dgev_forecast(
@@ -328,10 +655,8 @@ def simulate_dgev_forecast(
     if ig1 + K > dim:
         raise ValueError("State dimension does not contain a full seasonal block g1..g{K}.")
 
-    # minima detection (for plot back-transform)
     minima = _detect_minima_from_meta(meta)
 
-    # theta^{(m)} pieces
     sigma = _get_sigma(draws, S_draws)
     xi = _get_xi(draws, S_draws)
     Q_alpha = _get_Q(draws, S_draws, "Q_alpha", "s_alpha")
@@ -344,52 +669,41 @@ def simulate_dgev_forecast(
     if gamma0.ndim != 2 or gamma0.shape != (S_draws, K):
         raise ValueError(f"gamma0 must have shape (S, {K}), got {gamma0.shape}.")
 
-    # x_T^{(m)} (last observed state per draw)
-    alpha = x[:, -1, ia].copy()                          # (S,)
-    beta = x[:, -1, ib].copy()                           # (S,)
-    gamma_dyn = x[:, -1, ig1:ig1 + K].copy()             # (S, K)
+    alpha = x[:, -1, ia].copy()                      # (S,)
+    beta = x[:, -1, ib].copy()                       # (S,)
+    gamma_dyn = x[:, -1, ig1:ig1 + K].copy()         # (S, K)
 
-    # seasonal design for baseline gamma0, and seasonal rotation for gamma_dyn
     L_full = T + int(horizon)
     S_design_full = _build_season_design(L_full, period)  # (T+H, K)
     R = _season_rotation_matrix(K)                        # (K, K)
     RT = R.T
 
     rng = np.random.default_rng(int(seed))
-
     y_future_model = np.zeros((S_draws, horizon), float)
 
-    # In this seasonal form, the observation picks the first component gamma_dyn[:,0]
-    # after rotation; innovations only enter the first component.
     e1 = np.zeros((K,), float)
     e1[0] = 1.0
 
     for h in range(horizon):
-        t = T + h  # absolute time index in the full path (0-based)
+        t = T + h
 
-        # state propagation
         alpha = alpha + beta + rng.normal(0.0, np.sqrt(Q_alpha), size=S_draws)
         beta = beta + rng.normal(0.0, np.sqrt(Q_beta), size=S_draws)
 
         epsg = rng.normal(0.0, np.sqrt(Q_gamma), size=S_draws)
         gamma_dyn = gamma_dyn @ RT + epsg[:, None] * e1[None, :]
 
-        # observation location
-        base_row = S_design_full[t, :]  # (K,)
-        baseline = np.einsum("sk,k->s", gamma0, base_row)  # (S,)
+        base_row = S_design_full[t, :]                         # (K,)
+        baseline = np.einsum("sk,k->s", gamma0, base_row)      # (S,)
         mu = alpha + gamma_dyn[:, 0] + baseline
 
-        # observation simulation via inverse CDF
         u = rng.uniform(size=S_draws)
         y_future_model[:, h] = _gev_ppf_vec(u, mu, sigma, xi)
 
-    # Back-transform for plotting if model used sign flip for minima
     y_obs_plot = -y_model if minima else y_model
     y_future_plot = -y_future_model if minima else y_future_model
-
     y_full = np.concatenate([np.repeat(y_obs_plot[None, :], S_draws, axis=0), y_future_plot], axis=1)
 
-    # time axis
     start_year = start_date.year if start_date is not None else None
     start_month = start_date.month if start_date is not None else None
 
@@ -419,11 +733,12 @@ def simulate_dgev_forecast(
         start_year=start_year,
         start_month=start_month,
         minima=minima,
+        period=int(period),
     )
 
 
 # =============================================================================
-# Coarse-graining helpers (groups) — mirrored from dlm_forecast.py
+# Coarse-graining helpers
 # =============================================================================
 def _annual_groups_from_index(
     L_full: int,
@@ -485,7 +800,7 @@ def coarse_grain_annual_extreme(
     minima: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     """
-    Compute annual extremes per year group by coarse-graining each fine-scale predictive path.
+    Annual extremes per year group by coarse-graining each fine-scale predictive path.
 
     Returns:
       x_year         : (n_years,)
@@ -513,12 +828,12 @@ def coarse_grain_annual_extreme(
             year_draws[:, j] = np.max(y_full[:, I], axis=1)
 
         if np.all(I < T_obs):
-            y_year_obs[j] = float(year_draws[0, j])  # identical across draws
+            y_year_obs[j] = float(year_draws[0, j])
             last_obs_idx = j
         else:
             forecast_mask[j] = True
 
-    split_x = float(x_year[last_obs_idx]) if last_obs_idx >= 0 else float(x_year[0]) if nY else float("nan")
+    split_x = float(x_year[last_obs_idx]) if last_obs_idx >= 0 else (float(x_year[0]) if nY else float("nan"))
     return x_year, y_year_obs, year_draws, forecast_mask, split_x
 
 
@@ -544,7 +859,6 @@ def coarse_grain_meteo_seasons_extreme(
     """
     S, L_full = y_full.shape
 
-    # build (year,month) sequences
     year = np.zeros(L_full, int)
     month = np.zeros(L_full, int)
     y0, m0 = int(start_year), int(start_month)
@@ -563,7 +877,6 @@ def coarse_grain_meteo_seasons_extreme(
         "SON": [(0, 9), (0, 10), (0, 11)],
     }
     end_month = {"DJF": 2, "MAM": 5, "JJA": 8, "SON": 11}
-
     years = np.unique(year)
 
     per_season: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = {}
@@ -600,17 +913,16 @@ def coarse_grain_meteo_seasons_extreme(
                 fmask[j] = True
             all_entries.append((xs[j], I))
 
-        split_x = float(xs[last_obs_idx]) if last_obs_idx >= 0 and len(xs) else float(xs[0]) if xs else float("nan")
+        split_x = float(xs[last_obs_idx]) if last_obs_idx >= 0 and len(xs) else (float(xs[0]) if xs else float("nan"))
         per_season[sname] = (np.array(xs, float), obs_s, draws_s, fmask, split_x)
 
-    # Stack all seasons in chronological order
     all_entries.sort(key=lambda z: z[0])
     x_all = np.array([z[0] for z in all_entries], float)
     groups_all = [z[1] for z in all_entries]
 
     nA = len(groups_all)
     draws_all = np.full((S, nA), np.nan, float)
-    obs_all = np.full((nA,), np.nan, float)
+    obs_all = np.full((nA,), npnan := np.nan, float)  # noqa: F841
     fmask_all = np.zeros((nA,), bool)
 
     last_obs_idx = -1
@@ -626,13 +938,13 @@ def coarse_grain_meteo_seasons_extreme(
         else:
             fmask_all[j] = True
 
-    split_x_all = float(x_all[last_obs_idx]) if last_obs_idx >= 0 else float(x_all[0]) if nA else float("nan")
+    split_x_all = float(x_all[last_obs_idx]) if last_obs_idx >= 0 else (float(x_all[0]) if nA else float("nan"))
     seasonal_all = (x_all, obs_all, draws_all, fmask_all, split_x_all)
     return per_season, seasonal_all
 
 
 # =============================================================================
-# Plotting (mirrors dlm_forecast.py)
+# Plotting
 # =============================================================================
 def plot_forecast(
     *,
@@ -671,7 +983,7 @@ def plot_forecast(
 
 
 # =============================================================================
-# CLI (mirrors dlm_forecast.py)
+# CLI
 # =============================================================================
 if __name__ == "__main__":
     import argparse
@@ -682,6 +994,7 @@ if __name__ == "__main__":
             "- Loads latest posterior by default (like the plotters).\n"
             "- Fine-scale posterior predictive via state propagation + GEV simulation.\n"
             "- Coarse-graining is done by aggregating each simulated fine-scale predictive path.\n"
+            "- Can print prediction summaries (median + interval) to stdout.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -708,30 +1021,70 @@ if __name__ == "__main__":
         ),
     )
     p.add_argument("--out", type=str, default=None, help="Output directory. Default: <run>/forecast")
-
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
+
+    # post-hoc chain trimming
+    p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
+    p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
 
     # plot windows (last N points of the *observed* series; forecast always shown)
     p.add_argument("--window-months", type=int, default=240, help="Fine-scale plot: last N observed points.")
     p.add_argument("--window-years", type=int, default=60, help="Annual plot: last N observed years.")
     p.add_argument("--window-seasons", type=int, default=120, help="Seasonal plot: last N observed seasons.")
 
+    # ---- printing predictions (stdout) ----
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--print-forecast", dest="print_forecast", action="store_true", default=True,
+                   help="Print prediction summaries to stdout.")
+    g.add_argument("--no-print-forecast", dest="print_forecast", action="store_false",
+                   help="Disable printing prediction summaries.")
+
+    p.add_argument(
+        "--print-scales",
+        type=str,
+        default="fine,annual,seasonal_all",
+        help="Comma-separated: fine,annual,seasonal_all,DJF,MAM,JJA,SON",
+    )
+    p.add_argument(
+        "--print-horizon",
+        type=int,
+        default=24,
+        help="(fine) If no --print-dates/--print-start/--print-end are given, print first N forecast steps (<=0 prints all).",
+    )
+    p.add_argument(
+        "--print-dates",
+        type=str,
+        default=None,
+        help="Comma-separated dates (YYYY or YYYY-MM or YYYY-MM-DD). fine uses calendar steps; annual/seasonal use years.",
+    )
+    p.add_argument("--print-start", type=str, default=None, help="Window start (YYYY or YYYY-MM or YYYY-MM-DD).")
+    p.add_argument("--print-end", type=str, default=None, help="Window end (YYYY or YYYY-MM or YYYY-MM-DD).")
+    p.add_argument(
+        "--print-include-observed",
+        action="store_true",
+        default=False,
+        help="If set, allow printing points that fall in the observed segment too.",
+    )
+    p.add_argument(
+        "--print-max-lines",
+        type=int,
+        default=80,
+        help="Maximum lines printed per scale (truncate beyond this).",
+    )
+
     args = p.parse_args()
 
-    # resolve posterior
-    run_path = args.target
-    if run_path is None:
-        print(f"[info] --target not provided; searching for the latest posterior under --root={args.root!r} ...")
-        run_path = find_latest_run(root=args.root)
-        if run_path is None:
-            raise SystemExit(f"[error] No 'posterior.npz' found under {args.root!r}. Provide --target or change --root.")
-        print(f"[info] Using latest run: {run_path}")
-
-    bundle = load_posterior(run_path)
+    # resolve posterior (robust)
+    bundle = resolve_bundle(target=args.target, root=args.root)
     draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
+
+    # post-hoc burn/thin
+    if args.burn > 0 or args.thin > 1:
+        draws, meta = apply_burn_thin(draws, dict(meta), burn=args.burn, thin=args.thin)
 
     out_dir = args.out or os.path.join(os.path.dirname(npz_path), "forecast")
     _ensure_dir(out_dir)
+    print(f"[info] using posterior: {npz_path}")
     print(f"[info] saving outputs to: {out_dir}")
 
     # start date discovery
@@ -755,6 +1108,11 @@ if __name__ == "__main__":
     T = int(y_obs.size)
     H = int(args.horizon)
     L_full = T + H
+
+    # calendar axis availability for fine printing
+    has_calendar = (sd is not None) and (fr.period in (12, 6, 4, 3, 2, 1)) and ((12 % fr.period) == 0)
+    step_months = (12 // fr.period) if has_calendar else None
+    fine_labels = _fine_labels_from_axis(x_full, has_calendar=has_calendar)
 
     # -----------------------------
     # 1) Fine-scale plot
@@ -789,6 +1147,7 @@ if __name__ == "__main__":
         H=H,
         level=float(args.level),
         minima=bool(fr.minima),
+        period=int(fr.period),
     )
 
     # -----------------------------
@@ -833,6 +1192,9 @@ if __name__ == "__main__":
     # -----------------------------
     # 3) Meteorological seasons (period=12 only)
     # -----------------------------
+    per_season = None
+    seasonal_all = None
+
     if period != 12 or fr.start_year is None or fr.start_month is None:
         print("[warn] meteorological seasons (DJF/MAM/JJA/SON) require period=12 and a known start-date. Skipping.")
     else:
@@ -844,7 +1206,6 @@ if __name__ == "__main__":
             minima=bool(fr.minima),
         )
 
-        # seasonal_all (all seasons stacked)
         xA, obsA, drawsA, maskA, splitA = seasonal_all
         obs_idxA = np.isfinite(obsA)
         x_obs_A = xA[obs_idxA]
@@ -872,7 +1233,6 @@ if __name__ == "__main__":
             show=bool(args.show),
         )
 
-        # separate season plots
         for sname in ("DJF", "MAM", "JJA", "SON"):
             xS, obsS, drawsS, maskS, splitS = per_season[sname]
 
@@ -898,6 +1258,133 @@ if __name__ == "__main__":
                 ylabel=ylabel_seas,
                 save_path=os.path.join(out_dir, f"dgev_forecast_seasonal_{sname}_extreme.png"),
                 show=bool(args.show),
+            )
+
+    # -----------------------------
+    # 4) PRINT predictions (stdout)
+    # -----------------------------
+    if bool(args.print_forecast):
+        scales = [s.strip() for s in str(args.print_scales).split(",") if s.strip()]
+        dates = _parse_csv(args.print_dates)
+        include_obs = bool(args.print_include_observed)
+        max_lines = int(args.print_max_lines)
+
+        # ---- fine ----
+        if "fine" in scales:
+            idxs = _select_fine_indices(
+                L_full=L_full,
+                T_obs=T,
+                H=H,
+                dates=dates,
+                start=args.print_start,
+                end=args.print_end,
+                include_observed=include_obs,
+                print_horizon=int(args.print_horizon),
+                has_calendar=has_calendar,
+                start_year=(sd.year if sd is not None else None),
+                start_month=(sd.month if sd is not None else None),
+                step_months=step_months,
+            )
+            labs = [fine_labels[i] for i in idxs]
+            xx = x_full[idxs] if idxs else np.array([], float)
+            DD = y_full[:, idxs] if idxs else np.zeros((y_full.shape[0], 0), float)
+            isF = [bool(i >= T) for i in idxs]
+            _print_block(
+                name="fine",
+                labels=labs,
+                x=xx,
+                draws=DD,
+                is_forecast=isF,
+                level=float(args.level),
+                max_lines=max_lines,
+            )
+
+        # ---- annual ----
+        if "annual" in scales:
+            idxsY = _select_by_years(
+                x=xY,
+                forecast_mask=maskY,
+                dates=dates,
+                start=args.print_start,
+                end=args.print_end,
+                include_observed=include_obs,
+            )
+            labs = [f"{int(np.floor(xY[i])):04d}" for i in idxsY]
+            xx = xY[idxsY] if idxsY else np.array([], float)
+            DD = drawsY[:, idxsY] if idxsY else np.zeros((drawsY.shape[0], 0), float)
+            isF = [bool(maskY[i]) for i in idxsY]
+            _print_block(
+                name="annual",
+                labels=labs,
+                x=xx,
+                draws=DD,
+                is_forecast=isF,
+                level=float(args.level),
+                max_lines=max_lines,
+            )
+
+        # ---- seasonal_all ----
+        if "seasonal_all" in scales:
+            if seasonal_all is None:
+                print("\n[print] seasonal_all: not available (seasonal coarse-graining was skipped)\n")
+            else:
+                xA, obsA, drawsA, maskA, splitA = seasonal_all
+                idxsA = _select_by_years(
+                    x=xA,
+                    forecast_mask=maskA,
+                    dates=dates,
+                    start=args.print_start,
+                    end=args.print_end,
+                    include_observed=include_obs,
+                )
+
+                labs: List[str] = []
+                for i in idxsA:
+                    yy, mm = _ym_from_decimal_year(float(xA[i]))
+                    sname = _season_name_from_end_month(mm)
+                    labs.append(f"{yy:04d}-{sname}")
+
+                xx = xA[idxsA] if idxsA else np.array([], float)
+                DD = drawsA[:, idxsA] if idxsA else np.zeros((drawsA.shape[0], 0), float)
+                isF = [bool(maskA[i]) for i in idxsA]
+                _print_block(
+                    name="seasonal_all",
+                    labels=labs,
+                    x=xx,
+                    draws=DD,
+                    is_forecast=isF,
+                    level=float(args.level),
+                    max_lines=max_lines,
+                )
+
+        # ---- individual seasons ----
+        for sname in ("DJF", "MAM", "JJA", "SON"):
+            if sname not in scales:
+                continue
+            if per_season is None or sname not in per_season:
+                print(f"\n[print] {sname}: not available (seasonal coarse-graining was skipped)\n")
+                continue
+            xS, obsS, drawsS, maskS, splitS = per_season[sname]
+            idxsS = _select_by_years(
+                x=xS,
+                forecast_mask=maskS,
+                dates=dates,
+                start=args.print_start,
+                end=args.print_end,
+                include_observed=include_obs,
+            )
+            labs = [f"{int(np.floor(xS[i])):04d}-{sname}" for i in idxsS]
+            xx = xS[idxsS] if idxsS else np.array([], float)
+            DD = drawsS[:, idxsS] if idxsS else np.zeros((drawsS.shape[0], 0), float)
+            isF = [bool(maskS[i]) for i in idxsS]
+            _print_block(
+                name=sname,
+                labels=labs,
+                x=xx,
+                draws=DD,
+                is_forecast=isF,
+                level=float(args.level),
+                max_lines=max_lines,
             )
 
     print("[done] fine + annual + seasonal forecasts written.")

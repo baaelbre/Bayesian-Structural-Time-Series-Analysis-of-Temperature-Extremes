@@ -7,12 +7,12 @@
     "level": 0.9,
     "minima": true,
     "coverage": 0.9083333333333333,
-    "rmse": 2.497645306705665,
-    "mae": 1.8748280608319052,
-    "avg_width": 8.599053162616977
+    "rmse": 2.498713466205694,
+    "mae": 1.8771433353592668,
+    "avg_width": 8.591553991120586
   },
   "cfg": {
-    "n_iter": 4000,
+    "n_iter": 5000,
     "burn": 1000,
     "thin": 1,
     "random_seed": 40,
@@ -52,6 +52,7 @@
   },
   "seed_forecast": 123,
   "window": 600,
+  "series": "TXn",
   "dgev_knobs": {
     "ffbs_C0_scale": 1e-06,
     "ffbs_C0_A": 1e-06,

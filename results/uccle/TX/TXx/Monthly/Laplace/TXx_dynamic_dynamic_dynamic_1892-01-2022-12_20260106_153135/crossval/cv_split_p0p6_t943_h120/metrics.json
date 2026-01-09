@@ -1,23 +1,23 @@
 {
   "split": {
-    "split_label": "p0p8",
-    "split_idx": 1257,
-    "T_train": 1258,
+    "split_label": "p0p6",
+    "split_idx": 943,
+    "T_train": 944,
     "H": 120,
     "level": 0.9,
     "minima": false,
     "coverage": 0.95,
-    "rmse": 1.7501830150662514,
-    "mae": 1.4146839222685585,
-    "avg_width": 6.629033083371208
+    "rmse": 2.477031609587375,
+    "mae": 2.0367607609875176,
+    "avg_width": 9.259794142918901
   },
   "cfg": {
     "n_iter": 5000,
     "burn": 1000,
     "thin": 1,
-    "random_seed": 50,
+    "random_seed": 122,
     "progress": true,
-    "progress_every": 0,
+    "progress_every": 10,
     "max_tries_block": 25,
     "s_cap": 100000000.0,
     "laplace_z_clip": 1000000.0,
@@ -31,7 +31,7 @@
     "xi_upper": 0.5,
     "m0_alpha": 0.0,
     "P0_alpha": 10.0,
-    "m0_beta": 0.0016666666666666668,
+    "m0_beta": 0.0008333333333333334,
     "P0_beta": 1e-06,
     "m0_gamma": [
       1.0,
@@ -47,12 +47,12 @@
       0.5000000000000001
     ],
     "P0_gamma": 5.0,
-    "a_lambda": 2.0,
-    "b_lambda": 0.05
+    "a_lambda": 4.0,
+    "b_lambda": 0.0005
   },
   "seed_forecast": 123,
   "window": 600,
-  "series": "TNx",
+  "series": "TXx",
   "dgev_knobs": {
     "ffbs_C0_scale": 1e-06,
     "ffbs_C0_A": 1e-06,

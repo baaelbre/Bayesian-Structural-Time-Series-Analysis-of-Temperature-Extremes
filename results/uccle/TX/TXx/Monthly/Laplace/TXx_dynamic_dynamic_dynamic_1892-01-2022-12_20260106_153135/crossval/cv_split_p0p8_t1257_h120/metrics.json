@@ -6,18 +6,18 @@
     "H": 120,
     "level": 0.9,
     "minima": false,
-    "coverage": 0.95,
-    "rmse": 1.7501830150662514,
-    "mae": 1.4146839222685585,
-    "avg_width": 6.629033083371208
+    "coverage": 0.9583333333333334,
+    "rmse": 2.298435566267402,
+    "mae": 1.872326309671453,
+    "avg_width": 9.171424975630238
   },
   "cfg": {
     "n_iter": 5000,
     "burn": 1000,
     "thin": 1,
-    "random_seed": 50,
+    "random_seed": 5,
     "progress": true,
-    "progress_every": 0,
+    "progress_every": 10,
     "max_tries_block": 25,
     "s_cap": 100000000.0,
     "laplace_z_clip": 1000000.0,
@@ -27,11 +27,11 @@
   "priors": {
     "a_sigma": 2.0,
     "b_sigma": 2.0,
-    "xi_lower": -0.5,
-    "xi_upper": 0.5,
+    "xi_lower": -0.4,
+    "xi_upper": 0.4,
     "m0_alpha": 0.0,
     "P0_alpha": 10.0,
-    "m0_beta": 0.0016666666666666668,
+    "m0_beta": 0.0008333333333333334,
     "P0_beta": 1e-06,
     "m0_gamma": [
       1.0,
@@ -47,12 +47,12 @@
       0.5000000000000001
     ],
     "P0_gamma": 5.0,
-    "a_lambda": 2.0,
-    "b_lambda": 0.05
+    "a_lambda": 4.0,
+    "b_lambda": 0.0005
   },
-  "seed_forecast": 123,
+  "seed_forecast": 1,
   "window": 600,
-  "series": "TNx",
+  "series": "TXx",
   "dgev_knobs": {
     "ffbs_C0_scale": 1e-06,
     "ffbs_C0_A": 1e-06,

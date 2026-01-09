@@ -220,7 +220,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--root", type=str, default=None, help="Search root when --target is omitted (defaults to Uccle layout).")
 
     # CV spec
-    p.add_argument("--splits", type=str, default="0.8,0.9", help="Comma-separated split specs (idx, fraction, or date).")
+    p.add_argument("--splits", type=str, default="0.6,0.8,0.9", help="Comma-separated split specs (idx, fraction, or date).")
     p.add_argument("--horizon", type=int, default=None, help="Forecast horizon in steps (months or seasons).")
 
     # plot / output
@@ -235,8 +235,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--start-date", type=str, default=None, help="Override start date (YYYY / YYYY-MM / YYYY-MM-DD).")
 
     # per-split MCMC
-    p.add_argument("--n-iter", type=int, default=1000)
-    p.add_argument("--burn", type=int, default=100)
+    p.add_argument("--n-iter", type=int, default=5000)
+    p.add_argument("--burn", type=int, default=1000)
     p.add_argument("--thin", type=int, default=1)
     p.add_argument("--seed-mcmc", type=int, default=40)
     p.add_argument("--no-progress", action="store_true", default=False)

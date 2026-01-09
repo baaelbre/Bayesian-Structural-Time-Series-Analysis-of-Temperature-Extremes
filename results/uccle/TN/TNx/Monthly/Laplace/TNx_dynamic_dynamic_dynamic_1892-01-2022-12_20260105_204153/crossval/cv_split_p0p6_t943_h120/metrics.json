@@ -7,15 +7,15 @@
     "level": 0.9,
     "minima": false,
     "coverage": 0.9333333333333333,
-    "rmse": 1.8019784312992306,
-    "mae": 1.437126807776365,
-    "avg_width": 6.625720430728049
+    "rmse": 1.799851591420782,
+    "mae": 1.426887343508851,
+    "avg_width": 6.643247607598369
   },
   "cfg": {
-    "n_iter": 4000,
+    "n_iter": 5000,
     "burn": 1000,
     "thin": 1,
-    "random_seed": 40,
+    "random_seed": 50,
     "progress": true,
     "progress_every": 0,
     "max_tries_block": 25,
@@ -52,6 +52,7 @@
   },
   "seed_forecast": 123,
   "window": 600,
+  "series": "TNx",
   "dgev_knobs": {
     "ffbs_C0_scale": 1e-06,
     "ffbs_C0_A": 1e-06,

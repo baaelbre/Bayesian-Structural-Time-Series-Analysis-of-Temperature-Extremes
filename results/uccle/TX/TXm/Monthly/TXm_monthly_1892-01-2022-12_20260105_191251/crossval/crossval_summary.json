@@ -1,0 +1,38 @@
+[
+  {
+    "split_label": "p0p6",
+    "split_idx": 943,
+    "T_train": 944,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.925,
+    "rmse": 1.7591673995622337,
+    "mae": 1.3738743450360114,
+    "avg_width": 6.624445085471685,
+    "split_dir": "results/uccle/TX/TXm/Monthly/TXm_monthly_1892-01-2022-12_20260105_191251/crossval/cv_split_p0p6_t943_h120"
+  },
+  {
+    "split_label": "p0p8",
+    "split_idx": 1257,
+    "T_train": 1258,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.9583333333333334,
+    "rmse": 1.6903424142334065,
+    "mae": 1.2975009507062083,
+    "avg_width": 6.688776013235452,
+    "split_dir": "results/uccle/TX/TXm/Monthly/TXm_monthly_1892-01-2022-12_20260105_191251/crossval/cv_split_p0p8_t1257_h120"
+  },
+  {
+    "split_label": "p0p9",
+    "split_idx": 1414,
+    "T_train": 1415,
+    "H": 120,
+    "level": 0.9,
+    "coverage": 0.9,
+    "rmse": 2.0130056046749294,
+    "mae": 1.622101763408046,
+    "avg_width": 6.530287605633308,
+    "split_dir": "results/uccle/TX/TXm/Monthly/TXm_monthly_1892-01-2022-12_20260105_191251/crossval/cv_split_p0p9_t1414_h120"
+  }
+]
