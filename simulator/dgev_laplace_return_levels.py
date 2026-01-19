@@ -1,31 +1,70 @@
-# %% simulator/dgev_return_levels.py
+# %% simulator/dgev_laplace_waiting_times_annual.py
 from __future__ import annotations
 """
-Return levels & return periods for DGEV posterior draws (block + annual).
+Annual expected waiting times for the DGEV (Laplace NCP) posterior
+=================================================================
 
-Key changes vs your version
----------------------------
-- Annual grouping + annual return periods are fully vectorized (no per-year Python loop).
-- Annual exceedance uses stable math: p = -expm1(sum(log G)).
-- Annual return levels solved by *parallel* bisection over (draw, year) grid.
-- Return periods can be computed/stored on log10-scale to avoid 1e15 caps.
-- Robust run discovery kept (find_latest_run + fallback rglob posterior*.npz).
+This script ONLY computes **annual-scale expected waiting time** trajectories
+for exceedances of fixed thresholds y* on the ORIGINAL (data) scale.
 
-Conventions
+Definitions
 -----------
-- Posterior is on MODEL scale. For minima-series runs stored as z=-y, we detect minima and
-  transform thresholds/outputs to PLOT scale (original sign) automatically.
+Let M_j be the annual maximum (or annual minimum after the internal sign convention).
+Define the annual exceedance hazard
+
+    p_j(y*) = P(M_j > y* | x_{0:T}, θ)
+            = 1 - ∏_{t in S_j} G_t(y*)
+
+where S_j are the within-year blocks (e.g., months) and G_t is the block-level GEV CDF.
+
+Define the waiting time (in YEARS) from year j:
+
+    X_j = inf{k >= 1 : M_{j+k-1} > y*}
+
+Then the expected waiting time E_j = E[X_j | x_{0:T}, θ] satisfies the recursion
+
+    E_j = 1 + (1 - p_j) E_{j+1}
+
+with a tail convention beyond the computed horizon. We compute E_j for each
+posterior draw, then summarise pointwise into medians + credible bands.
+
+Minima
+------
+If the series is a minima index (TXn/TNn), the sampler stores Z_t = -Y_t on MODEL scale.
+Thresholds are specified on ORIGINAL scale and mapped internally via z* = -y*.
+
+Expected posterior bundle content (MODEL scale)
+----------------------------------------------
+  - draws['mu']    : (S, T) location path
+  - draws['sigma'] : (S,)   GEV scale   (or draws['sigma2'])
+  - draws['xi']    : (S,)   GEV shape
+Meta fields (optional):
+  - meta['period']     : blocks per year (default 12)
+  - meta['start_date'] : calendar grouping (YYYY-MM-DD)
+  - meta hints for minima detection (minima/model_sign/series/data_transform)
+
+Outputs (default: <run>/waiting_times_annual)
+--------------------------------------------
+For each threshold thr:
+  - waiting_time_annual_thr<thr>.npz  (med/lo/hi + labels + settings)
+  - waiting_time_annual_thr<thr>.png  (median + band)
+Combined plot (if multiple thresholds):
+  - waiting_time_annual_all_thresholds.png
+Also:
+  - metrics.json
 """
 
 import os
 import re
+import json
 import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Mapping
 
 import numpy as np
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -36,73 +75,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 try:
     from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
 except Exception as e:
-    raise ImportError("Could not import optimization.posterior_bundle.{load_posterior,find_latest_run}.") from e
+    raise ImportError("Could not import optimization.posterior_bundle.load_posterior/find_latest_run.") from e
 
 
 # -----------------------------------------------------------------------------
-# Small helpers
+# Robust run discovery
 # -----------------------------------------------------------------------------
-def _ensure_dir(p: str) -> None:
-    if p:
-        os.makedirs(p, exist_ok=True)
-
-def _savefig(fig: plt.Figure, path: str, *, dpi: int = 200, show: bool = False) -> None:
-    _ensure_dir(os.path.dirname(path))
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    print(f"[save] {path}")
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
-
-def _parse_date(s: Optional[str]) -> Optional[datetime]:
-    if s is None:
-        return None
-    ss = str(s).strip()
-    if not ss:
-        return None
-    parts = [int(x) for x in ss.split("-")]
-    if len(parts) == 1:
-        return datetime(parts[0], 1, 1)
-    if len(parts) == 2:
-        return datetime(parts[0], parts[1], 1)
-    if len(parts) == 3:
-        return datetime(parts[0], parts[1], parts[2])
-    raise ValueError("start_date must be YYYY / YYYY-MM / YYYY-MM-DD")
-
-def _coerce_bool(x: Any) -> Optional[bool]:
-    if x is None:
-        return None
-    if isinstance(x, bool):
-        return x
-    if isinstance(x, (int, np.integer)):
-        return bool(int(x))
-    if isinstance(x, str):
-        t = x.strip().lower()
-        if t in ("1", "true", "t", "yes", "y"): return True
-        if t in ("0", "false", "f", "no", "n"): return False
-    return None
-
-def _detect_minima(meta: Dict[str, Any]) -> bool:
-    for k in ("minima", "is_minima", "minima_series"):
-        b = _coerce_bool(meta.get(k))
-        if b is not None:
-            return b
-    ms = meta.get("model_sign", None)
-    try:
-        if ms is not None and float(ms) < 0:
-            return True
-    except Exception:
-        pass
-    dt = meta.get("data_transform", None)
-    if isinstance(dt, str) and any(tok in dt.lower() for tok in ("negate", "signflip", "flip_sign", "minus")):
-        return True
-    ser = meta.get("series", None)
-    if isinstance(ser, str) and ser.strip() in ("TXn", "TNn"):
-        return True
-    return False
-
-def _extract_ts(path_str: str) -> Optional[float]:
+def _extract_ts_from_path(path_str: str) -> Optional[float]:
     m = re.search(r"(\d{8})_(\d{6})", path_str)
     if not m:
         return None
@@ -112,572 +91,682 @@ def _extract_ts(path_str: str) -> Optional[float]:
     except Exception:
         return None
 
-def _find_latest_npz(root: str) -> Optional[str]:
-    rp = Path(root)
-    if not rp.exists():
+
+def find_latest_posterior_npz(root: str) -> Optional[str]:
+    root_p = Path(root)
+    if not root_p.exists():
         return None
-    cands = list(rp.rglob("posterior*.npz"))
+    cands = list(root_p.rglob("posterior*.npz"))
     if not cands:
         return None
 
     def key(p: Path) -> Tuple[int, float]:
-        ts = _extract_ts(str(p))
+        ts = _extract_ts_from_path(str(p))
         if ts is not None:
             return (1, ts)
         return (0, p.stat().st_mtime)
 
     return str(max(cands, key=key))
 
+
 def resolve_bundle(*, target: Optional[str], root: str):
     if target:
-        print(f"[info] loading posterior from --target: {target}")
         return load_posterior(target)
 
-    print(f"[info] --target not set; searching latest run under --root: {root}")
-    run = find_latest_run(root=root)
-    if run is not None:
-        print(f"[info] find_latest_run -> {run}")
-        return load_posterior(run)
+    print(f"[info] searching latest posterior run under: {root!r}")
+    run_path = find_latest_run(root=root)
+    if run_path is not None:
+        print(f"[info] using latest run: {run_path}")
+        return load_posterior(run_path)
 
-    npz = _find_latest_npz(root)
-    if npz is None:
-        raise SystemExit(f"No posterior found under {root!r}. Provide --target.")
-    print(f"[info] find_latest_run found nothing; fallback newest posterior*.npz -> {npz}")
-    return load_posterior(npz)
+    npz_path = find_latest_posterior_npz(root)
+    if npz_path is None:
+        raise SystemExit(f"[error] No posterior runs found under {root!r}. Provide --target or run the sampler.")
+    print(f"[info] find_latest_run found nothing; using latest npz: {npz_path}")
+    return load_posterior(npz_path)
 
 
 # -----------------------------------------------------------------------------
-# GEV CDF/PPF (broadcast-safe)
+# Post-hoc burn/thin + optional subsample
 # -----------------------------------------------------------------------------
-def gev_cdf(z, mu, sigma, xi):
-    z = np.asarray(z, float)
-    mu = np.asarray(mu, float)
-    sigma = np.clip(np.asarray(sigma, float), 1e-12, None)
-    xi = np.asarray(xi, float)
+def apply_burn_thin(
+    draws: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    burn: int = 0,
+    thin: int = 1,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    burn = int(burn or 0)
+    thin = int(thin or 1)
+    if burn < 0:
+        raise ValueError(f"--burn must be >= 0, got {burn}")
+    if thin < 1:
+        raise ValueError(f"--thin must be >= 1, got {thin}")
 
-    x = (z - mu) / sigma
-    eps = 1e-12
-    gumbel = np.abs(xi) < eps
+    n_samp: Optional[int] = None
+    for k in ("mu", "sigma", "sigma2", "xi"):
+        if k in draws and isinstance(draws[k], np.ndarray) and np.asarray(draws[k]).ndim >= 1:
+            n_samp = int(np.asarray(draws[k]).shape[0])
+            break
+    if n_samp is None:
+        return draws, meta
 
-    cdf_g = np.exp(-np.exp(-x))
+    if burn >= n_samp:
+        raise ValueError(f"--burn={burn} ≥ number of saved samples ({n_samp}).")
 
-    t = 1.0 + xi * x
-    valid = t > 0.0
-    cdf_ng = np.exp(-(t ** (-1.0 / xi)))
+    idx = slice(burn, None, thin)
+    n_used = int(math.ceil((n_samp - burn) / thin))
+    print(f"[info] post-processing chains: raw n={n_samp}, burn={burn}, thin={thin} → used n={n_used}")
 
-    xi_neg = xi < -eps
-    cdf_ng = np.where(valid, cdf_ng, np.where(xi_neg, 1.0, 0.0))
+    for k, v in list(draws.items()):
+        if not isinstance(v, np.ndarray):
+            continue
+        arr = np.asarray(v)
+        if arr.ndim >= 1 and arr.shape[0] == n_samp:
+            draws[k] = arr[idx, ...]
 
-    out = np.where(gumbel, cdf_g, cdf_ng)
-    return np.clip(out, 0.0, 1.0)
-
-def gev_ppf(p: float, mu, sigma, xi):
-    p = float(np.clip(p, 1e-12, 1.0 - 1e-12))
-    mu = np.asarray(mu, float)
-    sigma = np.clip(np.asarray(sigma, float), 1e-12, None)
-    xi = np.asarray(xi, float)
-
-    t = -math.log(p)
-    eps = 1e-12
-    gumbel = np.abs(xi) < eps
-
-    z_g = mu - sigma * math.log(t)
-    z_ng = mu + (sigma / xi) * (t ** (-xi) - 1.0)
-    return np.where(gumbel, z_g, z_ng)
+    postproc = meta.get("postproc", {})
+    if not isinstance(postproc, dict):
+        postproc = {}
+    postproc.update(
+        {
+            "extra_burn": int(burn),
+            "thin": int(thin),
+            "n_samples_raw": int(n_samp),
+            "n_samples_used": int(n_used),
+        }
+    )
+    meta["postproc"] = postproc
+    return draws, meta
 
 
-def _summ(draws: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    loq = (1.0 - level) / 2.0
+def subsample_draws_first_dim(
+    draws: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    max_draws: Optional[int],
+    seed: int = 123,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if max_draws is None:
+        return draws, meta
+    if "mu" not in draws:
+        return draws, meta
+    mu = np.asarray(draws["mu"])
+    if mu.ndim != 2:
+        return draws, meta
+
+    S = int(mu.shape[0])
+    M = int(max_draws)
+    if M <= 0 or S <= M:
+        return draws, meta
+
+    rng = np.random.default_rng(int(seed))
+    idx = np.sort(rng.choice(S, size=M, replace=False))
+    for k, v in list(draws.items()):
+        if not isinstance(v, np.ndarray):
+            continue
+        arr = np.asarray(v)
+        if arr.ndim >= 1 and arr.shape[0] == S:
+            draws[k] = arr[idx, ...]
+
+    postproc = meta.get("postproc", {})
+    if not isinstance(postproc, dict):
+        postproc = {}
+    postproc.update({"subsample_draws": int(M), "subsample_seed": int(seed)})
+    meta["postproc"] = postproc
+    print(f"[info] subsampled posterior draws: S={S} → {M}")
+    return draws, meta
+
+
+# -----------------------------------------------------------------------------
+# Meta helpers
+# -----------------------------------------------------------------------------
+def _coerce_bool(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, np.integer)):
+        return bool(int(x))
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("true", "t", "1", "yes", "y"):
+            return True
+        if s in ("false", "f", "0", "no", "n"):
+            return False
+    return None
+
+
+def detect_minima(meta: Dict[str, Any]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+
+    for k in ("minima", "is_minima", "minima_series"):
+        b = _coerce_bool(meta.get(k, None))
+        if b is not None:
+            return b
+
+    ms = meta.get("model_sign", None)
+    try:
+        if ms is not None and float(ms) < 0:
+            return True
+    except Exception:
+        pass
+
+    ser = meta.get("series", None)
+    if isinstance(ser, str) and ser.strip() in {"TXn", "TNn"}:
+        return True
+
+    dt = meta.get("data_transform", None)
+    if isinstance(dt, str):
+        s = dt.lower()
+        if any(tok in s for tok in ("negate", "signflip", "flip_sign", "minus")):
+            return True
+
+    return False
+
+
+def ensure_dir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def summarize_ci(arr: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    loq = (1.0 - float(level)) / 2.0
     hiq = 1.0 - loq
-    med = np.nanquantile(draws, 0.5, axis=0)
-    lo = np.nanquantile(draws, loq, axis=0)
-    hi = np.nanquantile(draws, hiq, axis=0)
+    med = np.quantile(arr, 0.5, axis=0)
+    lo = np.quantile(arr, loq, axis=0)
+    hi = np.quantile(arr, hiq, axis=0)
     return med, lo, hi
 
 
 # -----------------------------------------------------------------------------
-# Annual grouping
+# Broadcast-safe GEV log-CDF (we only need CDF here)
 # -----------------------------------------------------------------------------
-def build_year_index(T: int, period: int, start_date: Optional[datetime]) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-      x_year: (nY,) decimal years (end-of-year) if start_date else 0..nY-1
-      idx2d : (nY, period) integer indices mapping year -> block indices
-    Only keeps years with exactly `period` blocks observed.
-    """
-    T = int(T)
-    period = int(period)
-    idx = np.arange(T, dtype=int)
+def gev_logcdf(
+    x: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    xi: np.ndarray,
+    eps_xi: float = 1e-12,
+) -> np.ndarray:
+    x = np.asarray(x, float)
+    mu = np.asarray(mu, float)
+    sigma = np.asarray(sigma, float)
+    xi = np.asarray(xi, float)
 
-    if start_date is None or period <= 0:
-        nY = T // period
-        idx2d = idx[: nY * period].reshape(nY, period)
-        return np.arange(nY, dtype=float), idx2d
+    sigma = np.clip(sigma, 1e-12, None)
 
-    if 12 % period != 0:
-        nY = T // period
-        idx2d = idx[: nY * period].reshape(nY, period)
-        return np.arange(nY, dtype=float), idx2d
+    z = (x - mu) / sigma
+    xi_b = np.broadcast_to(xi, z.shape)
+    gmask = np.abs(xi_b) < eps_xi
 
-    step = 12 // period
-    years = np.empty(T, dtype=int)
+    out = np.empty_like(z, dtype=float)
 
-    y0, m0 = start_date.year, start_date.month
-    for i in range(T):
-        mm = (m0 - 1) + i * step
-        yy = y0 + (mm // 12)
-        years[i] = int(yy)
+    # Gumbel: log G = -exp(-z)
+    negz = -z
+    out_g = np.where(negz > 709.0, -np.inf, -np.exp(negz))
 
-    uniq = np.unique(years)
-    starts: List[int] = []
-    x_year: List[float] = []
-    for y in uniq:
-        I = idx[years == y]
-        if I.size == period:
-            starts.append(int(I.min()))
-            x_year.append(float(y) + (12 - 0.5) / 12.0)
+    # Non-Gumbel
+    t = 1.0 + xi_b * z
+    good = t > 0.0
 
-    if not starts:
-        return np.array([], float), np.zeros((0, period), int)
+    expo = np.empty_like(z, dtype=float)
+    expo[good] = (-1.0 / xi_b[good]) * np.log(t[good])
 
-    starts = np.array(starts, dtype=int)
-    idx2d = starts[:, None] + np.arange(period, dtype=int)[None, :]
-    return np.array(x_year, float), idx2d
+    out_ng = np.empty_like(z, dtype=float)
+    out_ng[good] = np.where(expo[good] > 709.0, -np.inf, -np.exp(expo[good]))
+
+    bad = ~good
+    if np.any(bad):
+        # outside support: for xi>0, CDF->0; for xi<0, CDF->1 (log->0)
+        out_ng[bad] = np.where(xi_b[bad] > 0.0, -np.inf, 0.0)
+
+    out[:] = np.where(gmask, out_g, out_ng)
+    out = np.where(np.isfinite(out), np.clip(out, -745.0, 0.0), out)
+    return out
 
 
 # -----------------------------------------------------------------------------
-# Parallel bisection for annual return levels
+# Year grouping helper (+ optional pandas calendar)
 # -----------------------------------------------------------------------------
-def annual_return_level_bisect(mu_year: np.ndarray, sigma: np.ndarray, xi: np.ndarray, N: float,
-                               max_iter: int = 70, max_expand: int = 60) -> np.ndarray:
-    mu_year = np.asarray(mu_year, float)
-    S, nY, p = mu_year.shape
-    sigma = np.clip(np.asarray(sigma, float).reshape(S), 1e-12, None)
-    xi = np.asarray(xi, float).reshape(S)
+def build_year_groups(T: int, period: int, start_date: Optional[str]) -> Tuple[List[np.ndarray], List[str]]:
+    if start_date:
+        try:
+            import pandas as pd
+            dates = pd.date_range(start=pd.to_datetime(start_date), periods=T, freq="MS")
+            years = dates.year.values
+            uniq = np.unique(years)
+            groups: List[np.ndarray] = []
+            labels: List[str] = []
+            for y in uniq:
+                idx = np.where(years == y)[0]
+                if idx.size > 0:
+                    groups.append(idx.astype(int))
+                    labels.append(str(int(y)))
+            return groups, labels
+        except Exception:
+            pass
 
-    target = float(np.clip(1.0 - 1.0 / float(N), 1e-12, 1.0 - 1e-12))
-    log_target = math.log(target)
-
-    def g(z: np.ndarray) -> np.ndarray:
-        G = gev_cdf(z[:, :, None], mu_year, sigma[:, None, None], xi[:, None, None])
-        logG = np.log(np.clip(G, 1e-300, 1.0))
-        return np.sum(logG, axis=2) - log_target
-
-    step_scale = np.maximum(sigma, 1.0)[:, None]
-    lo = np.min(mu_year, axis=2) - 10.0 * step_scale
-    hi = np.max(mu_year, axis=2) + 10.0 * step_scale
-
-    eps_xi = 1e-12
-    has_lb = xi > eps_xi
-    if np.any(has_lb):
-        lb = np.max(mu_year[has_lb] - (sigma[has_lb, None, None] / xi[has_lb, None, None]), axis=2)
-        lo[has_lb] = np.maximum(lo[has_lb], lb + 1e-10 * np.maximum(1.0, np.abs(lb)))
-
-    g_lo = g(lo)
-    g_hi = g(hi)
-
-    need = np.isfinite(g_hi) & (g_hi < 0.0)
-    k = 0
-    while np.any(need) and k < int(max_expand):
-        bump = (2.0 ** k) * 5.0 * step_scale
-        hi = np.where(need, hi + bump, hi)
-        g_hi = np.where(need, g(hi), g_hi)
-        need = np.isfinite(g_hi) & (g_hi < 0.0)
-        k += 1
-
-    ok = np.isfinite(g_lo) & np.isfinite(g_hi) & (g_lo <= 0.0) & (g_hi >= 0.0)
-    z = np.full((S, nY), np.nan, float)
-    if not np.any(ok):
-        return z
-
-    lo_ok = lo.copy()
-    hi_ok = hi.copy()
-    for _ in range(int(max_iter)):
-        mid = 0.5 * (lo_ok + hi_ok)
-        g_mid = g(mid)
-        left = g_mid <= 0.0
-        lo_ok = np.where(ok & left, mid, lo_ok)
-        hi_ok = np.where(ok & (~left), mid, hi_ok)
-
-    return np.where(ok, 0.5 * (lo_ok + hi_ok), z)
+    groups, labels = [], []
+    n_years = T // period
+    for j in range(n_years):
+        idx = np.arange(j * period, (j + 1) * period, dtype=int)
+        groups.append(idx)
+        labels.append(str(j))
+    return groups, labels
 
 
 # -----------------------------------------------------------------------------
-# Plot
+# Core engine: annual hazards + annual expected waiting time
 # -----------------------------------------------------------------------------
-def plot_ribbon(x, med, lo, hi, y_obs, ylabel, save_path, *,
-                color="C0", obs_color="0.25", show=False, no_title=True, title=""):
-    fig, ax = plt.subplots(1, 1, figsize=(12, 3.8))
-    if y_obs is not None:
-        ax.plot(x, y_obs, lw=1.0, alpha=0.35, color=obs_color)
-    ax.fill_between(x, lo, hi, alpha=0.20, color=color)
-    ax.plot(x, med, lw=1.6, color=color)
-    if (not no_title) and title:
-        ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.25)
-    plt.tight_layout()
-    _savefig(fig, save_path, show=show)
+@dataclass
+class SummaryBand:
+    med: np.ndarray
+    lo: np.ndarray
+    hi: np.ndarray
 
 
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
-@dataclass(slots=True)
-class DGEVReturnLevelsConfig:
-    level: float = 0.90
-    Ns: Tuple[int, ...] = (20, 50, 100)
-    thresholds: Tuple[float, ...] = ()
-    period_unit: str = "years"          # "blocks" or "years" (block R scaling only)
-    start_date: Optional[str] = None
-    skip_annual: bool = False
-    window_blocks: int = 0
-    window_years: int = 0
-    log10_period: bool = True           # default ON: avoids unreadable 1e15 axes
-    show: bool = False
-    no_title: bool = True
-
-    # numeric floors
-    p_floor: float = 1e-300
-
-    # plotting style
-    color: str = "C0"
-    obs_color: str = "0.25"
-    prefix: str = ""
-
-
-class DGEVReturnLevels:
-    def __init__(self, *, draws: Dict[str, Any], meta: Dict[str, Any], npz_path: str,
-                 cfg: Optional[DGEVReturnLevelsConfig] = None, out_dir: Optional[str] = None):
-        self.draws = draws
-        self.meta = dict(meta) if isinstance(meta, dict) else {}
-        self.npz_path = str(npz_path)
-        self.cfg = cfg or DGEVReturnLevelsConfig()
-        self.out_dir = out_dir or os.path.join(os.path.dirname(self.npz_path), "return_levels")
-
-        for k in ("mu", "sigma", "xi", "y"):
-            if k not in self.draws:
-                raise ValueError(f"Posterior must contain draws['{k}'].")
-
-        self.mu = np.asarray(self.draws["mu"], float)          # (S,T)
-        self.sigma = np.asarray(self.draws["sigma"], float).ravel()
-        self.xi = np.asarray(self.draws["xi"], float).ravel()
-        self.y_model = np.asarray(self.draws["y"], float).ravel()
-
+class DGEVAnnualWaitingTime:
+    def __init__(
+        self,
+        *,
+        mu: np.ndarray,        # (S,T)
+        sigma: np.ndarray,     # (S,)
+        xi: np.ndarray,        # (S,)
+        period: int = 12,
+        start_date: Optional[str] = None,
+        minima: bool = False,
+    ):
+        self.mu = np.asarray(mu, float)
+        if self.mu.ndim != 2:
+            raise ValueError("mu must be (S,T)")
         self.S, self.T = self.mu.shape
-        if self.y_model.size != self.T:
-            raise ValueError("draws['y'] length mismatch with draws['mu'].")
+
+        self.sigma = np.asarray(sigma, float).reshape(-1)
+        self.xi = np.asarray(xi, float).reshape(-1)
         if self.sigma.size != self.S or self.xi.size != self.S:
-            raise ValueError("draws['sigma'], draws['xi'] must have length S.")
+            raise ValueError("sigma/xi must have length S matching mu")
 
-        self.period = int(self.meta.get("period", 12))
-        self.minima = _detect_minima(self.meta)
+        self.period = int(period)
+        self.start_date = start_date
+        self.minima = bool(minima)
 
-        sd = _parse_date(self.cfg.start_date) or _parse_date(self.meta.get("start_date"))
-        self.start_date = sd
+        self._sigma2 = np.clip(self.sigma, 1e-12, None).reshape(self.S, 1)  # broadcast helper
+        self._xi2 = self.xi.reshape(self.S, 1)
 
-        # plot/model transform: model = sgn * plot, plot = sgn * model
-        self.sgn = -1.0 if self.minima else 1.0
-        self.y_plot = self.sgn * self.y_model
+        self.year_groups, self.year_labels = build_year_groups(self.T, self.period, self.start_date)
+        self.J = len(self.year_groups)
 
-        # x axis
-        self.x_fine = np.arange(self.T, dtype=float)
-        if self.start_date is not None and (12 % self.period == 0):
-            step = 12 // self.period
-            y0, m0 = self.start_date.year, self.start_date.month
-            for i in range(self.T):
-                mm = (m0 - 1) + i * step
-                yy = y0 + (mm // 12)
-                mo = (mm % 12) + 1
-                self.x_fine[i] = float(yy) + (float(mo) - 0.5) / 12.0
+    def to_model_scalar(self, y_orig: float) -> float:
+        return float(-y_orig if self.minima else y_orig)
 
-    @classmethod
-    def from_target_root(cls, *, target: Optional[str], root: str,
-                         cfg: Optional[DGEVReturnLevelsConfig] = None, out_dir: Optional[str] = None):
-        b = resolve_bundle(target=target, root=root)
-        return cls(draws=b.draws, meta=b.meta, npz_path=b.npz_path, cfg=cfg, out_dir=out_dir)
+    # ---- annual exceedance hazards p_j(y*) ----
+    def annual_exceedance_prob_draws(self, threshold_orig: float) -> Tuple[np.ndarray, List[str]]:
+        y_model = self.to_model_scalar(float(threshold_orig))
+        out = np.empty((self.S, self.J), dtype=float)
 
-    def _i0(self) -> int:
-        w = int(self.cfg.window_blocks)
-        return max(0, self.T - w) if w > 0 else 0
+        for j, idx in enumerate(self.year_groups):
+            mu_j = self.mu[:, idx]  # (S,K)
+            x = np.full_like(mu_j, y_model, dtype=float)
+            logG = gev_logcdf(x, mu=mu_j, sigma=self._sigma2, xi=self._xi2)  # (S,K)
+            sum_logG = np.sum(logG, axis=1)                                  # log ∏ G_t
+            out[:, j] = -np.expm1(sum_logG)                                  # 1 - exp(sum logG)
 
-    def _j0(self, nY: int) -> int:
-        w = int(self.cfg.window_years)
-        return max(0, nY - w) if w > 0 else 0
+        out = np.clip(out, 0.0, 1.0)
+        return out, self.year_labels
 
-    def compute(self) -> Dict[str, Any]:
-        cfg = self.cfg
-        i0 = self._i0()
+    # ---- expected waiting time (years) ----
+    @staticmethod
+    def expected_waiting_time_from_hazards(
+        p: np.ndarray,
+        *,
+        tail: str = "carry",
+        eps: float = 1e-15,
+        max_wait: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        p: (S,J) annual hazards in [0,1]
+        returns E: (S,J) expected waiting time in YEARS from each year index.
+        Tail:
+          - 'carry' : use p_tail = p[:, -1]
+          - float   : constant tail hazard
+        """
+        p = np.asarray(p, float)
+        if p.ndim != 2:
+            raise ValueError("p must be (S,J)")
+        S, J = p.shape
+        p = np.clip(p, 0.0, 1.0)
 
-        Ns = tuple(int(n) for n in cfg.Ns if int(n) > 1)
-        thr = tuple(float(x) for x in cfg.thresholds)
+        if tail == "carry":
+            p_tail = p[:, -1]
+        else:
+            try:
+                const = float(tail)
+            except Exception as e:
+                raise ValueError(f"Invalid --tail value {tail!r}. Use 'carry' or a float.") from e
+            p_tail = np.full((S,), np.clip(const, 0.0, 1.0), dtype=float)
 
-        payload: Dict[str, Any] = {
-            "x_fine": self.x_fine,
-            "y_obs": self.y_plot,
-            "period": int(self.period),
-            "minima": bool(self.minima),
-            "credible_level": float(cfg.level),
-            "Ns": np.array(Ns, int),
-            "thresholds": np.array(thr, float),
-            "period_unit": str(cfg.period_unit),
-            "npz_path": self.npz_path,
-            "out_dir": self.out_dir,
-        }
+        E = np.empty((S, J + 1), dtype=float)
+        E[:, J] = 1.0 / np.clip(p_tail, eps, 1.0)
 
-        # -------- Block return levels
-        for N in Ns:
-            pN = 1.0 - 1.0 / float(N)
-            z_model = gev_ppf(pN, self.mu, self.sigma[:, None], self.xi[:, None])
-            z_plot = self.sgn * z_model
-            med, lo, hi = _summ(z_plot[:, i0:], cfg.level)
-            payload[f"z_block_N{N}_med"] = med
-            payload[f"z_block_N{N}_lo"] = lo
-            payload[f"z_block_N{N}_hi"] = hi
+        for j in range(J - 1, -1, -1):
+            E[:, j] = 1.0 + (1.0 - p[:, j]) * E[:, j + 1]
 
-        # -------- Block return periods
-        blocks_per_year = float(self.period)
-        block_scale = (1.0 / blocks_per_year) if cfg.period_unit == "years" else 1.0
+        out = E[:, :J]
+        if max_wait is not None:
+            out = np.clip(out, 0.0, float(max_wait))
+        return out
 
-        if thr:
-            for y_plot in thr:
-                y_model = self.sgn * y_plot
-                G = gev_cdf(y_model, self.mu, self.sigma[:, None], self.xi[:, None])
-                p = np.clip(1.0 - G, cfg.p_floor, 1.0)
-                if cfg.log10_period:
-                    log10R = -np.log10(p) + math.log10(block_scale)
-                    med, lo, hi = _summ(log10R[:, i0:], cfg.level)
-                    payload[f"log10R_block_y{y_plot:g}_med"] = med
-                    payload[f"log10R_block_y{y_plot:g}_lo"] = lo
-                    payload[f"log10R_block_y{y_plot:g}_hi"] = hi
-                else:
-                    R = (1.0 / p) * block_scale
-                    med, lo, hi = _summ(R[:, i0:], cfg.level)
-                    payload[f"R_block_y{y_plot:g}_med"] = med
-                    payload[f"R_block_y{y_plot:g}_lo"] = lo
-                    payload[f"R_block_y{y_plot:g}_hi"] = hi
+    def annual_expected_waiting_time_draws(
+        self,
+        threshold_orig: float,
+        *,
+        tail: str = "carry",
+        max_wait: Optional[float] = None,
+    ) -> Tuple[np.ndarray, List[str]]:
+        p_ann, labels = self.annual_exceedance_prob_draws(threshold_orig)  # (S,J)
+        E = self.expected_waiting_time_from_hazards(p_ann, tail=tail, max_wait=max_wait)
+        return E, labels
 
-        # -------- Annual scale
-        if not cfg.skip_annual:
-            x_year, idx2d = build_year_index(self.T, self.period, self.start_date)
-            nY = int(idx2d.shape[0])
-            payload["x_year"] = x_year
-            payload["n_years"] = nY
 
-            if nY > 0:
-                j0 = self._j0(nY)
-                mu_year = self.mu[:, idx2d]  # (S,nY,period)
+# -----------------------------------------------------------------------------
+# Plotting
+# -----------------------------------------------------------------------------
+@dataclass
+class PlotConfig:
+    figsize: Tuple[float, float] = (10.5, 3.8)
+    alpha_band: float = 0.18
+    lw: float = 1.6
+    grid_alpha: float = 0.25
+    legend: bool = True
+    legend_loc: str = "best"
+    wt_logy: bool = False
 
-                for N in Ns:
-                    z_ann_model = annual_return_level_bisect(mu_year, self.sigma, self.xi, float(N))
-                    z_ann_plot = self.sgn * z_ann_model
-                    med, lo, hi = _summ(z_ann_plot[:, j0:], cfg.level)
-                    payload[f"z_ann_N{N}_med"] = med
-                    payload[f"z_ann_N{N}_lo"] = lo
-                    payload[f"z_ann_N{N}_hi"] = hi
+    xlabel_year: str = "year index"
+    ylabel_annual_wt: str = "expected waiting time (years)"
+    label_template_thr: str = "thr={thr:g}"
 
-                if thr:
-                    for y_plot in thr:
-                        y_model = self.sgn * y_plot
-                        G_full = gev_cdf(y_model, self.mu, self.sigma[:, None], self.xi[:, None])
-                        Gj = G_full[:, idx2d]
-                        logprod = np.sum(np.log(np.clip(Gj, 1e-300, 1.0)), axis=2)
-                        p_ann = np.clip(-np.expm1(logprod), cfg.p_floor, 1.0)
-                        if cfg.log10_period:
-                            log10R = -np.log10(p_ann)
-                            med, lo, hi = _summ(log10R[:, j0:], cfg.level)
-                            payload[f"log10R_ann_y{y_plot:g}_med"] = med
-                            payload[f"log10R_ann_y{y_plot:g}_lo"] = lo
-                            payload[f"log10R_ann_y{y_plot:g}_hi"] = hi
-                        else:
-                            R = 1.0 / p_ann
-                            med, lo, hi = _summ(R[:, j0:], cfg.level)
-                            payload[f"R_ann_y{y_plot:g}_med"] = med
-                            payload[f"R_ann_y{y_plot:g}_lo"] = lo
-                            payload[f"R_ann_y{y_plot:g}_hi"] = hi
 
-        return payload
+class WaitingTimePlotter:
+    def __init__(self, cfg: PlotConfig | None = None):
+        self.cfg = cfg or PlotConfig()
 
-    def save_plots(self, payload: Dict[str, Any]) -> None:
-        cfg = self.cfg
-        out = self.out_dir
-        _ensure_dir(out)
+    def plot_single_band(
+        self,
+        x: np.ndarray,
+        band: SummaryBand,
+        *,
+        xlabel: Optional[str],
+        ylabel: Optional[str],
+        path: str,
+        title: Optional[str] = None,
+        logy: bool = False,
+    ) -> None:
+        fig, ax = plt.subplots(figsize=self.cfg.figsize)
+        ax.fill_between(x, band.lo, band.hi, alpha=self.cfg.alpha_band)
+        ax.plot(x, band.med, lw=self.cfg.lw)
+        ax.set_xlabel(xlabel or "")
+        ax.set_ylabel(ylabel or "")
+        if title:
+            ax.set_title(title)
+        ax.grid(True, alpha=self.cfg.grid_alpha)
+        if logy:
+            ax.set_yscale("log")
+        ensure_dir(os.path.dirname(path))
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[save] {path}")
 
-        # banner
-        print(f"[info] posterior npz   : {self.npz_path}")
-        print(f"[info] output dir      : {out}")
-        print(f"[info] minima detected  : {self.minima} (sgn={self.sgn:+.0f})")
-        print(f"[info] period          : {self.period}")
-        print(f"[info] start_date       : {self.start_date}")
-        print(f"[info] draws S, T       : {self.S}, {self.T}")
-        print(f"[info] Ns              : {payload['Ns'].tolist()}")
-        print(f"[info] thresholds       : {payload['thresholds'].tolist()}")
-        print(f"[info] annual enabled   : {not cfg.skip_annual}")
-        print(f"[info] log10_period     : {cfg.log10_period}")
+    def plot_multi_bands(
+        self,
+        x: np.ndarray,
+        bands: Mapping[str, SummaryBand],
+        *,
+        xlabel: Optional[str],
+        ylabel: Optional[str],
+        path: str,
+        title: Optional[str] = None,
+        legend: Optional[bool] = None,
+        logy: bool = False,
+    ) -> None:
+        fig, ax = plt.subplots(figsize=self.cfg.figsize)
+        for lab, band in bands.items():
+            ax.fill_between(x, band.lo, band.hi, alpha=self.cfg.alpha_band)
+            ax.plot(x, band.med, lw=self.cfg.lw, label=lab)
+        ax.set_xlabel(xlabel or "")
+        ax.set_ylabel(ylabel or "")
+        if title:
+            ax.set_title(title)
+        ax.grid(True, alpha=self.cfg.grid_alpha)
+        if logy:
+            ax.set_yscale("log")
+        use_leg = self.cfg.legend if legend is None else bool(legend)
+        if use_leg:
+            ax.legend(loc=self.cfg.legend_loc, frameon=False)
+        ensure_dir(os.path.dirname(path))
+        fig.savefig(path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[save] {path}")
 
-        i0 = self._i0()
-        x_block = payload["x_fine"][i0:]
-        y_obs = payload["y_obs"][i0:]
-        pref = cfg.prefix or ""
 
-        # block return levels
-        for N in payload["Ns"].tolist():
-            path = os.path.join(out, f"{pref}return_level_block_N{int(N)}.png")
-            plot_ribbon(
-                x_block,
-                payload[f"z_block_N{int(N)}_med"],
-                payload[f"z_block_N{int(N)}_lo"],
-                payload[f"z_block_N{int(N)}_hi"],
-                y_obs,
-                ylabel=f"z(N={int(N)})",
-                save_path=path,
-                color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-            )
+# -----------------------------------------------------------------------------
+# Helpers: parsing + printing
+# -----------------------------------------------------------------------------
+def parse_csv_floats(s: str) -> List[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
-        # block return periods
-        for y in payload["thresholds"].tolist():
-            if cfg.log10_period:
-                path = os.path.join(out, f"{pref}return_period_block_log10_y{y:g}.png")
-                plot_ribbon(
-                    x_block,
-                    payload[f"log10R_block_y{y:g}_med"],
-                    payload[f"log10R_block_y{y:g}_lo"],
-                    payload[f"log10R_block_y{y:g}_hi"],
-                    None,
-                    ylabel=f"log10 Return period @ y*={y:g} ({cfg.period_unit})",
-                    save_path=path,
-                    color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-                )
-            else:
-                path = os.path.join(out, f"{pref}return_period_block_y{y:g}.png")
-                plot_ribbon(
-                    x_block,
-                    payload[f"R_block_y{y:g}_med"],
-                    payload[f"R_block_y{y:g}_lo"],
-                    payload[f"R_block_y{y:g}_hi"],
-                    None,
-                    ylabel=f"Return period @ y*={y:g} ({cfg.period_unit})",
-                    save_path=path,
-                    color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-                )
 
-        # annual
-        if ("x_year" in payload) and int(payload.get("n_years", 0)) > 0:
-            x_year = payload["x_year"]
-            nY = int(payload["n_years"])
-            j0 = self._j0(nY)
-            x_ann = x_year[j0:]
+def parse_csv_tokens(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
 
-            for N in payload["Ns"].tolist():
-                path = os.path.join(out, f"{pref}return_level_annual_N{int(N)}.png")
-                plot_ribbon(
-                    x_ann,
-                    payload[f"z_ann_N{int(N)}_med"],
-                    payload[f"z_ann_N{int(N)}_lo"],
-                    payload[f"z_ann_N{int(N)}_hi"],
-                    None,
-                    ylabel=f"z_ann(N={int(N)})",
-                    save_path=path,
-                    color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-                )
 
-            for y in payload["thresholds"].tolist():
-                if cfg.log10_period:
-                    path = os.path.join(out, f"{pref}return_period_annual_log10_y{y:g}.png")
-                    plot_ribbon(
-                        x_ann,
-                        payload[f"log10R_ann_y{y:g}_med"],
-                        payload[f"log10R_ann_y{y:g}_lo"],
-                        payload[f"log10R_ann_y{y:g}_hi"],
-                        None,
-                        ylabel=f"log10 Annual return period @ y*={y:g} (years)",
-                        save_path=path,
-                        color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-                    )
-                else:
-                    path = os.path.join(out, f"{pref}return_period_annual_y{y:g}.png")
-                    plot_ribbon(
-                        x_ann,
-                        payload[f"R_ann_y{y:g}_med"],
-                        payload[f"R_ann_y{y:g}_lo"],
-                        payload[f"R_ann_y{y:g}_hi"],
-                        None,
-                        ylabel=f"Annual return period @ y*={y:g} (years)",
-                        save_path=path,
-                        color=cfg.color, obs_color=cfg.obs_color, show=cfg.show, no_title=cfg.no_title,
-                    )
+def fmt_wt(x: float) -> str:
+    if not np.isfinite(x):
+        return str(x)
+    return f"{x:.3g}"
 
-        payload_path = os.path.join(out, "return_levels_payload.npz")
-        np.savez_compressed(payload_path, **payload)
-        print(f"[save] {payload_path}")
-        print("[done] return levels / return periods written.")
 
-    def run(self) -> Dict[str, Any]:
-        payload = self.compute()
-        self.save_plots(payload)
-        return payload
+def print_wt_annual_points(labels: List[str], band: SummaryBand, tokens: List[str], title: str) -> None:
+    mp = {lab: i for i, lab in enumerate(labels)}
+    print(f"\n{title}")
+    print("  label |     med      lo      hi")
+    for tok in tokens:
+        idx = mp.get(tok, None)
+        if idx is None:
+            try:
+                ii = int(tok)
+                if 0 <= ii < len(labels):
+                    idx = ii
+            except Exception:
+                idx = None
+        if idx is None:
+            print(f"  {tok:>5} |  (not found)")
+            continue
+        lab = labels[idx]
+        print(f"  {lab:>5} | {fmt_wt(float(band.med[idx])):>7} {fmt_wt(float(band.lo[idx])):>7} {fmt_wt(float(band.hi[idx])):>7}")
 
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
-def _parse_csv_floats(s: Optional[str]) -> List[float]:
-    if s is None:
-        return []
-    out: List[float] = []
-    for tok in str(s).split(","):
-        tok = tok.strip()
-        if tok:
-            out.append(float(tok))
-    return out
-
-def main() -> None:
+if __name__ == "__main__":
     import argparse
+
     p = argparse.ArgumentParser(
-        description="Compute DGEV return levels / return periods from posterior draws.",
+        description="Annual expected waiting times for Laplace DGEV posterior (threshold-based).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--target", type=str, default=None, help="Run dir or posterior.npz.")
-    p.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO", help="Search root if --target omitted.")
-    p.add_argument("--out", type=str, default=None, help="Output directory (default: <run>/return_levels).")
+    p.add_argument("--target", type=str, default=None,
+                   help="Path to run dir or directly to posterior.npz. If omitted, uses latest under --root.")
+    p.add_argument("--root", type=str, default="results/simulations/DGEV_NCP_LASSO",
+                   help="Search root when --target is omitted.")
+    p.add_argument("--out", type=str, default=None,
+                   help="Output directory. Default: <run>/waiting_times_annual")
 
-    p.add_argument("--level", type=float, default=0.90)
-    p.add_argument("--N", type=str, default="20,50,100")
-    p.add_argument("--threshold", type=str, default=None)
+    p.add_argument("--period", type=int, default=None,
+                   help="Blocks per year (default: meta['period'] or 12).")
+    p.add_argument("--start-date", type=str, default=None,
+                   help="Start date (YYYY-MM-DD) for calendar-year grouping.")
 
-    p.add_argument("--period-unit", choices=["blocks", "years"], default="years")
-    p.add_argument("--start-date", type=str, default=None)
-    p.add_argument("--skip-annual", action="store_true", default=False)
+    p.add_argument("--level", type=float, default=0.90, help="Credible interval level.")
+    p.add_argument("--burn", type=int, default=0, help="Extra burn-in (post-hoc).")
+    p.add_argument("--thin", type=int, default=1, help="Extra thinning (post-hoc).")
+    p.add_argument("--max-draws", type=int, default=None, help="Optional posterior draw subsample for speed.")
+    p.add_argument("--seed", type=int, default=123, help="Seed used for subsampling.")
 
-    p.add_argument("--window-blocks", type=int, default=0)
-    p.add_argument("--window-years", type=int, default=0)
+    p.add_argument("--thresholds", type=str, default="0.0",
+                   help="Comma-separated thresholds y* (ORIGINAL scale) for annual expected waiting times.")
+    p.add_argument("--tail", type=str, default="carry",
+                   help="Tail convention for recursion: 'carry' or a float (constant tail hazard).")
+    p.add_argument("--max-wait", type=float, default=None,
+                   help="Optional cap on waiting times (years), mainly for plotting stability.")
+    p.add_argument("--wt-logy", action="store_true", default=False,
+                   help="Use log-scale on y-axis for waiting time plots.")
 
-    p.add_argument("--log10-period", action="store_true", default=False)
-    p.add_argument("--show", action="store_true", default=False)
+    p.add_argument("--print-years", type=str, default=None,
+                   help="Comma-separated calendar years OR year-indices to print at (e.g. 1892,1950,2020).")
+
+    p.add_argument("--xlabel-year", type=str, default=None)
+    p.add_argument("--ylabel-annual-wt", type=str, default=None)
+    p.add_argument("--legend", action="store_true", default=True, help="Show legends on combined plots.")
+    p.add_argument("--no-legend", action="store_false", dest="legend", help="Disable legends.")
+    p.add_argument("--no-combined", action="store_true", default=False,
+                   help="Do not create combined plot (all thresholds on one plot).")
+    p.add_argument("--no-individual", action="store_true", default=False,
+                   help="Do not create individual plot per threshold.")
 
     args = p.parse_args()
 
-    Ns = tuple(int(round(x)) for x in _parse_csv_floats(args.N) if x > 1)
-    thr = tuple(_parse_csv_floats(args.threshold)) if args.threshold else ()
+    bundle = resolve_bundle(target=args.target, root=args.root)
+    draws, meta, npz_path = bundle.draws, bundle.meta, bundle.npz_path
 
-    cfg = DGEVReturnLevelsConfig(
-        level=float(args.level),
-        Ns=Ns,
-        thresholds=thr,
-        period_unit=str(args.period_unit),
-        start_date=str(args.start_date) if args.start_date else None,
-        skip_annual=bool(args.skip_annual),
-        window_blocks=int(args.window_blocks),
-        window_years=int(args.window_years),
-        log10_period=bool(args.log10_period),
-        show=bool(args.show),
+    if args.burn > 0 or args.thin > 1:
+        draws, meta = apply_burn_thin(draws, dict(meta), burn=args.burn, thin=args.thin)
+    draws, meta = subsample_draws_first_dim(draws, dict(meta), max_draws=args.max_draws, seed=args.seed)
+
+    if "mu" not in draws:
+        raise SystemExit("[error] posterior draws must contain 'mu' (S,T).")
+    mu = np.asarray(draws["mu"], float)
+
+    if "sigma" in draws:
+        sigma = np.asarray(draws["sigma"], float).reshape(-1)
+    elif "sigma2" in draws:
+        sigma = np.sqrt(np.clip(np.asarray(draws["sigma2"], float).reshape(-1), 0.0, None))
+    else:
+        raise SystemExit("[error] posterior draws must contain 'sigma' or 'sigma2'.")
+
+    if "xi" not in draws:
+        raise SystemExit("[error] posterior draws must contain 'xi'.")
+    xi = np.asarray(draws["xi"], float).reshape(-1)
+
+    period = int(args.period or meta.get("period", 12))
+    start_date = args.start_date or meta.get("start_date", None)
+    minima = detect_minima(meta)
+
+    engine = DGEVAnnualWaitingTime(mu=mu, sigma=sigma, xi=xi, period=period, start_date=start_date, minima=minima)
+
+    out_dir = args.out or os.path.join(os.path.dirname(npz_path), "waiting_times_annual")
+    ensure_dir(out_dir)
+
+    print(f"[info] using posterior: {npz_path}")
+    print(f"[info] period={period}, start_date={start_date}, minima_detected={minima}")
+    print(f"[info] saving outputs to: {out_dir}")
+
+    cfg = PlotConfig(
+        legend=bool(args.legend),
+        wt_logy=bool(args.wt_logy),
     )
+    if args.xlabel_year is not None:
+        cfg.xlabel_year = args.xlabel_year
+    if args.ylabel_annual_wt is not None:
+        cfg.ylabel_annual_wt = args.ylabel_annual_wt
 
-    b = resolve_bundle(target=args.target, root=args.root)
-    out_dir = args.out or os.path.join(os.path.dirname(b.npz_path), "return_levels")
-    print(f"[info] resolved output dir: {out_dir}")
-    rl = DGEVReturnLevels(draws=b.draws, meta=b.meta, npz_path=b.npz_path, cfg=cfg, out_dir=out_dir)
-    rl.run()
+    plotter = WaitingTimePlotter(cfg)
 
-if __name__ == "__main__":
-    main()
+    metrics: Dict[str, Any] = {
+        "npz_path": str(npz_path),
+        "period": int(period),
+        "start_date": start_date,
+        "minima_detected": bool(minima),
+        "S": int(engine.S),
+        "T": int(engine.T),
+        "J_years": int(engine.J),
+        "level": float(args.level),
+        "tail": str(args.tail),
+        "max_wait": args.max_wait,
+        "plots": {
+            "legend": bool(cfg.legend),
+            "wt_logy": bool(cfg.wt_logy),
+            "combined": (not bool(args.no_combined)),
+            "individual": (not bool(args.no_individual)),
+        },
+    }
+
+    thr_list = parse_csv_floats(args.thresholds)
+    print_year_tokens = parse_csv_tokens(args.print_years)
+
+    # Compute waiting-time bands
+    ann_wt_bands: Dict[str, SummaryBand] = {}
+    wt_meta: Dict[str, Any] = {}
+
+    last_labels: Optional[List[str]] = None
+    for thr in thr_list:
+        wt_ann, labels = engine.annual_expected_waiting_time_draws(thr, tail=args.tail, max_wait=args.max_wait)  # (S,J)
+        med, lo, hi = summarize_ci(wt_ann, level=args.level)
+        band = SummaryBand(med=med, lo=lo, hi=hi)
+
+        labT = cfg.label_template_thr.format(thr=thr)
+        ann_wt_bands[labT] = band
+        wt_meta[str(thr)] = {"annual_labels": labels}
+        last_labels = labels
+
+        # Save NPZ
+        np.savez_compressed(
+            os.path.join(out_dir, f"waiting_time_annual_thr{thr}.npz"),
+            thr=float(thr),
+            wt_ann_med=med,
+            wt_ann_lo=lo,
+            wt_ann_hi=hi,
+            labels=np.array(labels, dtype=object),
+            level=float(args.level),
+            minima_detected=bool(minima),
+            tail=str(args.tail),
+            max_wait=args.max_wait,
+        )
+
+        # Individual plot
+        if not args.no_individual:
+            plotter.plot_single_band(
+                np.arange(len(labels)),
+                band,
+                xlabel=cfg.xlabel_year,
+                ylabel=cfg.ylabel_annual_wt,
+                path=os.path.join(out_dir, f"waiting_time_annual_thr{thr}.png"),
+                logy=cfg.wt_logy,
+            )
+
+        # Printing
+        if print_year_tokens:
+            print_wt_annual_points(labels, band, print_year_tokens, f"[print] Annual expected waiting time ({labT})")
+
+    metrics["waiting_times"] = wt_meta
+
+    # Combined plot
+    if (not args.no_combined) and len(thr_list) >= 2 and last_labels is not None:
+        plotter.plot_multi_bands(
+            np.arange(len(last_labels)),
+            ann_wt_bands,
+            xlabel=cfg.xlabel_year,
+            ylabel=cfg.ylabel_annual_wt,
+            path=os.path.join(out_dir, "waiting_time_annual_all_thresholds.png"),
+            legend=cfg.legend,
+            logy=cfg.wt_logy,
+        )
+
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[save] {os.path.join(out_dir, 'metrics.json')}")
+    print("[done] annual expected waiting times computed.")
