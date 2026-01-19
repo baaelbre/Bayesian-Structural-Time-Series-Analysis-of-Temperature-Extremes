@@ -60,7 +60,7 @@ def _iso_or_str(x: Any) -> str:
 # =============================================================================
 # Priors & config
 # =============================================================================
-@dataclass(slots=True)
+@dataclass()
 class Priors:
     # sigma^2 ~ Inv-Gamma(a_sigma, b_sigma) with shape–rate on sigma^2
     a_sigma: float = 2.0
@@ -83,7 +83,7 @@ class Priors:
     b_lambda: float = 1.0
 
 
-@dataclass(slots=True)
+@dataclass()
 class SamplerConfig:
     n_iter: int = 5000
     burn: int = 1000
