@@ -62,7 +62,7 @@ class DLMGibbsConjugate:
       - hierarchical Bayesian lasso prior on signed process SDs.
 
     Fixes applied:
-      (1) Seasonal innovations: ONLY the first seasonal component gets noise (dummy seasonal).
+      (1) Seasonal innovations:  the first seasonal component gets noise (dummy seasonal).
       (2) Centred-time regression update: correct correlated Gaussian prior on (alpha_c, beta)
           induced by independent priors on (alpha0, beta0).
     """
@@ -759,8 +759,8 @@ if __name__ == "__main__":
     p.add_argument("--v0-level", type=float, default=0.05)
     p.add_argument("--m0-trend", type=float, default=0.001)
     p.add_argument("--v0-trend", type=float, default=0.05)
-    p.add_argument("--m0-season", type=str, default=None)  # csv or None
-    p.add_argument("--v0-season", type=str, default=None)  # csv or None
+    p.add_argument("--m0-season", type=str, default="5,10,-5,-10,5,10,-5,-10,5,10,-5")  # csv or None
+    p.add_argument("--v0-season", type=str, default="1,1,1,1,1,1,1,1,1,1,1")  # csv or None
 
     # Priors
     p.add_argument("--prior-a-sigma", type=float, default=2.0)

@@ -1,31 +1,7 @@
 # %% simulator/uccle_dlm_plotter.py
 from __future__ import annotations
 """
-Uccle DLM Plotter (TXm, TNm, Precm; Monthly)
-===========================================
-
-Thin wrapper around:
-    simulator.dlm_plotter.DLMPlotter
-
-Key requirements
-----------------
-- Uccle is always monthly and starts at 1892-01-01 (calendar index forced).
-- TX* series are always red (line + shading).
-- TN* series are always blue (line + shading).
-- State component plots (level/slope/seasonality) have NO titles by default.
-- Default: state plots have NO legend (no “median / 90% band” boxes).
-- Additional figure: separate histogram of process variances on log10 scale with no title.
-- Robust run discovery:
-    1) optimization.posterior_bundle.find_latest_run (expects posterior.npz)
-    2) fallback recursive search for posterior*.npz and pick most recent
-- Prints level/slope summaries at calendar years 1892, 1950, 2020 (January of each year).
-- NEW: prints credible intervals and estimates for (all) static parameters via
-  plotter.print_static_params(...), by default.
-
-Notes
------
-- For temperature DLMs where slope is on "per month" scale, we keep your default
-  state kw: slope_scale=120 (≈ per decade) unless overridden.
+Uccle DLM Plotter (TXm, TNm; Monthly)
 """
 
 import os
@@ -33,29 +9,95 @@ import sys
 import re
 import math
 import argparse
-import ast
 from pathlib import Path
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Union
 
 import numpy as np
-import matplotlib.pyplot as plt  # noqa: F401
 
 # Make project root importable
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from optimization.posterior_bundle import load_posterior, find_latest_run  # type: ignore
 from simulator.dlm_plotter import DLMPlotter  # type: ignore
+import matplotlib as mpl
+
+mpl.rcParams.update({
+    # global base font
+    "font.size": 18,
+
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 11,
+})
+
+# Prefer using shared utils when available (keeps behavior aligned with DLMPlotter)
+try:
+    from simulator.utils import _ensure_dir, find_latest_posterior_npz, _parse_kv_list  # type: ignore
+except Exception:
+    # Minimal fallbacks (kept tiny; wrapper still works if utils import fails)
+    def _ensure_dir(path: Optional[str]) -> None:
+        if path:
+            os.makedirs(path, exist_ok=True)
+
+    def find_latest_posterior_npz(root: str) -> Optional[str]:
+        root_p = Path(root)
+        if not root_p.exists():
+            return None
+        cands = list(root_p.rglob("posterior*.npz"))
+        if not cands:
+            return None
+        return str(max(cands, key=lambda p: p.stat().st_mtime))
+
+    def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
+        # very small K=V parser; keep consistent with your other wrappers where possible
+        import ast
+
+        def _parse_value(raw: str):
+            s = raw.strip()
+            low = s.lower()
+            if low in ("none", "null"):
+                return None
+            if low in ("true", "false"):
+                return low == "true"
+            try:
+                return ast.literal_eval(s)
+            except Exception:
+                return s
+
+        def _set_nested(d: dict, key: str, value):
+            parts = [p for p in key.split(".") if p]
+            cur = d
+            for p in parts[:-1]:
+                if p not in cur or not isinstance(cur[p], dict):
+                    cur[p] = {}
+                cur = cur[p]
+            cur[parts[-1]] = value
+
+        out: Dict[str, Any] = {}
+        for it in items:
+            if "=" not in it:
+                raise ValueError(f"Expected K=V, got: {it!r}")
+            k, v = it.split("=", 1)
+            k = k.strip()
+            val = _parse_value(v)
+            if "." in k:
+                _set_nested(out, k, val)
+            else:
+                out[k] = val
+        return out
 
 
 # ---------------------------------------------------------------------
-# Paths / discovery
+# Uccle layout helpers
 # ---------------------------------------------------------------------
-def _ensure_dir(path: Optional[str]) -> None:
-    if path:
-        os.makedirs(path, exist_ok=True)
-
-
 def default_root(series: str) -> str:
     base = "results/uccle"
     if series == "TXm":
@@ -67,35 +109,12 @@ def default_root(series: str) -> str:
     raise ValueError(f"Unknown series {series!r} for default root.")
 
 
-def _extract_ts_from_path(path_str: str) -> Optional[float]:
-    m = re.search(r"(\d{8})_(\d{6})", path_str)
-    if not m:
-        return None
-    try:
-        dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-        return dt.timestamp()
-    except Exception:
-        return None
-
-
-def find_latest_posterior_npz(root: str) -> Optional[str]:
-    root_p = Path(root)
-    if not root_p.exists():
-        return None
-    cands = list(root_p.rglob("posterior*.npz"))
-    if not cands:
-        return None
-
-    def key(p: Path) -> Tuple[int, float]:
-        ts = _extract_ts_from_path(str(p))
-        if ts is not None:
-            return (1, ts)
-        return (0, p.stat().st_mtime)
-
-    return str(max(cands, key=key))
-
-
 def resolve_bundle(*, target: Optional[str], series: str, root: Optional[str]) -> Any:
+    """
+    Robust run discovery:
+      1) find_latest_run(root=...) -> expects a run dir / posterior.npz
+      2) fallback find_latest_posterior_npz(root=...) -> recursive posterior*.npz
+    """
     if target:
         return load_posterior(target)
 
@@ -161,7 +180,8 @@ def apply_burn_thin(
         if arr.ndim >= 1 and arr.shape[0] == n_samp:
             draws[k] = arr[idx, ...]
 
-    postproc = meta.get("postproc", {})
+    meta = dict(meta)
+    postproc = dict(meta.get("postproc", {}) or {})
     postproc.update(
         {
             "extra_burn": int(burn),
@@ -175,47 +195,6 @@ def apply_burn_thin(
 
 
 # ---------------------------------------------------------------------
-# CLI kwarg overrides
-# ---------------------------------------------------------------------
-def _parse_value(raw: str):
-    s = raw.strip()
-    low = s.lower()
-    if low in ("none", "null"):
-        return None
-    if low in ("true", "false"):
-        return low == "true"
-    try:
-        return ast.literal_eval(s)
-    except Exception:
-        return s
-
-
-def _set_nested(d: dict, key: str, value):
-    parts = [p for p in key.split(".") if p]
-    cur = d
-    for p in parts[:-1]:
-        if p not in cur or not isinstance(cur[p], dict):
-            cur[p] = {}
-        cur = cur[p]
-    cur[parts[-1]] = value
-
-
-def _parse_kv_list(items: List[str]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for it in items:
-        if "=" not in it:
-            raise ValueError(f"Expected K=V, got: {it!r}")
-        k, v = it.split("=", 1)
-        k = k.strip()
-        val = _parse_value(v)
-        if "." in k:
-            _set_nested(out, k, val)
-        else:
-            out[k] = val
-    return out
-
-
-# ---------------------------------------------------------------------
 # Series colors (fixed)
 # ---------------------------------------------------------------------
 def series_color(series: str) -> str:
@@ -224,7 +203,17 @@ def series_color(series: str) -> str:
         return "red"
     if s.startswith("TN"):
         return "blue"
+    if s.startswith("PREC"):
+        return "tab:green"
     return "C0"
+
+
+def default_slope_scale(series: str) -> float:
+    """
+    For temperature DLMs (TXm/TNm), slope is usually per month; default to per-decade scale.
+    For precipitation, leave slope on its native scale unless overridden.
+    """
+    return 120.0 if series in ("TXm", "TNm") else 1.0
 
 
 # ---------------------------------------------------------------------
@@ -234,31 +223,21 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Uccle DLM Plotter (TXm/TNm/Precm; Monthly)\n"
-            "Uses the generic Gaussian DLMPlotter.\n"
+            "Uses simulator.dlm_plotter.DLMPlotter.\n"
             "Calendar origin is forced to 1892-01-01 monthly.\n"
-            "Prints level/slope summaries at user-chosen years (January).\n"
+            "Prints level/slope summaries at chosen years (January).\n"
             "Prints static parameter summaries (median/CI) by default.\n"
+            "Seasonal diagnostics are produced via DLMPlotter.\n"
             "Use --<section>-kw K=V (repeatable) to override plot kwargs.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument(
-        "--target",
-        type=str,
-        default=None,
-        help="Run directory or posterior .npz. If provided, overrides --series/--root.",
-    )
-    p.add_argument(
-        "--series",
-        type=str,
-        choices=["TXm", "TNm", "Precm"],
-        default="TNm",
-        help="Series code when searching by default roots (ignored if --target is given).",
-    )
+    p.add_argument("--target", type=str, default=None, help="Run directory or posterior .npz. Overrides --series/--root.")
+    p.add_argument("--series", type=str, choices=["TXm", "TNm", "Precm"], default="TNm")
     p.add_argument("--root", type=str, default=None, help="Search root when --target is omitted (defaults to Uccle layout).")
 
-    p.add_argument("--level", type=float, default=0.9, help="Credible band level.")
+    p.add_argument("--level", type=float, default=0.90, help="Credible band level.")
     p.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     p.add_argument("--out", type=str, default=None, help="Directory to save figures (default: <run>/figures).")
 
@@ -266,93 +245,71 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--skip-traceacf", action="store_true", help="Skip trace+hist+ACF panels.")
     p.add_argument("--skip-states", action="store_true", help="Skip separate state plots.")
     p.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
-    p.add_argument("--skip-qhist", action="store_true", help="Skip separate log10(Q) histogram.")
+    p.add_argument("--skip-qhist", action="store_true", help="Skip separate log10(Q) histogram (no title).")
 
+    # seasonal diagnostics
+    p.add_argument("--skip-seasonal-patterns", action="store_true", help="Skip seasonal pattern figure.")
+    p.add_argument("--skip-seasonal-variance", action="store_true", help="Skip seasonal variance-by-year figure.")
+    p.add_argument(
+        "--seasonal-years", type=str, default="auto",
+        help="Comma-separated calendar years for seasonal pattern plot, or 'auto'. Example: 1950,1980,2020"
+    )
+
+    # post-hoc chain processing
     p.add_argument("--burn", type=int, default=0, help="Extra burn-in draws (post-hoc).")
     p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
 
-    p.add_argument(
-        "--summary-years",
-        type=str,
-        default="1892,1950,2020",
-        help="Comma-separated calendar years (January) at which to print level/slope summaries.",
-    )
+    # summaries
+    p.add_argument("--summary-years", type=str, default="1892,1950,2020", help="Comma-separated calendar years (January).")
+    p.add_argument("--summary-slope-scale", type=float, default=None, help="Override slope scale in printed level/slope summary.")
 
-    # ---- static parameter printing ----
-    p.add_argument(
-        "--print-static",
-        action="store_true",
-        default=True,
-        help="Print static parameter summaries (median/CI).",
-    )
-    p.add_argument(
-        "--no-print-static",
-        action="store_true",
-        default=False,
-        help="Disable printing static parameter summaries.",
-    )
+    # static parameter printing
+    p.add_argument("--print-static", action="store_true", default=True, help="Print static parameter summaries (median/CI).")
+    p.add_argument("--no-print-static", action="store_true", default=False, help="Disable printing static parameter summaries.")
     p.add_argument("--static-level", type=float, default=None, help="Credible level for static params (default: --level).")
-    p.add_argument("--static-center", type=str, default="median", choices=["median", "mean"], help="Center for summaries.")
-    p.add_argument("--static-digits", type=int, default=4, help="Digits for printed static summaries.")
-    p.add_argument(
-        "--static-max-cols",
-        type=int,
-        default=None,
-        help="Max columns to print for vector parameters (default: print all).",
-    )
-    p.add_argument("--static-no-diag", action="store_true", default=False, help="Disable ESS/Geweke diagnostics in printing.")
-    p.add_argument(
-        "--print-log-process",
-        action="store_true",
-        default=True,
-        help="Also print log10(|s_*|) and log10(Q) in the static summary.",
-    )
-    p.add_argument("--log-eps", type=float, default=1e-20, help="Epsilon floor before log10 for process-noise printing.")
+    p.add_argument("--static-center", type=str, default="median", choices=["median", "mean"])
+    p.add_argument("--static-digits", type=int, default=4)
+    p.add_argument("--static-max-cols", type=int, default=None)
+    p.add_argument("--static-no-diag", action="store_true", default=False)
+    p.add_argument("--print-log-process", action="store_true", default=True)
+    p.add_argument("--log-eps", type=float, default=1e-20)
 
-    # ---- kwargs overrides for plotting ----
-    p.add_argument(
-        "--overview-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
-    )
-    p.add_argument(
-        "--traceacf-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
-    )
+    # kwargs overrides for plotting (defaults enforce Uccle style)
+    p.add_argument("--overview-kw", action="append", default=[], metavar="K=V")
+    p.add_argument("--traceacf-kw", action="append", default=[], metavar="K=V")
     p.add_argument(
         "--states-kw",
         action="append",
         default=[
-            "slope_scale=120",
+            # enforce "no titles" by default
             "title_level=''",
             "title_slope=''",
             "title_seasonality=''",
+            # enforce "no legend" by default
             "show_legend=False",
+            # common Uccle scaling: per-decade slope for temperatures (overridden in main() if needed)
+            # keep a placeholder; main() will set slope_scale if user didn't specify it
         ],
         metavar="K=V",
-        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
     )
-    p.add_argument(
-        "--quick-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
-    )
-    p.add_argument(
-        "--qhist-kw",
-        action="append",
-        default=[],
-        metavar="K=V",
-        help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable.",
-    )
+    p.add_argument("--quick-kw", action="append", default=[], metavar="K=V")
+    p.add_argument("--qhist-kw", action="append", default=[], metavar="K=V")
+
+    # seasonal kw
+    p.add_argument("--seasonal-patterns-kw", action="append", default=["title=''"], metavar="K=V")
+    p.add_argument("--seasonal-variance-kw", action="append", default=["title=''"], metavar="K=V")
 
     return p
+
+
+def _parse_year_list(s: str) -> List[int]:
+    out: List[int] = []
+    for tok in str(s).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        out.append(int(tok))
+    return out
 
 
 def main() -> None:
@@ -366,6 +323,7 @@ def main() -> None:
     meta["start_date"] = "1892-01-01"
     meta["freq"] = "Monthly"
     meta.setdefault("period", 12)
+    meta.setdefault("series", args.series)
 
     # Post-hoc burn/thin
     if args.burn > 0 or args.thin > 1:
@@ -380,24 +338,17 @@ def main() -> None:
 
     plotter = DLMPlotter(draws=draws, meta=meta, level=float(args.level))
 
-    # ---- PRINT SUMMARY at chosen years (January of each year) ----
-    years: List[int] = []
-    for tok in str(args.summary_years).split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            years.append(int(tok))
-        except Exception:
-            raise ValueError(f"--summary-years expects comma-separated integers, got {args.summary_years!r}")
-    if years:
-        times = [f"{y}-01" for y in years]  # January of that year
-        try:
-            plotter.print_level_slope_at(times=times, slope_scale=120)
-        except Exception as e:
-            print(f"[warn] could not print level/slope summaries at {times}: {e}")
+    # ---- PRINT level/slope summaries at chosen years (January of each year) ----
+    try:
+        years = _parse_year_list(args.summary_years)
+        if years:
+            times = [f"{y}-01" for y in years]
+            sc = float(args.summary_slope_scale) if (args.summary_slope_scale is not None) else default_slope_scale(args.series)
+            plotter.print_level_slope_at(times=times, slope_scale=sc)
+    except Exception as e:
+        print(f"[warn] could not print level/slope summaries: {e}")
 
-    # ---- PRINT STATIC PARAMS (median/CI) ----
+    # ---- PRINT static params (median/CI) ----
     do_print_static = bool(args.print_static) and (not bool(args.no_print_static))
     if do_print_static:
         try:
@@ -410,8 +361,6 @@ def main() -> None:
                 include_log_process=bool(args.print_log_process),
                 log_eps=float(args.log_eps),
             )
-        except AttributeError:
-            print("[warn] DLMPlotter has no method print_static_params(...). Did you update simulator/dlm_plotter.py?")
         except Exception as e:
             print(f"[warn] could not print static parameter summaries: {e}")
 
@@ -421,12 +370,34 @@ def main() -> None:
     states_kw = _parse_kv_list(args.states_kw)
     quick_kw = _parse_kv_list(args.quick_kw)
     qhist_kw = _parse_kv_list(args.qhist_kw)
+    seasonal_patterns_kw = _parse_kv_list(args.seasonal_patterns_kw)
+    seasonal_variance_kw = _parse_kv_list(args.seasonal_variance_kw)
 
     # Fixed TX/TN colors (line + shading)
     col = series_color(args.series)
     for d in (overview_kw, states_kw, quick_kw):
         d.setdefault("color", col)
 
+    # Enforce Uccle defaults for states unless user explicitly overrides
+    states_kw.setdefault("title_level", "")
+    states_kw.setdefault("title_slope", "")
+    states_kw.setdefault("title_seasonality", "")
+    states_kw.setdefault("show_legend", False)
+    states_kw.setdefault("slope_scale", default_slope_scale(args.series))
+    states_kw.setdefault("ylims", {"slope": (-0.5, 1.5)})
+
+    # Enforce "no title" defaults for seasonal figs (unless user overrides)
+    seasonal_patterns_kw.setdefault("title", "")
+    seasonal_variance_kw.setdefault("title", "")
+
+    # seasonal-years parsing
+    sy = str(args.seasonal_years).strip()
+    if sy.lower() == "auto" or sy == "":
+        seasonal_years: Union[str, List[int]] = "auto"
+    else:
+        seasonal_years = [int(z) for z in sy.split(",") if z.strip() != ""]
+
+    # ---- figures ----
     if not args.skip_overview:
         plotter.figure_overview(save_dir=out_dir, show=args.show, **overview_kw)
 
@@ -440,7 +411,24 @@ def main() -> None:
         plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
 
     if not args.skip_qhist:
+        # DLMPlotter.figure_process_variances_hist has "NO title" requirement by design
         plotter.figure_process_variances_hist(save_dir=out_dir, show=args.show, **qhist_kw)
+
+    # ---- seasonal diagnostics (delegated to DLMPlotter) ----
+    if not args.skip_seasonal_patterns:
+        plotter.figure_seasonal_patterns(
+            years=seasonal_years,
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_patterns_kw,
+        )
+
+    if not args.skip_seasonal_variance:
+        plotter.figure_seasonal_variance(
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_variance_kw,
+        )
 
     print("[done] plots written.")
 

@@ -4,70 +4,62 @@ from __future__ import annotations
 Bayesian exceedance risk for the DGEV (Laplace NCP) posterior
 ============================================================
 
-This module computes *event probabilities* (fine scale / block scale) and their
-annual aggregates **for every posterior draw**, for thresholds provided on the
-PLOT/original scale.
+Computes exceedance probabilities on the plot/original scale for *every posterior draw*.
 
-It also provides:
-- plotting on linear OR log y-scale,
-- plotting either event probability OR return period (years),
-- overlaying multiple thresholds on one plot,
-- printing (and saving) exceedance probabilities / return periods at selected times,
-- safe handling of extremely small probabilities via an RP cap (default 10,000 years).
+Outputs:
+- Fine-scale (block-level) exceedance probabilities p_t(y*)
+- Annual aggregated exceedance probabilities p_year(y*)
+- Optional conversion to return periods (years)
+- Plotting (prob or RP), linear/log y-scale, single or multi-threshold overlay
+- Reporting (median + credible interval) at selected times with optional CSV
 
-Definitions
------------
-For a threshold y* on the PLOT scale, for posterior draw s:
-
-Fine scale (block t):
-  p_t^{(s)}(y*) = P(event at t | draw s)
-
-Maxima series:
-  event="gt": p_t = P(Y_t > y*) = 1 - G_t(y*)
-
-Minima (sign-flip run where model fits Z_t=-Y_t as maxima):
-  thresholds are given on PLOT scale y*, we map to model scale z*=-y* and compute
-  the PLOT-scale event probability exactly.
-
-Annual aggregation (conditional independence within year group S_j):
-  p_year^{(s)}(y*) = 1 - ∏_{t in S_j} (1 - p_t^{(s)}(y*))
-implemented stably via log1p/expm1.
-
-Return periods (years)
+Minima series handling
 ----------------------
-Let period = blocks per year (e.g. 12 for monthly maxima, 4 for seasonal, ...)
+If the model is fit on a sign-flipped series Z_t = -Y_t (so maxima model applies to minima),
+thresholds are given on the plot scale y* and mapped to model scale z* = -y*.
+Event probabilities are mapped back exactly to the plot scale.
 
+Return periods (years) and RP cap
+---------------------------------
 Fine scale (block t):
   RP_t(years) = 1 / (p_t * period)
 
 Annual:
   RP_year(years) = 1 / p_year
 
-IMPORTANT: Very small probabilities cause huge RPs and log(0) issues.
-We enforce a cap rp_cap_years (default 10,000 years) by flooring probabilities:
+Tiny probabilities imply huge RPs and numerical issues; we cap by flooring probabilities:
   - annual: p >= 1 / rp_cap_years
   - fine:   p >= 1 / (rp_cap_years * period)
-You can choose policy:
-  - "clip": floor p (default; keeps curves continuous)
-  - "mask": set too-small values to NaN (breaks curves/bands)
 
-Public API used by your Uccle wrapper
--------------------------------------
+Policy:
+  - clip: floor p (continuous curves)
+  - mask: set too-small values to NaN (breaks curves/bands)
+
+Colormap shading for multi-threshold overlays
+---------------------------------------------
+When overlaying multiple thresholds (combine=True), you can supply a Matplotlib colormap
+(e.g., "Blues") so curves are shaded from light to dark in ascending threshold order.
+Bands (if enabled) use the same color with low alpha.
+
+Public API
+----------
 - resolve_bundle(target, root)
 - apply_burn_thin(draws, meta, burn=..., thin=...)
-- class DGEVLaplaceRisk with:
+- class DGEVLaplaceRisk:
     compute(...)
     save(...)
     plot_fine(...)
     plot_annual(...)
     print_at_times(...)
 
-Outputs (typical)
------------------
+Typical output directory
+-----------------------
 <run>/risk/
   exceedance_probs.npz
-  risk_monthly_thr_<thr>.png or risk_monthly_multi_*.png
-  risk_annual_thr_<thr>.png   or risk_annual_multi_*.png
+  risk_fine_multi_<prob|rp>_<yscale>_thr_<tag>.png
+  risk_annual_multi_<prob|rp>_<yscale>_thr_<tag>.png
+  risk_fine_thr_<thr>_<prob|rp>_<yscale>.png
+  risk_annual_thr_<thr>_<prob|rp>_<yscale>.png
   risk_report_times_<fine|annual>_<prob|rp>.csv  (optional)
 """
 
@@ -181,7 +173,7 @@ def find_latest_posterior_npz(root: str) -> Optional[str]:
 
 def resolve_bundle(*, target: Optional[str], root: str) -> Any:
     """
-    Mirrors your other tooling:
+    Load posterior bundle using your standard rules:
       1) if target is given: load it
       2) else try find_latest_run(root) for standard posterior.npz layout
       3) else fallback to recursive search for posterior*.npz
@@ -215,6 +207,9 @@ def apply_burn_thin(
     burn: int = 0,
     thin: int = 1,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Post-hoc thinning/burn for arrays whose first axis is the chain dimension.
+    """
     burn = int(burn or 0)
     thin = int(thin or 1)
     if burn < 0:
@@ -278,6 +273,9 @@ def _coerce_bool(x: Any) -> Optional[bool]:
 
 
 def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
+    """
+    Best-effort detection that the stored model was fit on Z=-Y (minima-as-maxima).
+    """
     if not isinstance(meta, dict):
         return False
 
@@ -311,6 +309,9 @@ def _detect_minima_from_meta(meta: Dict[str, Any]) -> bool:
 
 
 def _extract_state_indices(layout: List[str]) -> Tuple[int, int, int]:
+    """
+    Return indices for alpha, beta, and the start of the seasonal block g1..gK.
+    """
     if "alpha" not in layout or "beta" not in layout:
         raise ValueError("meta['layout'] must contain 'alpha' and 'beta'.")
     ia = layout.index("alpha")
@@ -361,6 +362,10 @@ def _get_Q(draws: Dict[str, np.ndarray], S: int, name_Q: str, name_s: str) -> np
 # Seasonal design / rotation + annual grouping
 # =============================================================================
 def _build_season_design(L: int, period: int) -> np.ndarray:
+    """
+    Dummy season encoding with sum-to-zero last season.
+    Returns (L, K) with K=period-1.
+    """
     p = int(period)
     if p < 2:
         return np.zeros((L, 0), float)
@@ -376,6 +381,9 @@ def _build_season_design(L: int, period: int) -> np.ndarray:
 
 
 def _season_rotation_matrix(K: int) -> np.ndarray:
+    """
+    Seasonal rotation for the dummy seasonal state evolution used in your codebase.
+    """
     if K <= 0:
         return np.zeros((0, 0), float)
     R = np.zeros((K, K), float)
@@ -392,14 +400,12 @@ def _annual_groups_from_index(
     *,
     start_year: Optional[int],
     start_month: Optional[int],
-) -> Tuple[np.ndarray, List[np.ndarray]]:
+) -> Tuple[np.ndarray, List[np.ndarray], int]:
     """
     Returns:
-      x_year (n_years,) : x-coordinate per year group
-      groups : list of arrays of indices in each year group
-
-    If (start_year,start_month) known AND period divides 12, group by calendar year.
-    Otherwise group into consecutive blocks of length `period` from the start.
+      x_year  : (nY,) x-coordinate per year group
+      groups  : list of arrays of indices for each year group
+      last_obs_year_index : last group whose indices are all < T_obs (or -1)
     """
     p = int(period)
     if p <= 0:
@@ -407,11 +413,13 @@ def _annual_groups_from_index(
 
     idx = np.arange(L_full)
 
+    # Calendar-based grouping if possible
     if start_year is not None and start_month is not None and p in (12, 6, 4, 3, 2, 1) and (12 % p == 0):
         step_months = 12 // p
         year = np.zeros(L_full, int)
         month = np.zeros(L_full, int)
         y0, m0 = int(start_year), int(start_month)
+
         for i in range(L_full):
             mm = (m0 - 1) + i * step_months
             yy = y0 + (mm // 12)
@@ -422,17 +430,30 @@ def _annual_groups_from_index(
         years = np.unique(year)
         groups: List[np.ndarray] = []
         x_year: List[float] = []
+        last_obs_year = -1
+
         for yy in years:
             I = idx[year == yy]
+            # only full years
             if I.size == p:
                 groups.append(I)
                 x_year.append(_decimal_year_from_ym(int(yy), 12))  # anchor at Dec
-        return np.array(x_year, float), groups
+                if np.all(I < T_obs):
+                    last_obs_year = len(groups) - 1
 
-    n_years = L_full // p
-    groups = [idx[j * p : (j + 1) * p] for j in range(n_years)]
-    x_year = np.arange(n_years, dtype=float)
-    return x_year, groups
+        return np.array(x_year, float), groups, last_obs_year
+
+    # Fallback: consecutive blocks of length p
+    nY = L_full // p
+    groups = [idx[j * p : (j + 1) * p] for j in range(nY)]
+    x_year = np.arange(nY, dtype=float)
+
+    last_obs_year = -1
+    for j, I in enumerate(groups):
+        if np.all(I < T_obs):
+            last_obs_year = j
+
+    return x_year, groups, last_obs_year
 
 
 # =============================================================================
@@ -457,17 +478,17 @@ def _gev_cdf_broadcast(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.
     mask0 = np.abs(xi) < 1e-12
     if np.any(mask0):
         z0 = np.where(mask0, z, 0.0)
-        c0 = np.exp(-np.exp(-z0))
-        out = np.where(mask0, c0, out)
+        out = np.where(mask0, np.exp(-np.exp(-z0)), out)
 
     if np.any(~mask0):
         zn = np.where(~mask0, z, 0.0)
         xin = np.where(~mask0, xi, 1.0)
 
-        t = 1.0 + xin * zn  # must be > 0
+        t = 1.0 + xin * zn  # must be > 0 for interior support
         a = np.power(t, -1.0 / xin, where=(t > 0.0), out=np.full_like(t, np.inf))
         cn = np.exp(-a)
 
+        # endpoint conventions when t<=0
         cn = np.where((t <= 0.0) & (xin > 0.0), 0.0, cn)  # below lower endpoint
         cn = np.where((t <= 0.0) & (xin < 0.0), 1.0, cn)  # above upper endpoint
 
@@ -478,15 +499,15 @@ def _gev_cdf_broadcast(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray, xi: np.
 
 def _event_prob_from_model_cdf(cdf_model: np.ndarray, *, minima: bool, event: str) -> np.ndarray:
     """
-    Map model-scale CDF evaluated at z* to event probability on PLOT/original scale.
+    Map model-scale CDF evaluated at z* to event probability on plot/original scale.
 
-    - minima=False (model Y): cdf_model = P(Y<=y*)
-         event="gt": P(Y>y*) = 1-cdf
-         event="lt": P(Y<y*) = cdf
+    - minima=False (model Y): cdf_model = P(Y <= y*)
+        event="gt": P(Y > y*) = 1 - cdf
+        event="lt": P(Y < y*) = cdf
 
-    - minima=True (model Z=-Y): cdf_model = P(Z<=z*) with z*=-y*
-         event="gt": P(Y>y*) = P(Z<-y*) = cdf_model
-         event="lt": P(Y<y*) = P(Z>-y*) = 1-cdf_model
+    - minima=True (model Z=-Y): cdf_model = P(Z <= z*) with z*=-y*
+        event="gt": P(Y > y*) = P(Z < -y*) = cdf_model
+        event="lt": P(Y < y*) = P(Z > -y*) = 1 - cdf_model
     """
     ev = str(event).strip().lower()
     if ev not in ("gt", "lt"):
@@ -500,11 +521,6 @@ def _event_prob_from_model_cdf(cdf_model: np.ndarray, *, minima: bool, event: st
 # Probability floors / return-period conversion with 10k-year cap
 # =============================================================================
 def _p_floor_from_rp_cap(*, rp_cap_years: float, period: int, annual: bool) -> float:
-    """
-    Floor probability so return period does not exceed rp_cap_years.
-    annual: p >= 1/rp_cap_years
-    fine:   p >= 1/(rp_cap_years * period)
-    """
     cap = float(rp_cap_years)
     if cap <= 0:
         raise ValueError("rp_cap_years must be > 0")
@@ -517,11 +533,6 @@ def _p_floor_from_rp_cap(*, rp_cap_years: float, period: int, annual: bool) -> f
 
 
 def _apply_small_prob_policy(p: np.ndarray, *, p_floor: float, policy: str) -> np.ndarray:
-    """
-    policy:
-      - 'clip': replace p < p_floor by p_floor
-      - 'mask': replace p < p_floor by NaN
-    """
     policy = str(policy).strip().lower()
     if policy not in ("clip", "mask"):
         raise ValueError("small_prob_policy must be 'clip' or 'mask'")
@@ -530,7 +541,6 @@ def _apply_small_prob_policy(p: np.ndarray, *, p_floor: float, policy: str) -> n
         return np.clip(p, p_floor, 1.0 - 1e-15)
     out = p.copy()
     out[out < p_floor] = np.nan
-    # also avoid exactly 1 for log safety
     out[out >= 1.0] = 1.0 - 1e-15
     return out
 
@@ -543,24 +553,16 @@ def _prob_to_rp_years(
     rp_cap_years: float,
     small_prob_policy: str,
 ) -> np.ndarray:
-    """
-    Convert probability array to return period in YEARS, applying rp cap policy
-    through a probability floor (or NaN masking).
-
-    annual: RP = 1/p
-    fine:   RP = 1/(p*period)
-    """
     p_floor = _p_floor_from_rp_cap(rp_cap_years=rp_cap_years, period=period, annual=annual)
     p_eff = _apply_small_prob_policy(p, p_floor=p_floor, policy=small_prob_policy)
     denom = 1.0 if annual else float(int(period))
-    rp = 1.0 / (p_eff * denom)
-    return rp
+    return 1.0 / (p_eff * denom)
 
 
 def _nan_summarize(draws_3d: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     draws_3d: (S, M, L) possibly with NaNs
-    returns median/lo/hi over S -> (M, L)
+    returns (median, lo, hi) over S -> (M, L)
     """
     loq = (1.0 - float(level)) / 2.0
     hiq = 1.0 - loq
@@ -586,22 +588,46 @@ def _set_yscale(ax: plt.Axes, yscale: str) -> None:
         ax.set_yscale("log")
 
 
+def _colors_for_thresholds(
+    thresholds: np.ndarray,
+    *,
+    cmap: str,
+    cmap_min: float = 0.35,
+    cmap_max: float = 0.95,
+) -> List[Any]:
+    """
+    Assign colors from a colormap in ascending threshold order (light -> dark).
+    Returns list of colors aligned with the original threshold order.
+    """
+    thr = np.asarray(thresholds, float).ravel()
+    M = int(thr.size)
+    if M <= 1:
+        return [None] * M
+    cm = plt.get_cmap(str(cmap))
+    vals = np.linspace(float(cmap_min), float(cmap_max), M)
+    order = np.argsort(thr)  # ascending thresholds
+    cols: List[Any] = [None] * M
+    for r, m in enumerate(order):
+        cols[m] = cm(vals[r])
+    return cols
+
+
 # =============================================================================
 # Main class
 # =============================================================================
 @dataclass(frozen=True)
 class RiskResult:
-    thresholds: np.ndarray        # (M,) on plot scale
-    event: str                    # 'gt' or 'lt' on plot scale
+    thresholds: np.ndarray  # (M,) on plot scale
+    event: str              # 'gt' or 'lt' on plot scale
     minima: bool
 
-    x_full: np.ndarray            # (L,)
-    p_fine: np.ndarray            # (S, M, L) draw-level fine probs
-    split_x_fine: float
+    x_full: np.ndarray      # (L,)
+    p_fine: np.ndarray      # (S, M, L) draw-level fine probs
+    split_x_fine: float     # x coordinate of last observed point (for optional split line)
 
-    x_year: np.ndarray            # (nY,)
-    p_year: np.ndarray            # (S, M, nY) draw-level annual probs
-    split_x_year: float
+    x_year: np.ndarray      # (nY,)
+    p_year: np.ndarray      # (S, M, nY) draw-level annual probs
+    split_x_year: float     # x coordinate of last observed year (optional split line)
 
     start_year: Optional[int]
     start_month: Optional[int]
@@ -610,7 +636,8 @@ class RiskResult:
 
 class DGEVLaplaceRisk:
     """
-    Compute Bayesian exceedance probabilities for each posterior draw.
+    Compute Bayesian exceedance probabilities for each posterior draw,
+    plus annual aggregates and optional return-period conversion.
     """
 
     def __init__(self, draws: Dict[str, Any], meta: Dict[str, Any], *, npz_path: str = ""):
@@ -659,7 +686,7 @@ class DGEVLaplaceRisk:
         """
         Returns:
           x_full (L_full,)
-          split_x (float): location of last observed point
+          split_x (float): x position of last observed point
           start_year, start_month if calendar-based, else None,None
         """
         if start_date is not None and self.period in (12, 6, 4, 3, 2, 1) and (12 % self.period == 0):
@@ -687,13 +714,12 @@ class DGEVLaplaceRisk:
         *,
         horizon: int,
         seed: int,
-        start_year: Optional[int],
-        start_month: Optional[int],
     ) -> np.ndarray:
         """
         Simulate future mu_{T:T+H-1} on MODEL scale for each posterior draw.
 
-        Requires draws['x'], draws['gamma0'], and Q_*.
+        Requires:
+          draws['x'] (S,T,dim), draws['gamma0'] (S,K), and Q_alpha/Q_beta/Q_gamma (or s_*).
         """
         H = int(horizon)
         if H <= 0:
@@ -727,10 +753,12 @@ class DGEVLaplaceRisk:
         if gamma0.shape != (self.S, K):
             raise ValueError(f"gamma0 must have shape (S,{K}).")
 
+        # baseline seasonal effect from fixed gamma0 dummy design
         L_full = self.T + H
-        S_design_full = _build_season_design(L_full, period)  # (L, K)
+        S_design_full = _build_season_design(L_full, period)          # (L, K)
         baseline_full = np.einsum("sk,tk->st", gamma0, S_design_full)  # (S, L)
 
+        # last states
         alpha = x[:, -1, ia].copy()
         beta = x[:, -1, ib].copy()
         gamma_dyn = x[:, -1, ig1 : ig1 + K].copy()
@@ -742,6 +770,7 @@ class DGEVLaplaceRisk:
 
         rng = np.random.default_rng(int(seed))
         mu_future = np.zeros((self.S, H), float)
+
         for h in range(H):
             t = self.T + h
             alpha = alpha + beta + rng.normal(0.0, np.sqrt(Q_alpha), size=self.S)
@@ -768,8 +797,8 @@ class DGEVLaplaceRisk:
         Compute draw-level fine probabilities for all time points (observed + optional future),
         and annual aggregates.
 
-        thresholds: on PLOT/original scale
-        event: 'gt' or 'lt' on PLOT scale (default: maxima->'gt', minima->'lt')
+        thresholds: on plot/original scale
+        event: 'gt' or 'lt' on plot scale (default: maxima->'gt', minima->'lt')
         """
         thr = np.asarray(list(thresholds), float).ravel()
         if thr.size == 0:
@@ -789,39 +818,38 @@ class DGEVLaplaceRisk:
 
         x_full, split_x_fine, sy, sm = self._build_x_axis(L_full=L_full, start_date=start_date)
 
-        # mu_full on MODEL scale: observed is stored; future optional via simulation
-        mu_future = self._simulate_mu_future(horizon=H, seed=seed, start_year=sy, start_month=sm) if H > 0 else np.zeros((self.S, 0))
+        # mu_full on MODEL scale: observed + optional simulated future
+        mu_future = self._simulate_mu_future(horizon=H, seed=seed) if H > 0 else np.zeros((self.S, 0), float)
         mu_full = np.concatenate([self.mu_obs, mu_future], axis=1)  # (S, L)
 
-        # map thresholds to model-scale for minima sign-flip runs
+        # thresholds on MODEL scale
         thr_model = (-thr) if self.minima else thr
 
-        # Broadcast shapes to (S, M, L)
-        muSL = mu_full[:, None, :]             # (S,1,L)
-        sigS = self.sigma[:, None, None]       # (S,1,1)
-        xiS = self.xi[:, None, None]           # (S,1,1)
-        yM = thr_model[None, :, None]          # (1,M,1)
+        # broadcast to (S, M, L)
+        muSL = mu_full[:, None, :]              # (S,1,L)
+        sigS = self.sigma[:, None, None]        # (S,1,1)
+        xiS = self.xi[:, None, None]            # (S,1,1)
+        yM = thr_model[None, :, None]           # (1,M,1)
 
         cdf_model = _gev_cdf_broadcast(yM, muSL, sigS, xiS)  # (S,M,L)
         p_fine = _event_prob_from_model_cdf(cdf_model, minima=self.minima, event=event)  # (S,M,L)
         p_fine = np.clip(p_fine, 0.0, 1.0)
 
-        # Annual aggregation
-        x_year, groups = _annual_groups_from_index(L_full, self.T, self.period, start_year=sy, start_month=sm)
+        # annual aggregation
+        x_year, groups, last_obs_year = _annual_groups_from_index(
+            L_full, self.T, self.period, start_year=sy, start_month=sm
+        )
+
         nY = len(groups)
         p_year = np.zeros((self.S, M, nY), float)
 
-        last_obs_year = -1
         for j, I in enumerate(groups):
             I = np.asarray(I, int)
             pI = p_fine[:, :, I]  # (S,M,p)
 
-            # stable: log(prod(1-p)) then 1-exp(log_surv)
+            # stable: prod(1-p) via log1p, then 1 - prod
             log_surv = np.sum(np.log1p(-pI), axis=2)  # (S,M)
             p_year[:, :, j] = -np.expm1(log_surv)
-
-            if np.all(I < self.T):
-                last_obs_year = j
 
         split_x_year = float(x_year[last_obs_year]) if (last_obs_year >= 0 and x_year.size) else float("nan")
 
@@ -852,35 +880,46 @@ class DGEVLaplaceRisk:
             start_year=(-1 if rr.start_year is None else int(rr.start_year)),
             start_month=(-1 if rr.start_month is None else int(rr.start_month)),
             x_full=rr.x_full,
-            p_fine=rr.p_fine,     # (S,M,L)
+            p_fine=rr.p_fine,  # (S,M,L)
             split_x_fine=float(rr.split_x_fine),
             x_year=rr.x_year,
-            p_year=rr.p_year,     # (S,M,nY)
+            p_year=rr.p_year,  # (S,M,nY)
             split_x_year=float(rr.split_x_year),
         )
         print(f"[save] {out_path}")
 
     # =============================================================================
-    # Plotting (prob or RP; linear or log; single or multi-threshold overlay)
+    # Plotting
     # =============================================================================
-    def plot_fine(
+    def _plot_generic(
         self,
-        rr: RiskResult,
         *,
-        out_dir: str,
-        level: float = 0.90,
-        window: Optional[int] = 240,
-        show: bool = False,
-        # NEW:
-        y_mode: str = "prob",                 # "prob" or "rp"
-        yscale: str = "linear",               # "linear" or "log"
-        combine: bool = False,                # overlay all thresholds on one plot
-        band: Optional[bool] = None,          # bands (default True when single; False when combine)
-        legend: Optional[bool] = None,        # legend (default False when single; True when combine)
-        rp_cap_years: float = 10_000.0,       # 10k-year guardrail
-        small_prob_policy: str = "clip",      # "clip" or "mask"
+        x: np.ndarray,
+        draws_prob: np.ndarray,        # (S,M,Lx)
+        thresholds: np.ndarray,        # (M,)
+        out_path: str,
+        xlabel: str,
+        ylabel_prob: str,
+        ylabel_rp: str,
+        level: float,
+        y_mode: str,
+        yscale: str,
+        period: int,
+        annual: bool,
+        rp_cap_years: float,
+        small_prob_policy: str,
+        combine: bool,
+        band: bool,
+        legend: bool,
+        split_line: bool,
+        split_x: float,
+        shade: bool,
+        cmap: str,
+        cmap_min: float,
+        cmap_max: float,
+        show: bool,
     ) -> None:
-        _ensure_dir(out_dir)
+        _ensure_dir(os.path.dirname(out_path))
 
         y_mode = str(y_mode).strip().lower()
         if y_mode not in ("prob", "rp"):
@@ -889,85 +928,170 @@ class DGEVLaplaceRisk:
         if yscale not in ("linear", "log"):
             raise ValueError("yscale must be 'linear' or 'log'")
 
+        # Convert draws to plotting scale
+        if y_mode == "prob":
+            p_floor = _p_floor_from_rp_cap(rp_cap_years=rp_cap_years, period=period, annual=annual)
+            y_draws = _apply_small_prob_policy(draws_prob, p_floor=p_floor, policy=small_prob_policy)
+            ylabel = ylabel_prob
+        else:
+            y_draws = _prob_to_rp_years(
+                draws_prob,
+                period=period,
+                annual=annual,
+                rp_cap_years=rp_cap_years,
+                small_prob_policy=small_prob_policy,
+            )
+            ylabel = ylabel_rp
+
+        med, lo, hi = _nan_summarize(y_draws, level=float(level))  # (M, Lx)
+
+        cols = [None] * int(thresholds.size)
+        if combine and shade and int(thresholds.size) > 1:
+            cols = _colors_for_thresholds(
+                thresholds,
+                cmap=str(cmap),
+                cmap_min=float(cmap_min),
+                cmap_max=float(cmap_max),
+            )
+
+        fig, ax = plt.subplots(1, 1, figsize=(12, 3.8 if combine else 3.6))
+
+        if combine:
+            for m, thr in enumerate(thresholds):
+                ax.plot(x, med[m, :], lw=1.6, label=f"{thr:g}", color=cols[m])
+                if band:
+                    ax.fill_between(x, lo[m, :], hi[m, :], alpha=0.18, color=cols[m])
+        else:
+            # caller will handle per-threshold paths; this branch is still usable
+            for m, thr in enumerate(thresholds):
+                ax.plot(x, med[m, :], lw=1.6, color=cols[m])
+
+        if split_line and np.isfinite(split_x):
+            ax.axvline(float(split_x), lw=1.0, alpha=0.8)
+
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel(xlabel)
+        ax.grid(True, alpha=0.25)
+        _set_yscale(ax, yscale)
+
+        if combine and legend:
+            ax.legend(title="threshold", frameon=False)
+
+        plt.tight_layout()
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        print(f"[save] {out_path}")
+
+    def plot_fine(
+        self,
+        rr: RiskResult,
+        *,
+        out_dir: str,
+        level: float = 0.90,
+        window: Optional[int] = 240,
+        show: bool = False,
+        y_mode: str = "prob",                 # "prob" or "rp"
+        yscale: str = "linear",               # "linear" or "log"
+        combine: bool = True,                 # overlay all thresholds on one plot
+        band: Optional[bool] = None,          # default: False when combine, True when separate
+        legend: Optional[bool] = None,        # default: True when combine, False when separate
+        split_line: bool = False,             # default: NO vertical split line
+        rp_cap_years: float = 10_000.0,
+        small_prob_policy: str = "clip",      # "clip" or "mask"
+        # NEW: colormap shading (useful for return periods overlays)
+        shade: Optional[bool] = None,         # default: True when combine else False
+        cmap: str = "Blues",
+        cmap_min: float = 0.35,
+        cmap_max: float = 0.95,
+    ) -> None:
+        """
+        Fine-scale plot (block-level).
+        """
+        _ensure_dir(out_dir)
+
         if band is None:
             band = (not bool(combine))
         if legend is None:
             legend = bool(combine)
+        if shade is None:
+            shade = bool(combine)
 
         draws = rr.p_fine  # (S,M,L)
 
-        # Windowing
+        # window
         L = int(rr.x_full.size)
         i0 = 0
         if window is not None:
             w = max(1, int(window))
             i0 = max(0, L - w)
+
         x = rr.x_full[i0:]
-
-        # Convert to y-draws (prob or RP)
-        if y_mode == "prob":
-            p_floor = _p_floor_from_rp_cap(rp_cap_years=rp_cap_years, period=rr.period, annual=False)
-            y_draws = _apply_small_prob_policy(draws[:, :, i0:], p_floor=p_floor, policy=small_prob_policy)
-            ylabel = "event probability"
-        else:
-            y_draws = _prob_to_rp_years(
-                draws[:, :, i0:],
-                period=rr.period,
-                annual=False,
-                rp_cap_years=rp_cap_years,
-                small_prob_policy=small_prob_policy,
-            )
-            ylabel = "return period (years)"
-
-        med, lo, hi = _nan_summarize(y_draws, level=float(level))  # (M, Lwin)
+        draws_w = draws[:, :, i0:]
 
         if combine:
-            fig, ax = plt.subplots(1, 1, figsize=(12, 3.8))
-            for m, thr in enumerate(rr.thresholds):
-                ax.plot(x, med[m, :], lw=1.6, label=f"{thr:g}")
-                if band:
-                    ax.fill_between(x, lo[m, :], hi[m, :], alpha=0.18)
-
-            ax.axvline(float(rr.split_x_fine), lw=1.0, alpha=0.8)
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("time")
-            ax.grid(True, alpha=0.25)
-            _set_yscale(ax, yscale)
-            if legend:
-                ax.legend(title="threshold", fontsize=9, title_fontsize=9, frameon=False)
-
-            plt.tight_layout()
             tag = _thr_tag(rr.thresholds)
-            path = os.path.join(out_dir, f"risk_monthly_multi_{y_mode}_{yscale}_thr_{tag}.png")
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
-            print(f"[save] {path}")
+            out_path = os.path.join(out_dir, f"risk_fine_multi_{y_mode}_{yscale}_thr_{tag}.png")
+            self._plot_generic(
+                x=x,
+                draws_prob=draws_w,
+                thresholds=rr.thresholds,
+                out_path=out_path,
+                xlabel="time",
+                ylabel_prob="event probability",
+                ylabel_rp="return period (years)",
+                level=float(level),
+                y_mode=str(y_mode),
+                yscale=str(yscale),
+                period=int(rr.period),
+                annual=False,
+                rp_cap_years=float(rp_cap_years),
+                small_prob_policy=str(small_prob_policy),
+                combine=True,
+                band=bool(band),
+                legend=bool(legend),
+                split_line=bool(split_line),
+                split_x=float(rr.split_x_fine),
+                shade=bool(shade),
+                cmap=str(cmap),
+                cmap_min=float(cmap_min),
+                cmap_max=float(cmap_max),
+                show=bool(show),
+            )
             return
 
-        # one figure per threshold
+        # separate plots
         for m, thr in enumerate(rr.thresholds):
-            fig, ax = plt.subplots(1, 1, figsize=(12, 3.6))
-            ax.plot(x, med[m, :], lw=1.6)
-            if band:
-                ax.fill_between(x, lo[m, :], hi[m, :], alpha=0.25)
-            ax.axvline(float(rr.split_x_fine), lw=1.0, alpha=0.8)
-
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("time")
-            ax.grid(True, alpha=0.25)
-            _set_yscale(ax, yscale)
-
-            plt.tight_layout()
-            path = os.path.join(out_dir, f"risk_monthly_thr_{thr:g}_{y_mode}_{yscale}.png")
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
-            print(f"[save] {path}")
+            thr_tag = _thr_tag(np.array([thr], float))
+            out_path = os.path.join(out_dir, f"risk_fine_thr_{thr_tag}_{y_mode}_{yscale}.png")
+            self._plot_generic(
+                x=x,
+                draws_prob=draws_w[:, m : m + 1, :],         # (S,1,Lw)
+                thresholds=np.array([thr], float),
+                out_path=out_path,
+                xlabel="time",
+                ylabel_prob="event probability",
+                ylabel_rp="return period (years)",
+                level=float(level),
+                y_mode=str(y_mode),
+                yscale=str(yscale),
+                period=int(rr.period),
+                annual=False,
+                rp_cap_years=float(rp_cap_years),
+                small_prob_policy=str(small_prob_policy),
+                combine=True,                                # combine=True for single line path
+                band=bool(band),
+                legend=False,
+                split_line=bool(split_line),
+                split_x=float(rr.split_x_fine),
+                shade=False,
+                cmap=str(cmap),
+                cmap_min=float(cmap_min),
+                cmap_max=float(cmap_max),
+                show=bool(show),
+            )
 
     def plot_annual(
         self,
@@ -977,106 +1101,104 @@ class DGEVLaplaceRisk:
         level: float = 0.90,
         window_years: Optional[int] = 60,
         show: bool = False,
-        # NEW:
-        y_mode: str = "prob",                 # "prob" or "rp"
-        yscale: str = "linear",               # "linear" or "log"
-        combine: bool = False,
+        y_mode: str = "prob",
+        yscale: str = "linear",
+        combine: bool = True,
         band: Optional[bool] = None,
         legend: Optional[bool] = None,
+        split_line: bool = False,             # default: NO vertical split line
         rp_cap_years: float = 10_000.0,
         small_prob_policy: str = "clip",
+        # NEW: colormap shading
+        shade: Optional[bool] = None,
+        cmap: str = "Blues",
+        cmap_min: float = 0.35,
+        cmap_max: float = 0.95,
     ) -> None:
+        """
+        Annual aggregated plot.
+        """
         _ensure_dir(out_dir)
-
-        y_mode = str(y_mode).strip().lower()
-        if y_mode not in ("prob", "rp"):
-            raise ValueError("y_mode must be 'prob' or 'rp'")
-        yscale = str(yscale).strip().lower()
-        if yscale not in ("linear", "log"):
-            raise ValueError("yscale must be 'linear' or 'log'")
 
         if band is None:
             band = (not bool(combine))
         if legend is None:
             legend = bool(combine)
+        if shade is None:
+            shade = bool(combine)
 
         draws = rr.p_year  # (S,M,nY)
 
-        # Windowing
+        # window
         nY = int(rr.x_year.size)
         j0 = 0
         if window_years is not None:
             w = max(1, int(window_years))
             j0 = max(0, nY - w)
+
         x = rr.x_year[j0:]
-
-        # Convert to y-draws
-        if y_mode == "prob":
-            p_floor = _p_floor_from_rp_cap(rp_cap_years=rp_cap_years, period=rr.period, annual=True)
-            y_draws = _apply_small_prob_policy(draws[:, :, j0:], p_floor=p_floor, policy=small_prob_policy)
-            ylabel = "annual event probability"
-        else:
-            y_draws = _prob_to_rp_years(
-                draws[:, :, j0:],
-                period=rr.period,
-                annual=True,
-                rp_cap_years=rp_cap_years,
-                small_prob_policy=small_prob_policy,
-            )
-            ylabel = "return period (years)"
-
-        med, lo, hi = _nan_summarize(y_draws, level=float(level))  # (M, nYwin)
+        draws_w = draws[:, :, j0:]
 
         if combine:
-            fig, ax = plt.subplots(1, 1, figsize=(12, 3.8))
-            for m, thr in enumerate(rr.thresholds):
-                ax.plot(x, med[m, :], lw=1.6, label=f"{thr:g}")
-                if band:
-                    ax.fill_between(x, lo[m, :], hi[m, :], alpha=0.18)
-
-            if np.isfinite(rr.split_x_year):
-                ax.axvline(float(rr.split_x_year), lw=1.0, alpha=0.8)
-
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("year")
-            ax.grid(True, alpha=0.25)
-            _set_yscale(ax, yscale)
-            if legend:
-                ax.legend(title="threshold", fontsize=9, title_fontsize=9, frameon=False)
-
-            plt.tight_layout()
             tag = _thr_tag(rr.thresholds)
-            path = os.path.join(out_dir, f"risk_annual_multi_{y_mode}_{yscale}_thr_{tag}.png")
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
-            print(f"[save] {path}")
+            out_path = os.path.join(out_dir, f"risk_annual_multi_{y_mode}_{yscale}_thr_{tag}.png")
+            self._plot_generic(
+                x=x,
+                draws_prob=draws_w,
+                thresholds=rr.thresholds,
+                out_path=out_path,
+                xlabel="year",
+                ylabel_prob="annual event probability",
+                ylabel_rp="return period (years)",
+                level=float(level),
+                y_mode=str(y_mode),
+                yscale=str(yscale),
+                period=int(rr.period),
+                annual=True,
+                rp_cap_years=float(rp_cap_years),
+                small_prob_policy=str(small_prob_policy),
+                combine=True,
+                band=bool(band),
+                legend=bool(legend),
+                split_line=bool(split_line),
+                split_x=float(rr.split_x_year),
+                shade=bool(shade),
+                cmap=str(cmap),
+                cmap_min=float(cmap_min),
+                cmap_max=float(cmap_max),
+                show=bool(show),
+            )
             return
 
         for m, thr in enumerate(rr.thresholds):
-            fig, ax = plt.subplots(1, 1, figsize=(12, 3.6))
-            ax.plot(x, med[m, :], lw=1.6)
-            if band:
-                ax.fill_between(x, lo[m, :], hi[m, :], alpha=0.25)
-
-            if np.isfinite(rr.split_x_year):
-                ax.axvline(float(rr.split_x_year), lw=1.0, alpha=0.8)
-
-            ax.set_ylabel(ylabel)
-            ax.set_xlabel("year")
-            ax.grid(True, alpha=0.25)
-            _set_yscale(ax, yscale)
-
-            plt.tight_layout()
-            path = os.path.join(out_dir, f"risk_annual_thr_{thr:g}_{y_mode}_{yscale}.png")
-            fig.savefig(path, dpi=200, bbox_inches="tight")
-            if show:
-                plt.show()
-            else:
-                plt.close(fig)
-            print(f"[save] {path}")
+            thr_tag = _thr_tag(np.array([thr], float))
+            out_path = os.path.join(out_dir, f"risk_annual_thr_{thr_tag}_{y_mode}_{yscale}.png")
+            self._plot_generic(
+                x=x,
+                draws_prob=draws_w[:, m : m + 1, :],
+                thresholds=np.array([thr], float),
+                out_path=out_path,
+                xlabel="year",
+                ylabel_prob="annual event probability",
+                ylabel_rp="return period (years)",
+                level=float(level),
+                y_mode=str(y_mode),
+                yscale=str(yscale),
+                period=int(rr.period),
+                annual=True,
+                rp_cap_years=float(rp_cap_years),
+                small_prob_policy=str(small_prob_policy),
+                combine=True,
+                band=bool(band),
+                legend=False,
+                split_line=bool(split_line),
+                split_x=float(rr.split_x_year),
+                shade=False,
+                cmap=str(cmap),
+                cmap_min=float(cmap_min),
+                cmap_max=float(cmap_max),
+                show=bool(show),
+            )
 
     # =============================================================================
     # Reporting at selected times (print + optional CSV)
@@ -1111,14 +1233,7 @@ class DGEVLaplaceRisk:
         """
         Print posterior summaries (median, CI) for each threshold at selected times.
 
-        - scale="fine": uses rr.x_full and rr.p_fine
-        - scale="annual": uses rr.x_year and rr.p_year
-
-        y_mode:
-          - "prob": event probability
-          - "rp": return period (years) with the 10k-year safeguard (rp_cap_years)
-
-        If csv_path is given, writes a CSV with rows:
+        If csv_path is given, writes:
           time_label, time_x, threshold, median, lo, hi
         """
         scale = str(scale).strip().lower()
@@ -1139,7 +1254,7 @@ class DGEVLaplaceRisk:
             annual = True
             time_name = "year"
 
-        # Convert draws to the requested y-mode
+        # Convert draws to requested y-mode
         if y_mode == "prob":
             p_floor = _p_floor_from_rp_cap(rp_cap_years=rp_cap_years, period=rr.period, annual=annual)
             y_draws = _apply_small_prob_policy(draws, p_floor=p_floor, policy=small_prob_policy)
@@ -1157,13 +1272,18 @@ class DGEVLaplaceRisk:
         med, lo, hi = _nan_summarize(y_draws, level=float(level))  # (M, Lgrid)
 
         rows: List[List[Any]] = []
-        print(f"\n[report] scale={scale} | y_mode={y_mode} | level={level:.3f} | rp_cap_years={rp_cap_years:g} | policy={small_prob_policy}")
+        print(
+            f"\n[report] scale={scale} | y_mode={y_mode} | level={level:.3f} | "
+            f"rp_cap_years={rp_cap_years:g} | policy={small_prob_policy}"
+        )
+
         for t in times:
             try:
                 target = self._time_to_target_float(t)
             except Exception:
                 print(f"[warn] could not parse time {t!r}; skipping.")
                 continue
+
             j = self._nearest_index(xgrid, target)
             xj = float(np.asarray(xgrid, float)[j])
             label = str(t)
@@ -1184,8 +1304,15 @@ class DGEVLaplaceRisk:
                 w.writerows(rows)
             print(f"\n[save] {csv_path}\n")
 
-    # Convenience wrappers you’ll likely use a lot:
-    def print_probs_at_times(self, rr: RiskResult, *, times: Sequence[Any], scale: str = "fine", level: float = 0.90, csv_path: Optional[str] = None) -> None:
+    def print_probs_at_times(
+        self,
+        rr: RiskResult,
+        *,
+        times: Sequence[Any],
+        scale: str = "fine",
+        level: float = 0.90,
+        csv_path: Optional[str] = None,
+    ) -> None:
         self.print_at_times(rr, times=times, scale=scale, y_mode="prob", level=level, csv_path=csv_path)
 
     def print_rp_at_times(
@@ -1216,13 +1343,14 @@ class DGEVLaplaceRisk:
 # =============================================================================
 if __name__ == "__main__":
     import argparse
+
     p = argparse.ArgumentParser(
         description=(
             "Compute Bayesian exceedance probabilities for DGEV Laplace posterior:\n"
-            "- fine-scale (per time point) and annual aggregates,\n"
+            "- fine-scale and annual aggregates,\n"
             "- for EVERY posterior draw,\n"
-            "- optional: plot prob or return period, linear or log, single or multi-threshold,\n"
-            "- optional: print summaries at chosen times.\n"
+            "- optional plots: probability or return period, linear or log, single or multi-threshold,\n"
+            "- optional reporting at selected times.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1257,15 +1385,50 @@ if __name__ == "__main__":
     p.add_argument("--window-months", type=int, default=240, help="Fine plot: last N points shown (includes forecast tail if any).")
     p.add_argument("--window-years", type=int, default=60, help="Annual plot: last N year groups shown.")
 
-    # NEW plotting controls
+    # plotting controls
     p.add_argument("--y-mode", type=str, default="prob", choices=["prob", "rp"], help="Plot y as probability or return period (years).")
     p.add_argument("--yscale", type=str, default="log", choices=["linear", "log"], help="Plot y-axis scale.")
-    p.add_argument("--combine", action="store_true", default=True, help="Overlay multiple thresholds on the same plot.")
-    p.add_argument("--no-band", action="store_true", default=False, help="Disable credible bands (useful when combining).")
+    p.add_argument(
+        "--combine",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Overlay multiple thresholds on the same plot.",
+    )
+    p.add_argument(
+        "--band",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show credible bands. If omitted: default False for combine, True for separate.",
+    )
+    p.add_argument(
+        "--legend",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show legend (only relevant for combine). If omitted: default True for combine, False otherwise.",
+    )
+    p.add_argument(
+        "--split-line",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Draw a vertical line at the last observed point (default: off).",
+    )
+
+    # RP guardrails
     p.add_argument("--rp-cap-years", type=float, default=10_000.0, help="Return-period cap in years (guards against tiny probabilities).")
     p.add_argument("--small-prob-policy", type=str, default="clip", choices=["clip", "mask"], help="How to handle probs below the rp-cap floor.")
 
-    # NEW reporting controls
+    # NEW: colormap shading (esp. for return periods overlays)
+    p.add_argument(
+        "--shade",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use colormap shading when combining thresholds. If omitted: default True for combine, False otherwise.",
+    )
+    p.add_argument("--cmap", type=str, default="Blues", help="Matplotlib colormap for multi-threshold overlays (e.g. Blues, Viridis).")
+    p.add_argument("--cmap-min", type=float, default=0.35, help="Lower end of colormap range [0,1] (lighter).")
+    p.add_argument("--cmap-max", type=float, default=0.95, help="Upper end of colormap range [0,1] (darker).")
+
+    # reporting controls
     p.add_argument("--times", type=str, default="", help="Comma-separated times for reporting (e.g. 1950-07,2020-07 or numeric x).")
     p.add_argument("--report-scale", type=str, default="fine", choices=["fine", "annual"], help="Whether to report on fine or annual scale.")
     p.add_argument("--report-csv", type=str, default="", help="Optional CSV path to save report (default: <out>/risk_report_times_*.csv).")
@@ -1310,7 +1473,13 @@ if __name__ == "__main__":
     # save raw draw-level probabilities
     risk.save(rr, out_path=os.path.join(out_dir, "exceedance_probs.npz"))
 
-    # plots
+    # effective band/legend/shade defaults (depend on combine if not specified)
+    combine = bool(args.combine)
+    band = (not combine) if (args.band is None) else bool(args.band)
+    legend = combine if (args.legend is None) else bool(args.legend)
+    shade = combine if (args.shade is None) else bool(args.shade)
+
+    # plots (no split line by default)
     risk.plot_fine(
         rr,
         out_dir=out_dir,
@@ -1319,10 +1488,16 @@ if __name__ == "__main__":
         show=bool(args.show),
         y_mode=str(args.y_mode),
         yscale=str(args.yscale),
-        combine=bool(args.combine),
-        band=(not bool(args.no_band)),
+        combine=combine,
+        band=band,
+        legend=legend,
+        split_line=bool(args.split_line),
         rp_cap_years=float(args.rp_cap_years),
         small_prob_policy=str(args.small_prob_policy),
+        shade=shade,
+        cmap=str(args.cmap),
+        cmap_min=float(args.cmap_min),
+        cmap_max=float(args.cmap_max),
     )
     risk.plot_annual(
         rr,
@@ -1332,10 +1507,16 @@ if __name__ == "__main__":
         show=bool(args.show),
         y_mode=str(args.y_mode),
         yscale=str(args.yscale),
-        combine=bool(args.combine),
-        band=(not bool(args.no_band)),
+        combine=combine,
+        band=band,
+        legend=legend,
+        split_line=bool(args.split_line),
         rp_cap_years=float(args.rp_cap_years),
         small_prob_policy=str(args.small_prob_policy),
+        shade=shade,
+        cmap=str(args.cmap),
+        cmap_min=float(args.cmap_min),
+        cmap_max=float(args.cmap_max),
     )
 
     # reporting at times

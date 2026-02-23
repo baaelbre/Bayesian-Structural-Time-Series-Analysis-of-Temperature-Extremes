@@ -881,7 +881,7 @@ def main() -> None:
 
     # Simulation
     p.add_argument("--T", type=int, default=500)
-    p.add_argument("--period", type=int, default=4)
+    p.add_argument("--period", type=int, default=12)
     p.add_argument("--start-date", type=str, default="2000-01-01")
     p.add_argument("--sigma", type=float, default=3.0)
     p.add_argument("--xi", type=float, default=-0.1)
@@ -921,11 +921,11 @@ def main() -> None:
     p.add_argument("--print-summary", default=True)
 
     # Initial inference values
-    p.add_argument("--sigma-init", type=float, default=1.0)
+    p.add_argument("--sigma-init", type=float, default=5.0)
     p.add_argument("--xi-init", type=float, default=-0.05)
-    p.add_argument("--s-alpha-init", type=float, default=1e-2)
-    p.add_argument("--s-beta-init", type=float, default=1e-3)
-    p.add_argument("--s-gamma-init", type=float, default=1e-2)
+    p.add_argument("--s-alpha-init", type=float, default=1e-1)
+    p.add_argument("--s-beta-init", type=float, default=1e-2)
+    p.add_argument("--s-gamma-init", type=float, default=1e-1)
     p.add_argument("--gamma0-init", type=str, default=None)
 
     # knobs
@@ -1006,7 +1006,7 @@ def main() -> None:
     sampler = DGEVLaplaceNCP(
         y=y,
         period=int(args.period),
-        start_date=start_date,  # NEW: pass through so save_posterior writes it
+        start_date=start_date, 
         alpha0=float(args.m0_level),
         beta0=float(args.m0_trend),
         gamma0=gamma0_init,

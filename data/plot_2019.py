@@ -8,6 +8,24 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+mpl.rcParams.update({
+    # global base font
+    "font.size": 18,
+
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 11,
+})
 
 YEAR = 2019
 INFILE = Path(__file__).resolve().parent / "Uccle_24_10_23.csv"

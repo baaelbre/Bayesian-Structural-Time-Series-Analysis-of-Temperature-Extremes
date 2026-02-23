@@ -926,7 +926,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument(
         "--all",
         action="store_true",
-        default=True,
+        default=False,
         help="Run TXx, TXn, TNx, TNn, Precx sequentially (ignores --series).",
     )
     p.add_argument(
@@ -977,7 +977,6 @@ def build_argparser() -> argparse.ArgumentParser:
     # ---- printing predictions (stdout) ----
     gpr = p.add_mutually_exclusive_group()
     gpr.add_argument("--print-forecast", dest="print_forecast", action="store_true", default=True, help="Print prediction summaries.")
-    gpr.add_argument("--no-print-forecast", dest="print_forecast", action="store_false", help="Disable printing prediction summaries.")
 
     p.add_argument(
         "--print-scales",

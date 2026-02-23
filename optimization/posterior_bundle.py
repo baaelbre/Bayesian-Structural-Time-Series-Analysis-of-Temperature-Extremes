@@ -79,7 +79,7 @@ def list_runs(root: str = "results/simulations/DGEV") -> list:
         run_dirs.append(run_dir)
 
     # Sort by npz file modification time
-    run_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(d, "posterior.npz")))
+    run_dirs.sort(key=lambda d: os.path.getmtime(os.path.join(d, "posterior.meta.json"))) #used to be npz_path
     return run_dirs
 
 def find_latest_run(root: str = "results/simulations/DGEV") -> str or None:

@@ -1,31 +1,6 @@
 # %% simulator/uccle_dlm_gof.py
 from __future__ import annotations
 """simulator/uccle_dlm_gof.py
-
-Uccle DLM Goodness-of-Fit (TXm, TNm; Monthly)
-=============================================
-
-Thin Uccle wrapper around:
-    simulator.dlm_gof (class-based)
-
-What this wrapper adds
-----------------------
-- Uccle default result roots (matches run_uccle_dlm_lasso_monthly.py).
-- Robust latest-run discovery (delegated to simulator.dlm_gof.DLMGoodnessOfFit).
-- Optional post-hoc burn/thin (delegated to simulator.dlm_gof.DLMGoodnessOfFit).
-- TX* plots are red; TN* plots are blue (PIT median/band and KS scatter points).
-- Forces Uccle monthly meta defaults (start_date=1892-01-01, period=12) for reporting.
-
-CLI examples
-------------
-# Latest TNm run (default)
-python -m simulator.uccle_dlm_gof --series TNm
-
-# Specific run directory / posterior.npz
-python -m simulator.uccle_dlm_gof --target results/uccle/TN/TNm/Monthly/TNm_monthly_.../posterior.npz
-
-# Save elsewhere + show
-python -m simulator.uccle_dlm_gof --series TXm --out Figures/TXm/gof --show
 """
 
 import os
@@ -38,7 +13,23 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from simulator.dlm_gof import DLMGoodnessOfFit, GOFConfig  # type: ignore
 
+import matplotlib as mpl
+mpl.rcParams.update({
+    # global base font
+    "font.size": 18,
 
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 11,
+})
 # ---------------------------------------------------------------------
 # Uccle defaults
 # ---------------------------------------------------------------------

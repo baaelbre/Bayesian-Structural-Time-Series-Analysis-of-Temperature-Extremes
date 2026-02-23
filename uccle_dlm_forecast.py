@@ -479,7 +479,7 @@ def build_argparser() -> argparse.ArgumentParser:
         "--series",
         type=str,
         choices=["TXm", "TNm", "Precm"],
-        default="TNm",
+        default="TXm",
         help="Series code when searching by default roots (ignored if --target is given).",
     )
     p.add_argument("--root", type=str, default=None, help="Search root when --target is omitted (defaults to Uccle layout).")
@@ -518,8 +518,6 @@ def build_argparser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--print-forecast", dest="print_forecast", action="store_true", default=True,
                    help="Print prediction summaries to stdout.")
-    g.add_argument("--no-print-forecast", dest="print_forecast", action="store_false",
-                   help="Disable printing prediction summaries.")
 
     p.add_argument(
         "--print-scales",

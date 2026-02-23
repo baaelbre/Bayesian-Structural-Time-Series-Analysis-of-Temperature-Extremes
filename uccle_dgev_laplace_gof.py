@@ -42,6 +42,24 @@ from simulator.dgev_laplace_gof import (  # type: ignore
     GOFConfig,
 )
 
+import matplotlib as mpl
+mpl.rcParams.update({
+    # global base font
+    "font.size": 18,
+
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 11,
+})
+
 
 # ---------------------------------------------------------------------
 # Uccle defaults

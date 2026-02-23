@@ -2,44 +2,6 @@
 from __future__ import annotations
 """
 Uccle wrapper: Bayesian exceedance risk for DGEV Laplace posterior
-=================================================================
-
-Thin Uccle wrapper around:
-    simulator.dgev_laplace_risk.py   (NEW version: prob/RP, log/linear, combine, reporting)
-
-What this wrapper does
-----------------------
-- Picks the correct Uccle root layout:
-    results/uccle/<GROUP>/<SERIES>/<FREQ>/Laplace
-  where GROUP is TX or TN inferred from SERIES.
-- Loads the latest posterior run (unless --target is given).
-- Applies optional post-hoc burn/thin.
-- Calls DGEVLaplaceRisk.compute(...) for thresholds on the PLOT/original scale.
-- Saves exceedance_probs.npz (draw-level probabilities) and writes plots.
-- Optional: prints/saves probability or return-period summaries at selected times.
-
-Color policy (Uccle-style)
---------------------------
-- TX* series -> red
-- TN* series -> blue
-Applied via matplotlib color cycle before calling the plotters.
-
-Examples
---------
-# run all 4 series on latest runs:
-python -u simulator/uccle_dgev_laplace_risk.py --thresholds 35,37,39 --combine
-
-# one series only:
-python -u simulator/uccle_dgev_laplace_risk.py --one --series TXx --thresholds 35,37,39 --y-mode rp --yscale log --combine
-
-# specify a particular run dir / posterior.npz:
-python -u simulator/uccle_dgev_laplace_risk.py --one --series TXn --target <path/to/run/or/posterior.npz> --thresholds 0,-5,-10
-
-# post-hoc trimming:
-python -u simulator/uccle_dgev_laplace_risk.py --thresholds 35,37 --burn 200 --thin 5
-
-# report at times:
-python -u simulator/uccle_dgev_laplace_risk.py --one --series TXx --thresholds 35,37,39 --times 1950-07,2020-07 --y-mode rp --report-scale fine
 """
 
 import os
@@ -48,12 +10,28 @@ import argparse
 from datetime import datetime
 from typing import Optional, List
 
-import matplotlib
+import matplotlib as mpl
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+mpl.use("Agg")
+mpl.rcParams.update({
+    # global base font
+    "font.size": 14,
 
-# Make project root importable (mirrors your other Uccle wrappers)
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 16,
+    "legend.title_fontsize": 16,
+})
+
+import matplotlib.pyplot as plt
+
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 from simulator.dgev_laplace_risk import (  # type: ignore
@@ -122,22 +100,33 @@ def _parse_csv_strings(s: Optional[str]) -> List[str]:
 
 
 # =============================================================================
-# Uccle plotting color policy
+# Uccle color policy: single-color + colormap
 # =============================================================================
+def _is_tx(series: str) -> bool:
+    return str(series).strip().upper().startswith("TX")
+
+
+def _single_color(series: str) -> str:
+    return "red" if _is_tx(series) else "blue"
+
+
+def _cmap(series: str, user_cmap: Optional[str] = None) -> str:
+    """
+    Default colormaps:
+      TX -> Reds
+      TN -> Blues
+    user_cmap can override.
+    """
+    if user_cmap and str(user_cmap).strip():
+        return str(user_cmap).strip()
+    return "Reds" if _is_tx(series) else "Blues"
+
+
 def _set_single_color_cycle(color: str) -> None:
     try:
-        matplotlib.rcParams["axes.prop_cycle"] = matplotlib.cycler(color=[str(color)])
+        mpl.rcParams["axes.prop_cycle"] = mpl.cycler(color=[str(color)])
     except Exception:
         pass
-
-
-def _uccle_color(series: str) -> str:
-    s = str(series).upper()
-    if s.startswith("TX"):
-        return "red"
-    if s.startswith("TN"):
-        return "blue"
-    return "C0"
 
 
 # =============================================================================
@@ -183,9 +172,8 @@ def _run_one(series: str, args: argparse.Namespace) -> None:
     # Calendar axis
     sd = _parse_date(args.start_date)
     if sd is None:
-        sd = _parse_date(meta.get("start_date"))
+        sd = _parse_date(meta.get("start_date")) or _parse_date("1892-01-01")
 
-    # Instantiate risk engine (NEW)
     risk = DGEVLaplaceRisk(draws, meta, npz_path=npz_path)
 
     rr = risk.compute(
@@ -199,8 +187,21 @@ def _run_one(series: str, args: argparse.Namespace) -> None:
     # Save draw-level probabilities
     risk.save(rr, out_path=os.path.join(out_dir, "exceedance_probs.npz"))
 
-    # Plots (Uccle color policy)
-    _set_single_color_cycle(_uccle_color(series))
+    # ---- plotting style policy ----
+    # - If combine: use colormap shading (Reds/Blues)
+    # - Else: single-color cycle (red/blue)
+    combine = bool(args.combine)
+
+    # defaults consistent with your risk engine:
+    # when combine=True, bands are often off; when combine=False, bands on
+    band = (not combine) if (args.band is None) else bool(args.band)
+    legend = combine if (args.legend is None) else bool(args.legend)
+    shade = combine if (args.shade is None) else bool(args.shade)
+
+    if not combine:
+        _set_single_color_cycle(_single_color(series))
+
+    cmap_name = _cmap(series, args.cmap)
 
     # Fine (block-scale)
     risk.plot_fine(
@@ -211,14 +212,22 @@ def _run_one(series: str, args: argparse.Namespace) -> None:
         show=bool(args.show),
         y_mode=str(args.y_mode),
         yscale=str(args.yscale),
-        combine=bool(args.combine),
-        band=(not bool(args.no_band)),
+        combine=combine,
+        band=band,
+        legend=legend,
+        split_line=bool(args.split_line),
         rp_cap_years=float(args.rp_cap_years),
         small_prob_policy=str(args.small_prob_policy),
+        shade=shade,
+        cmap=str(cmap_name),
+        cmap_min=float(args.cmap_min),
+        cmap_max=float(args.cmap_max),
     )
 
     # Annual
-    _set_single_color_cycle(_uccle_color(series))
+    if not combine:
+        _set_single_color_cycle(_single_color(series))
+
     risk.plot_annual(
         rr,
         out_dir=out_dir,
@@ -227,10 +236,16 @@ def _run_one(series: str, args: argparse.Namespace) -> None:
         show=bool(args.show),
         y_mode=str(args.y_mode),
         yscale=str(args.yscale),
-        combine=bool(args.combine),
-        band=(not bool(args.no_band)),
+        combine=combine,
+        band=band,
+        legend=legend,
+        split_line=bool(args.split_line),
         rp_cap_years=float(args.rp_cap_years),
         small_prob_policy=str(args.small_prob_policy),
+        shade=shade,
+        cmap=str(cmap_name),
+        cmap_min=float(args.cmap_min),
+        cmap_max=float(args.cmap_max),
     )
 
     # Optional reporting at times
@@ -264,11 +279,12 @@ def _run_one(series: str, args: argparse.Namespace) -> None:
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
-            "Uccle wrapper around simulator.dgev_laplace_risk (NEW):\n"
+            "Uccle wrapper around simulator.dgev_laplace_risk:\n"
             "- Loads latest DGEV Laplace posterior (per series) by default.\n"
             "- Computes Bayesian event probabilities for EVERY posterior draw.\n"
             "- Writes <run>/risk/exceedance_probs.npz and risk plots.\n"
             "- Can plot prob or return period, linear or log, and combine thresholds.\n"
+            "- Uses Reds (TX*) and Blues (TN*) colormaps when combining thresholds.\n"
             "- Can print/save summaries at selected times.\n"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -290,7 +306,7 @@ def build_argparser() -> argparse.ArgumentParser:
         ),
     )
 
-    p.add_argument("--series", type=str, default="TXn", choices=["TXx", "TXn", "TNx", "TNn"])
+    p.add_argument("--series", type=str, default="TXx", choices=["TXx", "TXn", "TNx", "TNn"])
     g = p.add_mutually_exclusive_group()
     g.add_argument("--all", dest="run_all", action="store_true", default=False, help="Run TXx, TXn, TNx, TNn (default).")
     g.add_argument("--one", dest="run_all", action="store_false", help="Run only --series.")
@@ -305,7 +321,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--thin", type=int, default=1, help="Extra thinning factor (post-hoc).")
 
     # risk inputs
-    p.add_argument("--thresholds", type=str, default="0,-1,-2,-3,-4,-5", help="Comma-separated thresholds on plot/original scale.")
+    p.add_argument("--thresholds", type=str, default="36.8,39.7", help="Comma-separated thresholds on plot/original scale.")
     p.add_argument("--event", type=str, default="auto", help="auto, gt, or lt (event on plot scale).")
 
     # calendar axis
@@ -323,18 +339,29 @@ def build_argparser() -> argparse.ArgumentParser:
     # credible band / windows
     p.add_argument("--level", type=float, default=0.90, help="Credible band level (over posterior draws).")
     p.add_argument("--window-months", type=int, default=240, help="Fine plot: last N points shown.")
-    p.add_argument("--window-years", type=int, default=120, help="Annual plot: last N year groups shown.")
+    p.add_argument("--window-years", type=int, default=60, help="Annual plot: last N year groups shown.")
 
-    # NEW plotting controls
-    p.add_argument("--y-mode", type=str, default="prob", choices=["prob", "rp"], help="Plot y as probability or return period (years).")
-    p.add_argument("--yscale", type=str, default="linear", choices=["linear", "log"], help="Plot y-axis scale.")
-    p.add_argument("--combine", action="store_true", default=False, help="Overlay multiple thresholds on one plot.")
-    p.add_argument("--no-band", action="store_true", default=False, help="Disable credible bands (useful when combining).")
+    # plotting controls
+    p.add_argument("--y-mode", type=str, default="rp", choices=["prob", "rp"], help="Plot y as probability or return period (years).")
+    p.add_argument("--yscale", type=str, default="log", choices=["linear", "log"], help="Plot y-axis scale.")
+    p.add_argument("--combine", action=argparse.BooleanOptionalAction, default=True, help="Overlay multiple thresholds on one plot.")
+
+    p.add_argument("--band", action=argparse.BooleanOptionalAction, default=True, help="Show credible bands (default: on if not combine).")
+    p.add_argument("--legend", action=argparse.BooleanOptionalAction, default=None, help="Show legend (default: on if combine).")
+    p.add_argument("--split-line", action=argparse.BooleanOptionalAction, default=False, help="Draw split line at last observed point.")
+
+    # RP guardrails
     p.add_argument("--rp-cap-years", type=float, default=10_000.0, help="Return-period cap in years (guards against tiny probabilities).")
     p.add_argument("--small-prob-policy", type=str, default="clip", choices=["clip", "mask"], help="How to handle probs below the rp-cap floor.")
 
-    # NEW reporting controls
-    p.add_argument("--times", type=str, default="1900,1950,2020", help="Comma-separated times for reporting (e.g. 1950-07,2020-07 or numeric x).")
+    # colormap controls (used when combine=True; can override defaults)
+    p.add_argument("--shade", action=argparse.BooleanOptionalAction, default=None, help="Use colormap shading (default: on if combine).")
+    p.add_argument("--cmap", type=str, default="", help="Override colormap name (default: Reds for TX, Blues for TN).")
+    p.add_argument("--cmap-min", type=float, default=0.35, help="Lower end of colormap range [0,1] (lighter).")
+    p.add_argument("--cmap-max", type=float, default=0.95, help="Upper end of colormap range [0,1] (darker).")
+
+    # reporting controls
+    p.add_argument("--times", type=str, default="1900,1970,2020", help="Comma-separated times for reporting (e.g. 1950-07,2020-07 or numeric x).")
     p.add_argument("--report-scale", type=str, default="annual", choices=["fine", "annual"], help="Whether to report on fine or annual scale.")
     p.add_argument("--report-csv", type=str, default="", help="Optional CSV path for the report (default: <out>/risk_report_times_*.csv).")
 

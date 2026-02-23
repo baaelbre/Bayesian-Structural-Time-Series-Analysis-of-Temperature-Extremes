@@ -54,6 +54,7 @@ except Exception as e:
 # =============================================================================
 Interval = Literal["eti", "hpd"]
 
+
 def _normalize_interval(interval: str) -> Interval:
     s = str(interval).strip().lower()
     if s in ("eti", "equal", "equal-tailed", "equaltail", "equaltails", "quantile", "qt"):
@@ -64,9 +65,7 @@ def _normalize_interval(interval: str) -> Interval:
 
 
 def _hpd_1d(x: np.ndarray, mass: float) -> Tuple[float, float]:
-    """
-    Shortest contiguous interval containing `mass` probability, approximated from samples.
-    """
+    """Shortest contiguous interval containing `mass` probability, approximated from samples."""
     v = np.asarray(x, float).ravel()
     v = v[np.isfinite(v)]
     n = int(v.size)
@@ -111,7 +110,7 @@ def _interval_2d(arr_2d: np.ndarray, *, mass: float, interval: Interval) -> Tupl
     A = np.asarray(arr_2d, float)
     if A.ndim != 2:
         raise ValueError("arr_2d must be 2D (S,T).")
-    S, T = A.shape
+    _, T = A.shape
     interval = _normalize_interval(interval)
     mass = float(mass)
 
@@ -219,12 +218,23 @@ def _apply_sign_backtransform(draws: Dict[str, Any], *, minima: bool) -> Dict[st
 # Plotter
 # =============================================================================
 TimeLike = Union[int, str]
+SeasonWhich = Literal["total", "dynamic", "baseline"]
 
 
 class DGEVPlotter:
     """
     Plotter for posterior bundles from Laplace-based structural GEV samplers.
-    Mirrors DLMPlotter as closely as possible.
+
+    Seasonal diagnostics are aligned with DLMPlotter:
+      - dynamic seasonal state: x[..., idx_g0]
+      - baseline seasonal dummies: gamma0 mapped to time by month-of-year
+      - total seasonal contribution: dynamic + baseline
+
+    Seasonal figures (all support which=total|dynamic|baseline):
+      - figure_seasonal_patterns(...)
+      - figure_seasonal_variance(...)
+      - figure_seasonal_dummies_heatmap(...)
+      - figure_seasonal_dummies_by_month(...)
     """
 
     def __init__(
@@ -290,19 +300,37 @@ class DGEVPlotter:
 
         # GEV sigma/xi (NOT sign-flipped)
         self.sigma: Optional[np.ndarray] = None
-        if "sigma" in self.draws and np.asarray(self.draws["sigma"]).ndim == 1 and np.asarray(self.draws["sigma"]).shape[0] == self.S:
+        if (
+            "sigma" in self.draws
+            and np.asarray(self.draws["sigma"]).ndim == 1
+            and np.asarray(self.draws["sigma"]).shape[0] == self.S
+        ):
             self.sigma = np.asarray(self.draws["sigma"], float)
-        elif "sigma2" in self.draws and np.asarray(self.draws["sigma2"]).ndim == 1 and np.asarray(self.draws["sigma2"]).shape[0] == self.S:
+        elif (
+            "sigma2" in self.draws
+            and np.asarray(self.draws["sigma2"]).ndim == 1
+            and np.asarray(self.draws["sigma2"]).shape[0] == self.S
+        ):
             self.sigma = np.sqrt(np.clip(np.asarray(self.draws["sigma2"], float), 0.0, None))
 
         self.xi: Optional[np.ndarray] = None
-        if "xi" in self.draws and np.asarray(self.draws["xi"]).ndim == 1 and np.asarray(self.draws["xi"]).shape[0] == self.S:
+        if (
+            "xi" in self.draws
+            and np.asarray(self.draws["xi"]).ndim == 1
+            and np.asarray(self.draws["xi"]).shape[0] == self.S
+        ):
             self.xi = np.asarray(self.draws["xi"], float)
 
         # baselines (already backtransformed if minima=True)
-        self.alpha0 = np.asarray(self.draws["alpha0"], float) if "alpha0" in self.draws else _maybe(self.draws, "m0_alpha")
-        self.beta0 = np.asarray(self.draws["beta0"], float) if "beta0" in self.draws else _maybe(self.draws, "m0_beta")
-        self.gamma0 = np.asarray(self.draws["gamma0"], float) if "gamma0" in self.draws else _maybe(self.draws, "m0_gamma")
+        self.alpha0 = (
+            np.asarray(self.draws["alpha0"], float) if "alpha0" in self.draws else _maybe(self.draws, "m0_alpha")
+        )
+        self.beta0 = (
+            np.asarray(self.draws["beta0"], float) if "beta0" in self.draws else _maybe(self.draws, "m0_beta")
+        )
+        self.gamma0 = (
+            np.asarray(self.draws["gamma0"], float) if "gamma0" in self.draws else _maybe(self.draws, "m0_gamma")
+        )
 
         # scalar & vector params (excluding time series shaped (S,T))
         self.scalar_params: Dict[str, np.ndarray] = {}
@@ -333,6 +361,7 @@ class DGEVPlotter:
             print("[info] minima=True detected → back-transforming (negated) location-related draws for plotting.")
         print(f"[info] credible interval type: {self.interval.upper()}")
 
+    # ----------------------------- init helpers ----------------------------- #
     def _collect_params(self) -> None:
         skip = {"y", "mu", "x", "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t"}
         for k, v in self.draws.items():
@@ -446,6 +475,150 @@ class DGEVPlotter:
             return x[:, :, self.idx_g0]
         return None
 
+    # ----------------------------- seasonal indexing helpers (same as DLMPlotter) ----------------------------- #
+    def _year_month_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return arrays (year[t], month[t]) with month in 1..period."""
+        if self.is_time and hasattr(self.t, "__len__"):
+            years = np.array([dt.year for dt in self.t], dtype=int)
+            months = np.array([dt.month for dt in self.t], dtype=int)
+            return years, months
+
+        start_date = self.meta.get("start_date", None) or self.meta.get("start", None) or self.meta.get("t0", None)
+        if start_date is None:
+            raise ValueError(
+                "Cannot build year/month indexing: meta['start_date'] (or start/t0) is missing. "
+                "Add start_date='YYYY-MM-DD' to meta or pass --start-date."
+            )
+
+        dt0 = _parse_date_ymd(str(start_date))
+        period = int(self.period)
+
+        tt = np.arange(self.T, dtype=int)
+        months0 = dt0.year * period + (dt0.month - 1)
+        months = months0 + tt
+        years = months // period
+        mon = (months % period) + 1
+        return years.astype(int), mon.astype(int)
+
+    def _year_slices(self) -> Tuple[List[int], Dict[int, np.ndarray]]:
+        years, _months = self._year_month_arrays()
+        uniq = np.unique(years)
+        idx_by_year: Dict[int, np.ndarray] = {int(y): np.where(years == y)[0] for y in uniq}
+        return [int(y) for y in uniq], idx_by_year
+
+    def _full_years(self) -> Tuple[List[int], Dict[int, np.ndarray], np.ndarray]:
+        """Full year means exactly `period` months present in that calendar year."""
+        uniq_years, idx_by_year = self._year_slices()
+        _, months_arr = self._year_month_arrays()
+        p = int(self.period)
+        full = [int(y) for y in uniq_years if idx_by_year[int(y)].size == p]
+        full = sorted(full)
+        return full, idx_by_year, months_arr
+
+    # ----------------------------- seasonal composition (DLMPlotter-style) ----------------------------- #
+    def _gamma0_full(self) -> Optional[np.ndarray]:
+        """
+        Ensure baseline seasonal dummy vector has length period (includes implied last month).
+        Accepts gamma0 shape:
+          - (S, period-1): append last = -sum
+          - (S, period):   already full
+          - (period-1,) or (period,): treated as fixed across draws (broadcast to (S, ...))
+        """
+        if self.gamma0 is None:
+            return None
+
+        p = int(self.period)
+        G0 = np.asarray(self.gamma0, float)
+
+        # allow fixed gamma0 vector (no draw dimension)
+        if G0.ndim == 1 and G0.size in (p - 1, p):
+            G0 = np.broadcast_to(G0.reshape(1, -1), (self.S, G0.size)).copy()
+
+        if G0.ndim != 2 or G0.shape[0] != self.S:
+            return None
+
+        if G0.shape[1] == p:
+            return G0
+
+        if G0.shape[1] == p - 1:
+            last = -np.sum(G0, axis=1, keepdims=True)
+            return np.concatenate([G0, last], axis=1)
+
+        return None
+
+    def _baseline_season_series(self) -> Optional[np.ndarray]:
+        """
+        Baseline seasonal dummy contribution per draw and time:
+          base_t = gamma0_full[m_t], with m_t in {0..period-1}
+        Returns (S, T) or None if gamma0 missing.
+        """
+        G0 = self._gamma0_full()
+        if G0 is None:
+            return None
+        p = int(self.period)
+        m = (np.arange(self.T, dtype=int) % p)
+        return G0[:, m]  # (S, T)
+
+    def seasonal_dynamic_series(self) -> Optional[np.ndarray]:
+        """Dynamic seasonal state series (S, T) from x[..., idx_g0]."""
+        return self._component_draws("gamma")
+
+    def seasonal_total_series(self) -> Optional[np.ndarray]:
+        """
+        Total seasonal contribution (S, T):
+          season_t = gamma_dyn_t + baseline_dummy_t
+        If gamma0 missing, returns dynamic series.
+        """
+        dyn = self.seasonal_dynamic_series()
+        if dyn is None:
+            return None
+        base = self._baseline_season_series()
+        if base is None:
+            return dyn
+        return dyn + base
+
+    def seasonal_matrix_year_month(
+        self,
+        *,
+        which: str = "total",  # total|dynamic|baseline
+    ) -> Tuple[List[int], np.ndarray, np.ndarray]:
+        """
+        Returns:
+          years_full: list of calendar years with full period months
+          months:     array [1..period]
+          M:          (S, Ny, period) with M[:, j, m-1] as seasonal contribution for that year & month
+        """
+        which = str(which).lower().strip()
+        if which not in ("total", "dynamic", "baseline"):
+            raise ValueError("which must be one of: 'total', 'dynamic', 'baseline'")
+
+        if which == "dynamic":
+            season = self.seasonal_dynamic_series()
+        elif which == "baseline":
+            season = self._baseline_season_series()
+        else:
+            season = self.seasonal_total_series()
+
+        if season is None:
+            raise RuntimeError("No seasonal series available (need draws['x'] with seasonal index, and/or gamma0).")
+
+        full_years, idx_by_year, months_arr = self._full_years()
+        p = int(self.period)
+        if not full_years:
+            raise RuntimeError("No full calendar years found (need exactly 'period' months per year).")
+
+        Ny = len(full_years)
+        M = np.empty((self.S, Ny, p), float)
+
+        for j, y in enumerate(full_years):
+            idx = idx_by_year[int(y)]
+            order = np.argsort(months_arr[idx])
+            idx = idx[order]  # month order 1..p
+            M[:, j, :] = season[:, idx]
+
+        months = np.arange(1, p + 1, dtype=int)
+        return full_years, months, M
+
     # ----------------------------- time indexing (same as DLMPlotter) ----------------------------- #
     def _time_to_index(self, t: TimeLike) -> Tuple[int, str]:
         T = self.T
@@ -481,7 +654,7 @@ class DGEVPlotter:
             raise ValueError(f"Date {t!r} maps to index {i}, out of range [0, {T - 1}].")
         return int(i), str(t)
 
-    # ----------------------------- printing: level/slope (same as DLMPlotter) ----------------------------- #
+    # ----------------------------- printing: level/slope ----------------------------- #
     def print_level_slope_at(
         self,
         times: Sequence[TimeLike] = ("start", "mid", "end"),
@@ -492,10 +665,7 @@ class DGEVPlotter:
         use_mean: bool = False,
         interval: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Print posterior summaries for level alpha_t and slope beta_t at selected times.
-        Uses ETI or HPD depending on `interval` (defaults to plotter interval).
-        """
+        """Print posterior summaries for level alpha_t and slope beta_t at selected times."""
         if not self.has_x or self.idx_alpha is None or self.idx_beta is None:
             raise RuntimeError("Cannot print level/slope: draws['x'] missing or layout lacks alpha/beta.")
 
@@ -547,7 +717,7 @@ class DGEVPlotter:
         print()
         return rows
 
-    # ----------------------------- printing: static params (mirrors DLMPlotter) ----------------------------- #
+    # ----------------------------- static param printing ----------------------------- #
     @staticmethod
     def _clean_name(s: str) -> str:
         x = str(s)
@@ -699,15 +869,12 @@ class DGEVPlotter:
             G0 = np.asarray(self.gamma0)
             add_scalar("gamma0", G0) if G0.ndim == 1 else add_vector("gamma0", G0)
 
-        # derived Q as vector (nice column names)
         if include_derived_Q and (self.Q is not None) and np.size(self.Q):
             col = [self._clean_name(x) for x in (self.Q_names or [])]
             add_vector("Q", np.asarray(self.Q), col_labels=col if col else None)
 
-        # log-scale summaries (mirrors DLMPlotter)
         if include_log_process:
             eps = float(log_eps)
-
             if self.s_alpha is not None:
                 add_scalar("log10|s_alpha|", np.log10(np.clip(np.abs(self.s_alpha), eps, None)))
             if self.s_beta is not None:
@@ -720,13 +887,23 @@ class DGEVPlotter:
                 logQ = np.log10(np.clip(np.asarray(self.Q, float), eps, None))
                 add_vector("log10Q", logQ, col_labels=col if col else None)
 
-        # add remaining scalar/vector params
         skip_keys = {
-            "mu", "x", "y",
-            "true_mu_t", "true_alpha_t", "true_beta_t", "true_gamma_t",
-            "sigma", "sigma2", "xi",
-            "alpha0", "beta0", "gamma0",
-            "m0_alpha", "m0_beta", "m0_gamma",
+            "mu",
+            "x",
+            "y",
+            "true_mu_t",
+            "true_alpha_t",
+            "true_beta_t",
+            "true_gamma_t",
+            "sigma",
+            "sigma2",
+            "xi",
+            "alpha0",
+            "beta0",
+            "gamma0",
+            "m0_alpha",
+            "m0_beta",
+            "m0_gamma",
             "Q",
         }
         for k, arr in self.scalar_params.items():
@@ -746,7 +923,6 @@ class DGEVPlotter:
             main = sorted(main, key=lambda r: str(r.get("name", "")))
             rows = main + tail
 
-        # print (mirrors DLMPlotter)
         print(f"\n[static parameter summaries] S={self.S}, CI={ci_pct}% {itv.upper()} (center={ctr_name})")
         if include_diagnostics:
             print(" name                           n |       ctr [        lo,        hi] |    ESS   z")
@@ -772,10 +948,7 @@ class DGEVPlotter:
                     f"{(f'{z:.2f}' if np.isfinite(z) else 'nan'):>5}"
                 )
             else:
-                print(
-                    f" {nm:<30} {n:>5d} | "
-                    f"{fmt(ctr):>10} [{fmt(lo):>10}, {fmt(hi):>10}]"
-                )
+                print(f" {nm:<30} {n:>5d} | " f"{fmt(ctr):>10} [{fmt(lo):>10}, {fmt(hi):>10}]")
 
             if "note" in r:
                 print(f"   -> {r['note']}")
@@ -783,7 +956,7 @@ class DGEVPlotter:
         print()
         return rows
 
-    # ----------------------------- trace/hist/acf panel (copy from DLMPlotter) ----------------------------- #
+    # ----------------------------- trace/hist/acf panel ----------------------------- #
     def _trace_hist_acf_panel(
         self,
         series: np.ndarray,
@@ -800,8 +973,8 @@ class DGEVPlotter:
         show: bool = True,
         trace_ylim: Optional[Tuple[float, float]] = None,
         hist_xlim: Optional[Tuple[float, float]] = None,
-        plot_policy: str = "none",    # "none" | "clip" | "drop"
-        diag_policy: str = "clean",   # "raw" | "clipped" | "clean"
+        plot_policy: str = "none",  # "none" | "clip" | "drop"
+        diag_policy: str = "clean",  # "raw" | "clipped" | "clean"
         drop_nonfinite: bool = True,
         clip_q: Optional[Tuple[float, float]] = None,
         clip_nmad: Optional[float] = None,
@@ -869,7 +1042,9 @@ class DGEVPlotter:
         if not use_bounds:
             lo_bound, hi_bound = -np.inf, np.inf
 
-        out_mask_finite = ((s_finite < lo_bound) | (s_finite > hi_bound)) if use_bounds else np.zeros_like(s_finite, bool)
+        out_mask_finite = ((s_finite < lo_bound) | (s_finite > hi_bound)) if use_bounds else np.zeros_like(
+            s_finite, bool
+        )
         n_out = int(np.sum(out_mask_finite))
 
         # plotting series (keep length = original draws; NaN out nonfinite/outliers if requested)
@@ -917,8 +1092,11 @@ class DGEVPlotter:
         if trace_ylim is not None:
             axs[0].set_ylim(*trace_ylim)
         elif (
-            auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop")
-            and np.isfinite(lo_bound) and np.isfinite(hi_bound)
+            auto_zoom_if_clipped
+            and use_bounds
+            and plot_policy in ("clip", "drop")
+            and np.isfinite(lo_bound)
+            and np.isfinite(hi_bound)
         ):
             axs[0].set_ylim(lo_bound, hi_bound)
 
@@ -926,8 +1104,11 @@ class DGEVPlotter:
         if hist_xlim is not None:
             hist_range = (float(hist_xlim[0]), float(hist_xlim[1]))
         elif (
-            auto_zoom_if_clipped and use_bounds and plot_policy in ("clip", "drop")
-            and np.isfinite(lo_bound) and np.isfinite(hi_bound)
+            auto_zoom_if_clipped
+            and use_bounds
+            and plot_policy in ("clip", "drop")
+            and np.isfinite(lo_bound)
+            and np.isfinite(hi_bound)
         ):
             hist_range = (float(lo_bound), float(hi_bound))
 
@@ -952,7 +1133,7 @@ class DGEVPlotter:
         else:
             plt.close(fig)
 
-    # ----------------------------- figures (mirror DLMPlotter) ----------------------------- #
+    # ----------------------------- figures ----------------------------- #
     def figure_overview(
         self,
         *,
@@ -989,15 +1170,23 @@ class DGEVPlotter:
         # mu
         axs[0].plot(t, ctr, lw=1.6, color=color, label=(c_lab if show_legend_mu else "_nolegend_"))
         axs[0].fill_between(
-            t, lo, hi,
-            alpha=band_alpha, color=color,
+            t,
+            lo,
+            hi,
+            alpha=band_alpha,
+            color=color,
             label=(band_label if show_legend_mu else "_nolegend_"),
         )
         if self.y is not None and len(self.y) == self.T:
             axs[0].plot(t, self.y, lw=1.0, alpha=0.6, label=(r"$y_t$" if show_legend_mu else "_nolegend_"))
         if self.true_mu is not None and len(self.true_mu) == self.T:
             axs[0].plot(
-                t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8,
+                t,
+                self.true_mu,
+                lw=1.2,
+                ls="--",
+                color="k",
+                alpha=0.8,
                 label=("truth" if show_legend_mu else "_nolegend_"),
             )
 
@@ -1146,10 +1335,19 @@ class DGEVPlotter:
 
         if plot_other_scalars:
             skip = {
-                "sigma", "sigma2", "xi",
-                "s_alpha", "s_beta", "s_gamma",
-                "Q_alpha", "Q_beta", "Q_gamma",
-                "lambda2", "tau_alpha", "tau_beta", "tau_gamma",
+                "sigma",
+                "sigma2",
+                "xi",
+                "s_alpha",
+                "s_beta",
+                "s_gamma",
+                "Q_alpha",
+                "Q_beta",
+                "Q_gamma",
+                "lambda2",
+                "tau_alpha",
+                "tau_beta",
+                "tau_gamma",
             }
             for k, arr in sorted(self.scalar_params.items()):
                 if k in skip or str(k).startswith("tau_"):
@@ -1172,7 +1370,7 @@ class DGEVPlotter:
         ylabel_level: str = r"$\alpha_t$",
         title_slope: str = "",
         ylabel_slope: str = r"$\beta_t$",
-        title_seasonality: str = "",
+        title_seasonality: str = "",  # keep empty (no title)
         ylabel_seasonality: str = r"$\gamma_t$",
         slope_scale: float = 1.0,
         ylims: Optional[Dict[str, Tuple[float, float]]] = None,
@@ -1180,6 +1378,7 @@ class DGEVPlotter:
         zero_line_slope: bool = True,
         zero_line_seasonality: bool = True,
         show_legend: bool = True,
+        seasonality_which: str = "dynamic",  # dynamic|baseline|total
     ) -> None:
         if not self.has_x:
             print("[states] no centred state draws 'x' found; skipping.")
@@ -1214,7 +1413,12 @@ class DGEVPlotter:
 
             if truth is not None and len(truth) == self.T:
                 ax.plot(
-                    t, truth, lw=1.2, ls="--", color="k", alpha=0.8,
+                    t,
+                    truth,
+                    lw=1.2,
+                    ls="--",
+                    color="k",
+                    alpha=0.8,
                     label=("truth" if show_legend else "_nolegend_"),
                 )
 
@@ -1276,14 +1480,27 @@ class DGEVPlotter:
                 yscale=yscales.get("slope"),
             )
 
-        G = self._component_draws("gamma")
+        which = str(seasonality_which).lower().strip()
+        if which not in ("dynamic", "baseline", "total"):
+            raise ValueError("seasonality_which must be one of: dynamic|baseline|total")
+
+        if which == "dynamic":
+            G = self.seasonal_dynamic_series()
+            truthG = self.true_gamma
+        elif which == "baseline":
+            G = self._baseline_season_series()
+            truthG = None
+        else:
+            G = self.seasonal_total_series()
+            truthG = None
+
         if G is not None:
             _plot_component(
                 G,
-                out_name=f"{fname_prefix}_seasonality.png",
-                title=title_seasonality,
+                out_name=f"{fname_prefix}_seasonality_{which}.png",
+                title=title_seasonality,  # default "" => no title
                 ylabel=ylabel_seasonality,
-                truth=self.true_gamma,
+                truth=truthG,
                 zero_line=zero_line_seasonality,
                 ylim=ylims.get("seasonality"),
                 yscale=yscales.get("seasonality"),
@@ -1322,12 +1539,21 @@ class DGEVPlotter:
 
         axs[0].plot(t, ctr, lw=1.6, color=color, label=(c_lab if show_legend_mu else "_nolegend_"))
         axs[0].fill_between(
-            t, lo, hi, alpha=band_alpha, color=color,
+            t,
+            lo,
+            hi,
+            alpha=band_alpha,
+            color=color,
             label=(band_label if show_legend_mu else "_nolegend_"),
         )
         if self.true_mu is not None and len(self.true_mu) == self.T:
             axs[0].plot(
-                t, self.true_mu, lw=1.2, ls="--", color="k", alpha=0.8,
+                t,
+                self.true_mu,
+                lw=1.2,
+                ls="--",
+                color="k",
+                alpha=0.8,
                 label=("truth" if show_legend_mu else "_nolegend_"),
             )
         axs[0].set_title(title_mu)
@@ -1389,7 +1615,7 @@ class DGEVPlotter:
         """
         Separate histogram of process variances on log10 scale.
 
-        Requirement: NO title. (Same as DLMPlotter.)
+        Requirement: NO title.
         """
         if self.Q is None or (not np.size(self.Q)):
             print("[qhist] no process variances found; skipping.")
@@ -1422,6 +1648,320 @@ class DGEVPlotter:
         else:
             plt.close(fig)
 
+    # ----------------------------- NEW seasonal figures (DLMPlotter-style) ----------------------------- #
+    def figure_seasonal_patterns(
+        self,
+        *,
+        which: str = "total",  # total|dynamic|baseline
+        years: Union[str, Sequence[int]] = "auto",
+        save_dir: Optional[str] = None,
+        fname: str = "seasonal_patterns.png",
+        show: bool = True,
+        center: str = "median",
+        level: Optional[float] = None,
+        interval: Optional[str] = None,
+        show_band: bool = True,
+        band_alpha: float = 0.15,
+        title: str = "",  # requirement: NO title by default
+        ylabel: str = r"$\gamma_t$",
+        xlabel: str = "month",
+        show_legend: bool = True,
+        legend_title: str = "",
+    ) -> None:
+        """
+        Seasonal pattern curves for selected calendar years.
+        Uses full years only and plots month-of-year (1..period) on x-axis.
+        """
+        lev = float(self.level if level is None else level)
+        if not (0.0 < lev < 1.0):
+            raise ValueError("level must be in (0,1)")
+        itv = self.interval if interval is None else _normalize_interval(interval)
+        c = _normalize_center(center)
+
+        try:
+            full_years, months, M = self.seasonal_matrix_year_month(which=which)
+        except Exception as e:
+            print(f"[seasonal_patterns] {e}; skipping.")
+            return
+
+        if isinstance(years, str) and years.strip().lower() == "auto":
+            y0 = full_years[0]
+            y1 = full_years[len(full_years) // 2]
+            y2 = full_years[-1]
+            years_list = list(dict.fromkeys([y0, y1, y2]))
+        else:
+            years_list = [int(y) for y in years]  # type: ignore[arg-type]
+
+        # map year->index in M
+        year_to_j = {int(y): j for j, y in enumerate(full_years)}
+        years_list = [y for y in years_list if y in year_to_j]
+        if not years_list:
+            print("[seasonal_patterns] requested years not available as full years; skipping.")
+            return
+
+        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+
+        lo_q = (1.0 - lev) / 2.0
+        hi_q = 1.0 - lo_q
+
+        for y in years_list:
+            j = year_to_j[int(y)]
+            Gy = M[:, j, :]  # (S, p)
+            ctr = np.mean(Gy, axis=0) if c == "mean" else np.quantile(Gy, 0.5, axis=0)
+            ax.plot(months, ctr, lw=1.6, label=str(y) if show_legend else "_nolegend_")
+
+            if show_band:
+                if itv == "eti":
+                    lo = np.quantile(Gy, lo_q, axis=0)
+                    hi = np.quantile(Gy, hi_q, axis=0)
+                else:
+                    lo, hi = _interval_2d(Gy, mass=lev, interval=itv)
+                ax.fill_between(months, lo, hi, alpha=band_alpha)
+
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_xticks(months)
+        ax.grid(True, alpha=0.25)
+        if show_legend:
+            leg = ax.legend(loc="best", title=(legend_title if legend_title else None))
+            if leg is not None and legend_title == "":
+                try:
+                    leg.set_title("")
+                except Exception:
+                    pass
+
+        plt.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    def figure_seasonal_variance(
+        self,
+        *,
+        which: str = "total",  # total|dynamic|baseline
+        save_dir: Optional[str] = None,
+        fname: str = "seasonal_variance.png",
+        show: bool = True,
+        center: str = "median",
+        level: Optional[float] = None,
+        interval: Optional[str] = None,
+        title: str = "",  # requirement: NO title by default
+        ylabel: str = r"$A_\gamma$",
+        xlabel: str = "year",
+        band_alpha: float = 0.25,
+    ) -> None:
+        """
+        A_gamma(year) = Var_m(season_{y,m}) computed draw-by-draw, then ribbon over years.
+        """
+        lev = float(self.level if level is None else level)
+        if not (0.0 < lev < 1.0):
+            raise ValueError("level must be in (0,1)")
+        itv = self.interval if interval is None else _normalize_interval(interval)
+        c = _normalize_center(center)
+
+        try:
+            years_full, _months, M = self.seasonal_matrix_year_month(which=which)  # (S, Ny, p)
+        except Exception as e:
+            print(f"[seasonal_variance] {e}; skipping.")
+            return
+
+        A = np.var(M, axis=2, ddof=0)  # (S, Ny)
+
+        ctr = np.mean(A, axis=0) if c == "mean" else np.quantile(A, 0.5, axis=0)
+        if itv == "eti":
+            lo_q = (1.0 - lev) / 2.0
+            hi_q = 1.0 - lo_q
+            lo = np.quantile(A, lo_q, axis=0)
+            hi = np.quantile(A, hi_q, axis=0)
+        else:
+            lo = np.empty(A.shape[1], dtype=float)
+            hi = np.empty(A.shape[1], dtype=float)
+            for j in range(A.shape[1]):
+                lo[j], hi[j] = _hpd_1d(A[:, j], mass=lev)
+
+        fig, ax = plt.subplots(1, 1, figsize=(10.5, 3.6))
+        ax.plot(years_full, ctr, lw=1.6)
+        ax.fill_between(years_full, lo, hi, alpha=band_alpha)
+
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+
+        plt.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    def figure_seasonal_dummies_heatmap(
+        self,
+        *,
+        which: str = "baseline",  # total|dynamic|baseline
+        save_dir: Optional[str] = None,
+        fname: str = "seasonal_heatmap.png",
+        show: bool = True,
+        center: str = "median",
+        title: str = "",  # default no title
+        xlabel: str = "month",
+        ylabel: str = "year",
+        show_colorbar: bool = True,
+        aspect: str = "auto",
+        interpolation: str = "nearest",
+        vmin: Optional[float] = None,
+        vmax: Optional[float] = None,
+    ) -> None:
+        """
+        Heatmap of seasonal contribution by year (rows) and month (cols).
+        Plots the posterior center (mean/median) of season_{y,m}.
+        """
+        c = _normalize_center(center)
+        try:
+            years_full, months, M = self.seasonal_matrix_year_month(which=which)  # (S, Ny, p)
+        except Exception as e:
+            print(f"[seasonal_heatmap] {e}; skipping.")
+            return
+
+        H = np.mean(M, axis=0) if c == "mean" else np.quantile(M, 0.5, axis=0)  # (Ny, p)
+
+        fig, ax = plt.subplots(1, 1, figsize=(11, 4.2))
+        im = ax.imshow(
+            H,
+            aspect=aspect,
+            interpolation=interpolation,
+            origin="lower",
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        # ticks
+        ax.set_xticks(np.arange(months.size))
+        ax.set_xticklabels([str(int(m)) for m in months])
+        # y ticks: keep readable (every k years)
+        Ny = len(years_full)
+        if Ny <= 15:
+            yt = np.arange(Ny)
+        else:
+            k = max(1, Ny // 10)
+            yt = np.arange(0, Ny, k)
+        ax.set_yticks(yt)
+        ax.set_yticklabels([str(years_full[i]) for i in yt])
+
+        ax.grid(False)
+        if show_colorbar:
+            fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+
+        plt.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
+    def figure_seasonal_dummies_by_month(
+        self,
+        *,
+        which: str = "baseline",  # total|dynamic|baseline
+        save_dir: Optional[str] = None,
+        fname: str = "seasonal_by_month.png",
+        show: bool = True,
+        center: str = "median",
+        level: Optional[float] = None,
+        interval: Optional[str] = None,
+        title: str = "",  # default no title
+        xlabel: str = "year",
+        ylabel: str = r"$\gamma$",
+        band_alpha: float = 0.20,
+        show_band: bool = False,  # off by default (can get busy)
+        legend: bool = True,
+        max_months_in_legend: int = 12,
+    ) -> None:
+        """
+        For each month-of-year m, plot the (center) seasonal contribution vs year.
+        Optionally add a per-year band (ETI/HPD) for each month.
+        """
+        lev = float(self.level if level is None else level)
+        if not (0.0 < lev < 1.0):
+            raise ValueError("level must be in (0,1)")
+        itv = self.interval if interval is None else _normalize_interval(interval)
+        c = _normalize_center(center)
+
+        try:
+            years_full, months, M = self.seasonal_matrix_year_month(which=which)  # (S, Ny, p)
+        except Exception as e:
+            print(f"[seasonal_by_month] {e}; skipping.")
+            return
+
+        Ny = len(years_full)
+        p = months.size
+
+        # center across draws for each (year, month)
+        C = np.mean(M, axis=0) if c == "mean" else np.quantile(M, 0.5, axis=0)  # (Ny, p)
+
+        # optional bands per (year, month) across draws -> (Ny, p)
+        if show_band:
+            if itv == "eti":
+                lo_q = (1.0 - lev) / 2.0
+                hi_q = 1.0 - lo_q
+                Lo = np.quantile(M, lo_q, axis=0)
+                Hi = np.quantile(M, hi_q, axis=0)
+            else:
+                Lo = np.empty((Ny, p), float)
+                Hi = np.empty((Ny, p), float)
+                for j in range(Ny):
+                    for m in range(p):
+                        Lo[j, m], Hi[j, m] = _hpd_1d(M[:, j, m], mass=lev)
+        else:
+            Lo = Hi = None  # type: ignore[assignment]
+
+        fig, ax = plt.subplots(1, 1, figsize=(11, 4.2))
+        for m_idx, m in enumerate(months):
+            ax.plot(years_full, C[:, m_idx], lw=1.2, label=f"m={int(m)}" if (legend and p <= max_months_in_legend) else "_nolegend_")
+            if show_band and Lo is not None and Hi is not None:
+                ax.fill_between(years_full, Lo[:, m_idx], Hi[:, m_idx], alpha=band_alpha)
+
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        if legend and p <= max_months_in_legend:
+            ax.legend(loc="best", ncol=4)
+
+        plt.tight_layout()
+        if save_dir:
+            _ensure_dir(save_dir)
+            out = os.path.join(save_dir, fname)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
+            print(f"[save] {out}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+
 
 # =============================================================================
 # CLI (mirrors dlm_plotter.py)
@@ -1433,7 +1973,7 @@ if __name__ == "__main__":
         description=(
             "DGEV Laplace plotter (mirrors the Gaussian DLMPlotter CLI).\n"
             "Produces overview, scalar trace/hist/ACF, separate state plots, quick report,\n"
-            "and a separate log10(Q) histogram.\n"
+            "a separate log10(Q) histogram, and seasonal diagnostics.\n"
             "Auto-detects minima=True from meta and back-transforms for plotting.\n"
             "Use --<section>-kw K=V (repeatable) to override kwargs.\n"
             "Nested dicts: use dot notation, e.g. ylims.slope=(-1,1).\n"
@@ -1443,21 +1983,33 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--target", type=str, default=None,
-        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root."
+        "--target",
+        type=str,
+        default=None,
+        help="Path to a run directory or directly to posterior.npz. If omitted, searches under --root.",
     )
     parser.add_argument(
-        "--root", type=str, default="results/simulations/DGEV_NCP_LASSO",
-        help="Search root if --target is omitted."
+        "--root",
+        type=str,
+        default="results/simulations/DGEV_NCP_LASSO",
+        help="Search root if --target is omitted.",
     )
     parser.add_argument("--level", type=float, default=0.90, help="Credible band level.")
-    parser.add_argument("--interval", type=str, default="eti", choices=["eti", "hpd"], help="Credible interval type (ETI or HPD).")
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="eti",
+        choices=["eti", "hpd"],
+        help="Credible interval type (ETI or HPD).",
+    )
     parser.add_argument("--show", action="store_true", default=False, help="Show figures interactively.")
     parser.add_argument("--out", type=str, default=None, help="Directory to save figures. Default: <run>/figures")
 
     parser.add_argument(
-        "--start-date", type=str, default=None,
-        help="Override meta start_date (YYYY-MM-DD) to build a monthly datetime axis."
+        "--start-date",
+        type=str,
+        default="1997-01-01",
+        help="Override meta start_date (YYYY-MM-DD) to build a monthly datetime axis.",
     )
 
     gmin = parser.add_mutually_exclusive_group()
@@ -1470,49 +2022,125 @@ if __name__ == "__main__":
     parser.add_argument("--skip-quick", action="store_true", help="Skip quick report.")
     parser.add_argument("--skip-qhist", action="store_true", help="Skip separate log10(Q) histogram.")
 
+    # NEW seasonal toggles
+    parser.add_argument("--skip-seasonal-patterns", action="store_true", help="Skip seasonal patterns figure.")
+    parser.add_argument("--skip-seasonal-variance", action="store_true", help="Skip seasonal variance-by-year figure.")
+    parser.add_argument("--skip-seasonal-heatmap", action="store_true", help="Skip seasonal heatmap figure.")
+    parser.add_argument("--skip-seasonal-bymonth", action="store_true", help="Skip seasonal by-month trends figure.")
+
     parser.add_argument(
-        "--overview-kw", action="append", default=[], metavar="K=V",
-        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots."
+        "--seasonal-years",
+        type=str,
+        default="auto",
+        help="Comma-separated calendar years for seasonal patterns, or 'auto'. Example: 1950,1980,2020",
     )
     parser.add_argument(
-        "--traceacf-kw", action="append", default=[], metavar="K=V",
-        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots."
+        "--seasonal-which",
+        type=str,
+        default="total",
+        choices=["total", "dynamic", "baseline"],
+        help="Which seasonal contribution to plot (applies to seasonal diagnostics unless overridden by section kwargs).",
+    )
+
+    parser.add_argument(
+        "--overview-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_overview(...). Repeatable. Supports nested keys via dots.",
     )
     parser.add_argument(
-        "--states-kw", action="append", default=[], metavar="K=V",
-        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots."
+        "--traceacf-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_trace_acf_core(...). Repeatable. Supports nested keys via dots.",
     )
     parser.add_argument(
-        "--quick-kw", action="append", default=[], metavar="K=V",
-        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots."
+        "--states-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_states_separate(...). Repeatable. Supports nested keys via dots.",
     )
     parser.add_argument(
-        "--qhist-kw", action="append", default=[], metavar="K=V",
-        help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable."
+        "--quick-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.quick_report(...). Repeatable. Supports nested keys via dots.",
+    )
+    parser.add_argument(
+        "--qhist-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_process_variances_hist(...). Repeatable.",
+    )
+
+    # seasonal kwargs
+    parser.add_argument(
+        "--seasonal-patterns-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_seasonal_patterns(...). Repeatable.",
+    )
+    parser.add_argument(
+        "--seasonal-variance-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_seasonal_variance(...). Repeatable.",
+    )
+    parser.add_argument(
+        "--seasonal-heatmap-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_seasonal_dummies_heatmap(...). Repeatable.",
+    )
+    parser.add_argument(
+        "--seasonal-bymonth-kw",
+        action="append",
+        default=[],
+        metavar="K=V",
+        help="Override kwargs for plotter.figure_seasonal_dummies_by_month(...). Repeatable.",
     )
 
     # printing toggles (same pattern as dlm_plotter.py)
     gp = parser.add_mutually_exclusive_group()
     gp.add_argument(
-        "--print-level-slope", dest="print_level_slope", action="store_true", default=True,
-        help="Print level/slope summaries at times given by --times."
+        "--print-level-slope",
+        dest="print_level_slope",
+        action="store_true",
+        default=True,
+        help="Print level/slope summaries at times given by --times.",
     )
     gp.add_argument(
-        "--no-print-level-slope", dest="print_level_slope", action="store_false",
-        help="Disable printing of level/slope summaries."
+        "--no-print-level-slope",
+        dest="print_level_slope",
+        action="store_false",
+        help="Disable printing of level/slope summaries.",
     )
     parser.add_argument(
-        "--times", type=str, default="start,mid,end",
-        help="Comma-separated times for level/slope printing. Each can be index or start/mid/end or YYYY-MM."
+        "--times",
+        type=str,
+        default="start,mid,end",
+        help="Comma-separated times for level/slope printing. Each can be index or start/mid/end or YYYY-MM.",
     )
     parser.add_argument(
-        "--slope-scale", type=float, default=1.0,
-        help="Scale factor applied to beta_t when printing (e.g. 120 for per-decade if beta is per-month)."
+        "--slope-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to beta_t when printing (e.g. 120 for per-decade if beta is per-month).",
     )
 
     parser.add_argument(
-        "--print-static", action="store_true", default=True,
-        help="Print summaries (center + CI) for all static parameters (scalars and vectors)."
+        "--print-static",
+        action="store_true",
+        default=True,
+        help="Print summaries (center + CI) for all static parameters (scalars and vectors).",
     )
     parser.add_argument("--static-level", type=float, default=None, help="Credible level for static params (defaults to --level).")
     parser.add_argument("--static-center", type=str, default="median", help="Center for static summaries: median or mean.")
@@ -1572,6 +2200,20 @@ if __name__ == "__main__":
     quick_kw = _parse_kv_list(args.quick_kw)
     qhist_kw = _parse_kv_list(args.qhist_kw)
 
+    seasonal_patterns_kw = _parse_kv_list(args.seasonal_patterns_kw)
+    seasonal_variance_kw = _parse_kv_list(args.seasonal_variance_kw)
+    seasonal_heatmap_kw = _parse_kv_list(args.seasonal_heatmap_kw)
+    seasonal_bymonth_kw = _parse_kv_list(args.seasonal_bymonth_kw)
+
+    # parse seasonal years (auto or list)
+    sy = str(args.seasonal_years).strip()
+    if sy.lower() == "auto" or sy == "":
+        seasonal_years: Union[str, List[int]] = "auto"
+    else:
+        seasonal_years = [int(z) for z in sy.split(",") if z.strip() != ""]
+
+    seasonal_which = str(args.seasonal_which).strip().lower()
+
     # --- optional printing (same structure as dlm_plotter.py) ---
     if args.print_level_slope:
         raw_times = [s.strip() for s in str(args.times).split(",") if s.strip() != ""]
@@ -1604,5 +2246,43 @@ if __name__ == "__main__":
         plotter.quick_report(save_dir=out_dir, show=args.show, **quick_kw)
     if not args.skip_qhist:
         plotter.figure_process_variances_hist(save_dir=out_dir, show=args.show, **qhist_kw)
+
+    # --- seasonal diagnostics (new) ---
+    if not args.skip_seasonal_patterns:
+        if "which" not in seasonal_patterns_kw:
+            seasonal_patterns_kw["which"] = seasonal_which
+        plotter.figure_seasonal_patterns(
+            years=seasonal_years,
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_patterns_kw,
+        )
+
+    if not args.skip_seasonal_variance:
+        if "which" not in seasonal_variance_kw:
+            seasonal_variance_kw["which"] = seasonal_which
+        plotter.figure_seasonal_variance(
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_variance_kw,
+        )
+
+    if not args.skip_seasonal_heatmap:
+        if "which" not in seasonal_heatmap_kw:
+            seasonal_heatmap_kw["which"] = seasonal_which
+        plotter.figure_seasonal_dummies_heatmap(
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_heatmap_kw,
+        )
+
+    if not args.skip_seasonal_bymonth:
+        if "which" not in seasonal_bymonth_kw:
+            seasonal_bymonth_kw["which"] = seasonal_which
+        plotter.figure_seasonal_dummies_by_month(
+            save_dir=out_dir,
+            show=args.show,
+            **seasonal_bymonth_kw,
+        )
 
     print("[done] plots written.")

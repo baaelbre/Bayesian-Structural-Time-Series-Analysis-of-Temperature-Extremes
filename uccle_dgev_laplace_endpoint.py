@@ -2,32 +2,6 @@
 from __future__ import annotations
 """
 Uccle wrapper for DGEV Laplace endpoint tracking
-==============================================
-
-Thin wrapper around:
-    simulator.dgev_laplace_endpoint.DGEVLaplaceEndpoint
-
-Uccle defaults / conventions
-----------------------------
-- Default root: results/uccle/<GROUP>/<SERIES>/<AGG>/Laplace
-- Robust latest-run discovery:
-    1) optimization.posterior_bundle.find_latest_run (posterior.npz runs)
-    2) fallback recursive search for posterior*.npz
-
-Plot conventions (Uccle-style)
-------------------------------
-- No title, no legend
-- TX* series are red; TN* series are blue; others default
-- Vertical split line at last observed point
-- Adds a small textbox with P(xi < -xi_eps) and nonfinite policy
-
-Outputs (default: <run>/endpoint)
----------------------------------
-<run>/endpoint/
-  endpoint_over_time.npz
-  endpoint_fine_<plot|model>_<linear|log>.png
-  endpoint_annual_<plot|model>_<linear|log>.png
-  endpoint_report_times_<fine|annual>.csv  (optional)
 """
 
 import os
@@ -52,8 +26,24 @@ from simulator.dgev_laplace_endpoint import (  # type: ignore
     _parse_csv_strings,
 )
 
-import matplotlib
-matplotlib.use("Agg")
+import matplotlib as mpl
+mpl.use("Agg")
+mpl.rcParams.update({
+    # global base font
+    "font.size": 18,
+
+    # titles + axis labels
+    "axes.titlesize": 16,
+    "axes.labelsize": 16,
+
+    # tick labels
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+
+    # legends
+    "legend.fontsize": 11,
+    "legend.title_fontsize": 11,
+})
 import matplotlib.pyplot as plt  # noqa: E402
 
 
@@ -92,12 +82,6 @@ def _ensure_dir(path: str) -> None:
     if path:
         os.makedirs(path, exist_ok=True)
 
-
-# =============================================================================
-# Optional: enforce Uccle color by post-editing plot images
-# (Better: directly reproduce plot with same data and chosen color.)
-# We'll just re-plot here using the class outputs.
-# =============================================================================
 def _nan_summarize_2d(draws_2d: np.ndarray, level: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     loq = (1.0 - float(level)) / 2.0
     hiq = 1.0 - loq
@@ -167,15 +151,6 @@ def plot_fine_uccle(
     ax.set_title("")  # no title
     ax.legend_.remove() if ax.get_legend() is not None else None
 
-    ax.text(
-        0.01,
-        0.98,
-        f"P(finite)=P(xi<-{xi_eps:g})≈{p_finite:.3f}\npolicy={nonfinite_policy}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-    )
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -217,8 +192,7 @@ def plot_annual_uccle(
     if np.isfinite(split_x_year):
         ax.axvline(float(split_x_year), lw=1.0, alpha=0.8, color="black")
 
-    kind = "annual lower endpoint" if (minima and str(mode) == "plot") else "annual upper endpoint"
-    ax.set_ylabel(f"{kind} ({mode} scale)")
+    ax.set_ylabel(r"Endpoint $y^*$")
     ax.set_xlabel("year")
     ax.grid(True, alpha=0.25)
 
@@ -226,16 +200,6 @@ def plot_annual_uccle(
 
     ax.set_title("")  # no title
     ax.legend_.remove() if ax.get_legend() is not None else None
-
-    ax.text(
-        0.01,
-        0.98,
-        f"P(finite)=P(xi<-{xi_eps:g})≈{p_finite:.3f}\npolicy={nonfinite_policy}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=9,
-    )
 
     plt.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -285,7 +249,7 @@ if __name__ == "__main__":
 
     # endpoint controls
     p.add_argument("--mode", type=str, default="plot", choices=["plot", "model"], help="Compute endpoints on plot/original scale or model scale.")
-    p.add_argument("--xi-eps", type=float, default=1e-6, help="Treat xi >= -xi_eps as non-finite (guards near-zero blow-ups).")
+    p.add_argument("--xi-eps", type=float, default=0, help="Treat xi >= -xi_eps as non-finite (guards near-zero blow-ups).")
     p.add_argument("--nonfinite-policy", type=str, default="nan", choices=["nan", "inf"], help="How to represent xi>=-xi_eps draws.")
 
     # plotting
