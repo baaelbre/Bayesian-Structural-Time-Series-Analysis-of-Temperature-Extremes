@@ -1,0 +1,22 @@
+{
+  "state_names": [
+    "level",
+    "slope"
+  ],
+  "meta": {
+    "obs_kind": "gev",
+    "seed": 124,
+    "T": 240,
+    "params_state": {
+      "q_level": 0.15,
+      "q_slope": 0.01,
+      "drift_level": 0.0,
+      "drift_slope": 0.0005,
+      "obs_intercept": 10.0
+    },
+    "params_obs": {
+      "sigma": 1.0,
+      "xi": -0.15
+    }
+  }
+}

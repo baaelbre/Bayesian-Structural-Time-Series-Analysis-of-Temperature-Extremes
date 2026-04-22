@@ -1,7 +1,3 @@
-# plot_2019_tx_tn_from_uccle_daily.py
-# Put this script in data/ next to: Uccle_24_10_23.csv
-# Run:  python plot_2019_tx_tn_from_uccle_daily.py
-
 from pathlib import Path
 import numpy as np
 import pandas as pd

@@ -75,7 +75,7 @@ except Exception as e:
 
 # Sampler (re-fit per split)
 try:
-    from optimization.dgev_laplace_2 import DGEVLaplaceNCP, Priors, SamplerConfig  # type: ignore
+    from optimization.dgev_laplace import DGEVLaplaceNCP, Priors, SamplerConfig  # type: ignore
 except Exception:
     from dgev_laplace_2 import DGEVLaplaceNCP, Priors, SamplerConfig  # type: ignore
 
