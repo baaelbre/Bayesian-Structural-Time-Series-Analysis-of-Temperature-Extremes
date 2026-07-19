@@ -289,6 +289,213 @@ class PosteriorBundle:
             return f"P({self.series_name or 'Y'} < {threshold:g})"
         return f"P({self.series_name or 'Y'} > {threshold:g})"
 
+    def level_rate_draws(
+        self,
+        start_year: int,
+        end_year: int,
+        *,
+        scale: str | float = "decade",
+    ) -> Array:
+        """Posterior finite-change rate from the latent level trajectory.
+
+        The latent level is averaged within the first and last calendar years
+        and the difference is divided by elapsed time. Unlike the instantaneous
+        slope state, this summary includes all changes in the fitted level and
+        is therefore robust to the allocation between level and slope
+        innovations.
+        """
+
+        if self.dates is None:
+            raise ValueError("level_rate_draws requires calendar dates.")
+        if int(end_year) <= int(start_year):
+            raise ValueError("Require end_year > start_year.")
+        import pandas as pd
+
+        years = np.asarray(pd.to_datetime(np.asarray(self.dates)).year, dtype=int)
+        start_idx = np.flatnonzero(years == int(start_year))
+        end_idx = np.flatnonzero(years == int(end_year))
+        if start_idx.size == 0 or end_idx.size == 0:
+            available = (int(years.min()), int(years.max()))
+            raise ValueError(
+                f"Requested years are unavailable; fitted range is {available[0]}-{available[1]}."
+            )
+
+        level = self.state_draws("alpha", original_scale=True)
+        start_level = np.mean(level[:, start_idx], axis=1)
+        end_level = np.mean(level[:, end_idx], axis=1)
+        annual_rate = (end_level - start_level) / float(end_year - start_year)
+
+        if isinstance(scale, (int, float)):
+            multiplier = float(scale)
+        else:
+            key = str(scale).lower()
+            if key in {"year", "annual"}:
+                multiplier = 1.0
+            elif key in {"decade", "decadal"}:
+                multiplier = 10.0
+            elif key in {"century", "centennial"}:
+                multiplier = 100.0
+            else:
+                raise ValueError(
+                    "scale must be 'year', 'decade', 'century', or a numeric multiplier."
+                )
+        return multiplier * annual_rate
+
+    def period_rate_draws(
+        self,
+        periods: Dict[str, tuple[int, int]],
+        *,
+        scale: str | float = "decade",
+    ) -> Dict[str, Array]:
+        """Posterior level-change rates for several named periods."""
+
+        return {
+            str(label): self.level_rate_draws(start, end, scale=scale)
+            for label, (start, end) in periods.items()
+        }
+
+    def period_rate_summary(
+        self,
+        periods: Dict[str, tuple[int, int]],
+        *,
+        scale: str | float = "decade",
+        credible_interval: float = 0.90,
+    ):
+        """Summarize finite-period rates and positive-change probabilities."""
+
+        import pandas as pd
+
+        rows = []
+        for label, values in self.period_rate_draws(periods, scale=scale).items():
+            summary = self.posterior_summary(
+                values, credible_interval=credible_interval, axis=0
+            )
+            rows.append(
+                {
+                    "period": label,
+                    "lower": float(summary["lower"]),
+                    "median": float(summary["median"]),
+                    "upper": float(summary["upper"]),
+                    "probability_positive": float(np.mean(values > 0.0)),
+                }
+            )
+        return pd.DataFrame(rows).set_index("period")
+
+    def rate_contrast_draws(
+        self,
+        recent: tuple[int, int],
+        reference: tuple[int, int],
+        *,
+        scale: str | float = "decade",
+    ) -> Array:
+        """Posterior difference between two finite-period level-change rates."""
+
+        recent_draws = self.level_rate_draws(*recent, scale=scale)
+        reference_draws = self.level_rate_draws(*reference, scale=scale)
+        return recent_draws - reference_draws
+
+    def rate_contrast_summary(
+        self,
+        recent: tuple[int, int],
+        reference: tuple[int, int],
+        *,
+        scale: str | float = "decade",
+        credible_interval: float = 0.90,
+    ) -> Dict[str, float]:
+        """Summarize acceleration as a contrast of finite-period rates."""
+
+        values = self.rate_contrast_draws(recent, reference, scale=scale)
+        summary = self.posterior_summary(
+            values, credible_interval=credible_interval, axis=0
+        )
+        return {
+            "lower": float(summary["lower"]),
+            "median": float(summary["median"]),
+            "upper": float(summary["upper"]),
+            "probability_positive": float(np.mean(values > 0.0)),
+        }
+
+    def component_probabilities(self):
+        """Posterior zero/fixed/dynamic probabilities for SSVS components."""
+        import pandas as pd
+
+        labels = {0: "zero", 1: "fixed", 2: "dynamic"}
+        rows = []
+        for component in ("level", "trend", "season"):
+            key = f"state_{component}"
+            if key not in self.draws_static:
+                continue
+            values = np.asarray(self.draws_static[key], dtype=int).reshape(-1)
+            row = {"component": component}
+            for code, label in labels.items():
+                row[label] = float(np.mean(values == code))
+            rows.append(row)
+        if not rows:
+            raise ValueError("This fit does not contain structural SSVS draws.")
+        return pd.DataFrame(rows).set_index("component")
+
+    def component_transition_summary(self):
+        """Transition counts and switching rates for SSVS component states."""
+
+        import pandas as pd
+
+        labels = {0: "zero", 1: "fixed", 2: "dynamic"}
+        rows = []
+        for component in ("level", "trend", "season"):
+            key = f"state_{component}"
+            if key not in self.draws_static:
+                continue
+            values = np.asarray(self.draws_static[key], dtype=int).reshape(-1)
+            changes = int(np.sum(values[1:] != values[:-1])) if values.size > 1 else 0
+            rows.append(
+                {
+                    "component": component,
+                    "n_draws": int(values.size),
+                    "n_switches": changes,
+                    "switch_rate": float(changes / max(values.size - 1, 1)),
+                    "first_state": labels[int(values[0])],
+                    "last_state": labels[int(values[-1])],
+                }
+            )
+        if not rows:
+            raise ValueError("This fit does not contain structural SSVS draws.")
+        return pd.DataFrame(rows).set_index("component")
+
+    def structural_model_probabilities(self):
+        """Posterior probabilities of the joint structural specifications."""
+        import pandas as pd
+
+        keys = ["state_level", "state_trend", "state_season"]
+        if not all(key in self.draws_static for key in keys):
+            raise ValueError("This fit does not contain structural SSVS draws.")
+        values = np.column_stack(
+            [np.asarray(self.draws_static[key], dtype=int).reshape(-1) for key in keys]
+        )
+        unique, counts = np.unique(values, axis=0, return_counts=True)
+        labels = {0: "zero", 1: "fixed", 2: "dynamic"}
+        rows = []
+        for state, count in zip(unique, counts):
+            rows.append(
+                {
+                    "level": labels[int(state[0])],
+                    "trend": labels[int(state[1])],
+                    "season": labels[int(state[2])],
+                    "probability": float(count / values.shape[0]),
+                }
+            )
+        return pd.DataFrame(rows).sort_values("probability", ascending=False).reset_index(drop=True)
+
+    def most_probable_structure(self) -> Dict[str, Any]:
+        """Return the maximum-posterior joint SSVS structure."""
+        table = self.structural_model_probabilities()
+        row = table.iloc[0]
+        return {
+            "level": str(row["level"]),
+            "trend": str(row["trend"]),
+            "season": str(row["season"]),
+            "probability": float(row["probability"]),
+        }
+
     def summary_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "series": self.series_name,

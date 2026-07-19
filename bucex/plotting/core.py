@@ -185,10 +185,114 @@ def _plot_endpoint(
     return ax
 
 
+def _plot_component_probabilities(fit, *, ax=None):
+    plt = _mpl()
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6.8, 3.2))
+    table = fit.component_probabilities()
+    components = list(table.index)
+    left = np.zeros(len(components), dtype=float)
+    colors = {"zero": "#d7d7d7", "fixed": "#84a9c0", "dynamic": "#d97961"}
+    for label in ("zero", "fixed", "dynamic"):
+        values = table[label].to_numpy(dtype=float)
+        ax.barh(components, values, left=left, label=label.capitalize(), color=colors[label])
+        left += values
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Posterior probability")
+    ax.set_title(f"{fit.series_name or ''} component structure".strip())
+    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.18))
+    _clean_axis(ax)
+    return ax
+
+
+def _interval_summary(values, credible_interval: float):
+    alpha = 1.0 - float(credible_interval)
+    return np.quantile(values, [alpha / 2.0, 0.5, 1.0 - alpha / 2.0])
+
+
+def _plot_period_rates(
+    fit,
+    *,
+    periods,
+    credible_interval: float = 0.90,
+    ax=None,
+    color: Optional[str] = None,
+):
+    plt = _mpl()
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6.8, 3.4))
+    color = color or _series_color(fit.series_name)
+    draws = fit.period_rate_draws(periods, scale="decade")
+    labels = list(draws)
+    positions = np.arange(len(labels))
+    for position, label in zip(positions, labels):
+        low, med, high = _interval_summary(draws[label], credible_interval)
+        inner_low, _, inner_high = _interval_summary(draws[label], 0.50)
+        ax.plot([low, high], [position, position], color=color, linewidth=1.1)
+        ax.plot([inner_low, inner_high], [position, position], color=color, linewidth=4.0)
+        ax.plot(med, position, marker="o", color=color, markersize=5)
+    ax.axvline(0.0, color="0.35", linewidth=0.8, linestyle="--")
+    ax.set_yticks(positions, labels)
+    ax.set_xlabel("Level change (°C per decade)")
+    ax.set_title(f"{fit.series_name or ''} period-average change".strip())
+    _clean_axis(ax)
+    return ax
+
+
+def _plot_collection_rate_acceleration(
+    collection,
+    *,
+    recent=(1980, 2022),
+    reference=(1950, 1979),
+    credible_interval: float = 0.90,
+    figsize=(7.2, 4.2),
+):
+    plt = _mpl()
+    order = [
+        name
+        for name in ("TXm", "TNm", "TXx", "TXn", "TNx", "TNn")
+        if name in collection.fits
+    ]
+    fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+    positions = np.arange(len(order))
+    for position, name in zip(positions, order):
+        fit = collection.fits[name]
+        values = fit.rate_contrast_draws(recent, reference, scale="decade")
+        low, med, high = _interval_summary(values, credible_interval)
+        inner_low, _, inner_high = _interval_summary(values, 0.50)
+        color = _series_color(name)
+        ax.plot([low, high], [position, position], color=color, linewidth=1.1)
+        ax.plot([inner_low, inner_high], [position, position], color=color, linewidth=4.0)
+        ax.plot(med, position, marker="o", color=color, markersize=5)
+        probability = float(np.mean(values > 0.0))
+        ax.text(
+            high,
+            position,
+            f"  P={probability:.2f}",
+            va="center",
+            ha="left",
+            fontsize=8,
+        )
+    ax.axvline(0.0, color="0.35", linewidth=0.9, linestyle="--")
+    ax.set_yticks(positions, order)
+    ax.invert_yaxis()
+    ax.set_xlabel("Recent minus mid-century rate (°C per decade)")
+    ax.set_title(
+        f"Acceleration: {recent[0]}–{recent[1]} versus "
+        f"{reference[0]}–{reference[1]}"
+    )
+    _clean_axis(ax)
+    return fig, ax
+
+
 def _plot_collection(collection, *, type: str, credible_interval: float = 0.90, **kwargs):
     plt = _mpl()
     fits = collection.fits
     order = [name for name in ("TXm", "TNm", "TXx", "TXn", "TNx", "TNn") if name in fits]
+    if type in {"rate_acceleration", "acceleration", "rate_contrast"}:
+        return _plot_collection_rate_acceleration(
+            collection, credible_interval=credible_interval, **kwargs
+        )
     if type in {"level_slope", "states"}:
         fig, axes = plt.subplots(
             len(order),
@@ -250,7 +354,7 @@ def plot(obj: Any, type: str = "level", **kwargs):
         A :class:`PosteriorBundle` or :class:`UccleFitCollection`.
     type:
         ``'level'``, ``'slope'``, ``'level_slope'``, ``'exceedance'``,
-        ``'return_period'`` or ``'endpoint'``.
+        ``'return_period'``, ``'endpoint'``, ``'period_rates'`` or ``'component_probabilities'``.
     """
     type = type.lower().replace("-", "_").replace(" ", "_")
     credible_interval = float(kwargs.pop("credible_interval", 0.90))
@@ -291,7 +395,17 @@ def plot(obj: Any, type: str = "level", **kwargs):
     if type in {"endpoint", "gev_endpoint"}:
         ax = _plot_endpoint(obj, credible_interval=credible_interval, **kwargs)
         return ax.figure, ax
+    if type in {"period_rates", "finite_rates", "level_rates"}:
+        if "periods" not in kwargs:
+            raise ValueError("plot(type='period_rates') requires periods={label: (start, end)}.")
+        ax = _plot_period_rates(
+            obj, credible_interval=credible_interval, **kwargs
+        )
+        return ax.figure, ax
+    if type in {"component_probabilities", "components", "structure"}:
+        ax = _plot_component_probabilities(obj, **kwargs)
+        return ax.figure, ax
     raise ValueError(
         "Unknown plot type. Use level, slope, level_slope, exceedance, "
-        "return_period, or endpoint."
+        "return_period, endpoint, period_rates, or component_probabilities."
     )

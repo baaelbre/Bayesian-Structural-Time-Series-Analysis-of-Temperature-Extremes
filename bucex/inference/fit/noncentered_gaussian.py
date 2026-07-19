@@ -12,6 +12,7 @@ from .noncentered_utils import (
     build_ncp_system,
     canonicalize_ncp_params,
     ffbs_gaussian_1d,
+    design_matrix_ncp,
     gaussian_theta_update,
     infer_ncp_layout,
     initialise_lasso,
@@ -20,6 +21,14 @@ from .noncentered_utils import (
     mu_from_ncp,
     random_sign_switches,
     update_lasso_scales,
+    apply_theta_draw,
+    copy_lasso_lambda2,
+    lasso_coefficient_scale,
+)
+from .model_space import (
+    ComponentState,
+    initial_structural_state,
+    sample_structural_regression,
 )
 from .priors import InverseGammaPrior, NonCenteredGaussianPriors
 from .utils import sample_inverse_gamma
@@ -46,6 +55,7 @@ def _sigma2_update_from_mu(
     params_state: Optional[ParamDict] = None,
     tau: Optional[dict[str, float]] = None,
     lasso_uses_sigma2: bool = False,
+    lasso_prior: Any = None,
 ) -> float:
     """Conjugate observation-variance update.
 
@@ -62,7 +72,13 @@ def _sigma2_update_from_mu(
             raise ValueError("params_state and tau are required for the scaled lasso sigma2 update.")
         for block, key in (("level", "s_level"), ("trend", "s_trend"), ("season", "s_season")):
             if block in tau and key in params_state:
-                ss += float(params_state[key]) ** 2 / max(float(tau[block]), 1e-12)
+                coefficient_scale = (
+                    lasso_coefficient_scale(lasso_prior, block)
+                    if lasso_prior is not None
+                    else 1.0
+                )
+                denominator = coefficient_scale**2 * max(float(tau[block]), 1e-12)
+                ss += float(params_state[key]) ** 2 / max(denominator, 1e-16)
                 n_extra += 1
     a_post = prior.a + 0.5 * (resid.size + n_extra)
     b_post = prior.b + 0.5 * ss
@@ -112,6 +128,7 @@ class NonCenteredGaussianGibbs:
         params_obs["sigma2"] = float(params_obs["sigma"]) ** 2
 
         tau, lambda2 = initialise_lasso(self.priors, self.layout)
+        model_state = initial_structural_state(params_state, self.layout)
 
         n_iter, burn, thin = self.config.n_iter, self.config.burn, self.config.thin
         save_iters = list(range(burn, n_iter, thin))
@@ -140,9 +157,18 @@ class NonCenteredGaussianGibbs:
                 q_season=np.zeros(n_keep),
             )
         if self.priors.lasso is not None:
-            draws_static["lambda2"] = np.zeros(n_keep)
+            if isinstance(lambda2, dict):
+                for block in tau:
+                    draws_static[f"lambda2_{block}"] = np.zeros(n_keep)
+            else:
+                draws_static["lambda2"] = np.zeros(n_keep)
             for block in tau:
                 draws_static[f"tau_{block}"] = np.zeros(n_keep)
+        if self.priors.ssvs is not None:
+            draws_static["state_level"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["state_trend"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["state_season"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["model_index"] = np.zeros(n_keep, dtype=np.int16)
 
         logpost = np.full(n_keep, np.nan)
         G, Q = build_ncp_system(self.layout)
@@ -171,17 +197,37 @@ class NonCenteredGaussianGibbs:
                 if self.priors.lasso is not None
                 else float(params_obs["sigma2"])
             )
-            theta_draw = gaussian_theta_update(
-                y=y1,
-                z_path=z_path,
-                sigma2=float(params_obs["sigma2"]),
-                priors=self.priors,
-                layout=self.layout,
-                rng=self.rng,
-                tau=tau or None,
-                lasso_variance_scale=lasso_var,
-            )
-            params_state.update(theta_draw)
+            model_index = -1
+            if self.priors.ssvs is not None:
+                X, theta_names, tbar = design_matrix_ncp(
+                    z_path, self.layout, center_time=True
+                )
+                selection = sample_structural_regression(
+                    y=y1,
+                    X=X,
+                    theta_names=theta_names,
+                    tbar=tbar,
+                    noise_variance=float(params_obs["sigma2"]),
+                    priors=self.priors,
+                    layout=self.layout,
+                    rng=self.rng,
+                    apply_theta_draw=apply_theta_draw,
+                )
+                params_state.update(selection.params_state)
+                model_state = selection.state
+                model_index = selection.selected_index
+            else:
+                theta_draw = gaussian_theta_update(
+                    y=y1,
+                    z_path=z_path,
+                    sigma2=float(params_obs["sigma2"]),
+                    priors=self.priors,
+                    layout=self.layout,
+                    rng=self.rng,
+                    tau=tau or None,
+                    lasso_variance_scale=lasso_var,
+                )
+                params_state.update(theta_draw)
             z_path, params_state = random_sign_switches(z_path, params_state, self.layout, self.rng)
 
             if self.priors.lasso is not None:
@@ -207,6 +253,7 @@ class NonCenteredGaussianGibbs:
                     self.priors.lasso is not None
                     and self.priors.lasso.variance_mode == "observation"
                 ),
+                lasso_prior=self.priors.lasso,
             )
             params_obs["sigma2"] = float(sigma2)
             params_obs["sigma"] = float(np.sqrt(sigma2))
@@ -222,7 +269,18 @@ class NonCenteredGaussianGibbs:
                 if self.layout.season_dim > 0:
                     msg += f" Q_season={params_state['q_season']:.3g}"
                 if self.priors.lasso is not None:
-                    msg += f" lambda2={lambda2:.3g}"
+                    if isinstance(lambda2, dict):
+                        compact = ",".join(
+                            f"{key[0]}:{value:.2g}" for key, value in lambda2.items()
+                        )
+                        msg += f" lambda2=({compact})"
+                    else:
+                        msg += f" lambda2={lambda2:.3g}"
+                if self.priors.ssvs is not None:
+                    msg += (
+                        f" structure=({model_state.level.label},"
+                        f"{model_state.trend.label},{model_state.season.label})"
+                    )
                 print(msg)
 
             if it in save_set:
@@ -240,9 +298,18 @@ class NonCenteredGaussianGibbs:
                     for key in ("s_season", "q_season"):
                         draws_static[key][keep_idx] = float(params_state[key])
                 if self.priors.lasso is not None:
-                    draws_static["lambda2"][keep_idx] = float(lambda2)
+                    if isinstance(lambda2, dict):
+                        for block, value in lambda2.items():
+                            draws_static[f"lambda2_{block}"][keep_idx] = float(value)
+                    else:
+                        draws_static["lambda2"][keep_idx] = float(lambda2)
                     for block, value in tau.items():
                         draws_static[f"tau_{block}"][keep_idx] = float(value)
+                if self.priors.ssvs is not None:
+                    draws_static["state_level"][keep_idx] = int(model_state.level)
+                    draws_static["state_trend"][keep_idx] = int(model_state.trend)
+                    draws_static["state_season"][keep_idx] = int(model_state.season)
+                    draws_static["model_index"][keep_idx] = int(model_index)
                 resid = y1 - mu
                 logpost[keep_idx] = float(
                     -0.5 * Tn * np.log(2.0 * np.pi * params_obs["sigma2"])
@@ -256,7 +323,15 @@ class NonCenteredGaussianGibbs:
             logpost=logpost,
             acceptance={},
             meta={
-                "sampler": "noncentered_gaussian_lasso_gibbs",
+                "sampler": (
+                    "noncentered_gaussian_ssvs_gibbs"
+                    if self.priors.ssvs is not None
+                    else (
+                        "noncentered_gaussian_lasso_gibbs"
+                        if self.priors.lasso is not None
+                        else "noncentered_gaussian_normal_gibbs"
+                    )
+                ),
                 "parameterization": "noncentered",
                 "n_iter": n_iter,
                 "burn": burn,
@@ -266,5 +341,11 @@ class NonCenteredGaussianGibbs:
                 "ncp_state_names": self.layout.ncp_state_names,
                 "draws_states_ncp": z_draws,
                 "bayesian_lasso": self.priors.lasso is not None,
+                "componentwise_lasso": bool(
+                    self.priors.lasso is not None
+                    and getattr(self.priors.lasso, "componentwise", False)
+                ),
+                "structural_ssvs": self.priors.ssvs is not None,
+                "model_selection_exact": self.priors.ssvs is not None,
             },
         )

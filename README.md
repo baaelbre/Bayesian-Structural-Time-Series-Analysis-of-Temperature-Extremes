@@ -1,134 +1,243 @@
-# bucex v0.2.0
+# bucex v0.3.3
 
 `bucex` provides Bayesian structural state-space models for ordinary and extreme
-series. Version 0.2 is the first manuscript-oriented release: it contains the
-non-centred local-level/local-slope/dummy-seasonal model, the hierarchical
-Bayesian lasso used in the paper, the paper's observation priors, Uccle wrappers,
-and fit objects that know how to plot and calculate risk.
+time series. Version 0.3.3 keeps the v0.3.2 samplers and regularisation unchanged,
+adds explicit reasons whenever a DGEV iteration is restored, and provides a
+short multi-chain Torque workflow for the six Uccle series.
 
-## Main additions in v0.2
+## Prior profiles
 
-- hierarchical Bayesian lasso on the signed innovation standard deviations
-  `s_level`, `s_trend`, and `s_season`;
-- local scales `tau_level`, `tau_trend`, `tau_season` and global scale `lambda2`
-  are sampled and stored;
-- manuscript priors:
-  - Gaussian: `sigma2 ~ IG(2, 1)`;
-  - DGEV: `sigma2 ~ IG(2, 2)`, `xi ~ Uniform(-0.5, 0.5)`;
-- centred-time Fruehwirth-Schnatter regression update with the correct correlated
-  prior for the centred intercept and slope;
-- automatic sign transformation for TXn and TNn;
-- a complete `PosteriorBundle` with data, dates, model, state names, transformations,
-  posterior risk methods, save/load, and `fit.plot(type=...)`;
-- one-call wrappers for TXm, TNm, TXx, TXn, TNx, and TNn.
+```python
+fit_bayes(..., priors="manuscript")   # original shared Bayesian lasso
+fit_bayes(..., priors="normal")       # scale-aware Normal priors
+fit_bayes(..., priors="regularized")  # component-wise Bayesian lasso
+fit_bayes(..., priors="ssvs")         # zero/fixed/dynamic selection
+```
 
-## Install locally
+The non-centred signed innovation scales are
 
-From the repository root:
+```text
+s_level, s_trend, s_season
+```
+
+with process variances `q_k = s_k**2`.
+
+The `manuscript` profile remains unchanged. The new `regularized` profile uses
+separate shrinkage parameters and coefficient scales for the three structural
+blocks. Its monthly defaults are:
+
+```text
+level  : 0.03 °C
+trend  : 0.0002 °C per month
+season : 0.03 °C
+```
+
+These are starting scales for sensitivity analysis, not universal constants.
+
+## Component-wise Bayesian lasso
+
+```python
+from bucex import ComponentwiseBayesianLassoPrior
+
+prior = ComponentwiseBayesianLassoPrior(
+    coefficient_scale={
+        "level": 0.03,
+        "trend": 0.0002,
+        "season": 0.03,
+    },
+    a_lambda={"level": 2.0, "trend": 2.0, "season": 2.0},
+    b_lambda={"level": 1.0, "trend": 1.0, "season": 1.0},
+)
+```
+
+For component `k`, the hierarchy is
+
+```text
+s_k | tau_k ~ Normal(0, variance_scale * coefficient_scale_k² * tau_k)
+tau_k | lambda2_k ~ Exponential(lambda2_k / 2)
+lambda2_k ~ Gamma(a_k, b_k)
+```
+
+The saved posterior contains `lambda2_level`, `lambda2_trend`, and
+`lambda2_season`.
+
+## Structural SSVS
+
+The level is always present and is either fixed or dynamic. Trend and
+seasonality can be zero, fixed, or dynamic:
+
+```text
+level  : fixed | dynamic
+trend  : zero  | fixed | dynamic
+season : zero  | fixed | dynamic
+```
+
+This gives 18 candidate structures for the default model. The v0.3.2 SSVS
+profile uses a monthly slope prior `beta0 ~ Normal(0, 0.005²)` and calibrated
+innovation slabs. This prevents a very diffuse monthly slope slab from
+artificially excluding the trend through a marginal-likelihood penalty.
+
+```python
+fit = fit_uccle_series(
+    "TXm",
+    data_dir="data",
+    priors="ssvs",
+    n_iter=20_000,
+    burn=5_000,
+)
+
+print(fit.component_probabilities())
+print(fit.component_transition_summary())
+print(fit.structural_model_probabilities().head())
+```
+
+SSVS probabilities remain sensitive to slab scales, prior model probabilities,
+and chain mixing. Multiple seeds and transition diagnostics should be used.
+For DGEV fits, selection is based on Laplace pseudo-observations and is marked
+as approximate in `fit.meta`.
+
+## Finite-period warming rates
+
+The instantaneous latent slope can remain weakly identified when both the level
+and slope receive innovations. Version 0.3.2 therefore provides summaries based
+directly on posterior changes in the fitted level:
+
+```python
+periods = {
+    "early": (1892, 1949),
+    "mid": (1950, 1979),
+    "recent": (1980, 2022),
+}
+
+print(fit.period_rate_summary(periods))
+print(
+    fit.rate_contrast_summary(
+        recent=(1980, 2022),
+        reference=(1950, 1979),
+    )
+)
+```
+
+Rates are returned in °C per decade by default. These summaries include all
+changes in the level trajectory and do not depend on whether the model assigns
+them to level or slope innovations.
+
+## Numerical covariance repair
+
+The FFBS sampler now:
+
+- uses the Joseph covariance update in the Kalman filter;
+- attempts Cholesky sampling with increasing jitter;
+- projects to the nearest numerical positive-semidefinite covariance only as a
+  final fallback;
+- never delegates an indefinite covariance to NumPy's warning-based fallback.
+
+## Install
 
 ```bash
 python -m pip install -e .
 ```
 
-Or install the built wheel:
+or install the wheel:
 
 ```bash
-python -m pip install dist/bucex-0.2.0-py3-none-any.whl
+python -m pip install bucex-0.3.3-py3-none-any.whl
 ```
 
-## Fit one series
+## Local test
+
+```bash
+python -m pytest -q
+
+python examples/fit_uccle_series.py \
+    --series TXm \
+    --data-dir data \
+    --out-dir results/local_regularized \
+    --priors regularized \
+    --n-iter 100 \
+    --burn 50
+```
+
+## HPC
+
+```bash
+qsub jobs/fit_uccle_array.pbs
+```
+
+Choose a profile at submission time:
+
+```bash
+qsub -v BUCEX_PRIORS=regularized jobs/fit_uccle_array.pbs
+qsub -v BUCEX_PRIORS=ssvs jobs/fit_uccle_array.pbs
+```
+
+Outputs are written by chain under `results/uccle_v033_<profile>/chains/`.
+
+## Poster figures
+
+```bash
+python examples/make_uccle_poster_figures.py \
+    --fit-dir results/uccle_v033_regularized/fits \
+    --out-dir results/uccle_v033_regularized/poster
+```
+
+The acceleration and period-rate panels now use finite changes in the posterior
+level trajectories rather than period averages of the instantaneous slope.
+
+
+## Laplace restoration diagnostics
+
+The DGEV Laplace update is unchanged. A restored progress line now identifies
+why all retry attempts failed, for example:
+
+```text
+[it 500/8000] ... [restored attempts=25 reasons=(support_after_state_parameters:25)] window_restored=94/100 window_failures=(support_after_state_parameters:2350)
+```
+
+The fitted object stores:
 
 ```python
-from bucex import fit_uccle_series
-
-fit = fit_uccle_series(
-    "TXx",
-    data_dir="data",
-    n_iter=20_000,
-    burn=5_000,
-    thin=1,
-    seed=40,
-)
-
-print(fit.static_summary())
+fit.meta["restored_iterations"]
+fit.meta["restored_fraction"]
+fit.meta["attempt_failure_counts"]
+fit.meta["restore_failure_counts"]
 ```
 
-The wrapper selects the Gaussian model for TXm/TNm and the DGEV model for
-TXx/TXn/TNx/TNn. Minima are negated internally and transformed back in all
-high-level output.
+Typical reason labels include `support_after_state_parameters`,
+`support_after_observation_parameters`, and staged exception labels such as
+`laplace_ffbs:LinAlgError`.
 
-## Fit all six Uccle series
+## Short parallel Uccle chains on Torque
 
-```python
-from bucex import fit_uccle_all
+The default PBS array launches three independent chains for each of six series:
 
-fits = fit_uccle_all(
-    data_dir="data",
-    n_iter=20_000,
-    burn=5_000,
-    thin=1,
-    seed=40,
-)
-
-fits.save("results/bucex_v0.2")
-print(fits.summary())
+```bash
+mkdir -p logs
+qsub jobs/fit_uccle_array.pbs
 ```
 
-## High-level plotting
+This creates 18 one-core tasks. Each chain uses 8,000 iterations and 1,500
+burn-in by default. Override these values at submission time:
 
-```python
-# One fit
-fit.plot(type="level")
-fit.plot(type="slope")
-fit.plot(type="level_slope")
-
-# All series in a manuscript-style panel
-fits.plot(type="level_slope", credible_interval=0.90)
-
-# Tail-risk plots
-fits["TXx"].plot(
-    type="return_period",
-    threshold=[36.8, 39.7],
-    annual=True,
-    max_return_period=10_000,
-)
-
-fits["TNx"].plot(
-    type="exceedance",
-    threshold=20.0,
-    annual=True,
-)
-
-fits["TXx"].plot(type="endpoint", threshold=39.7)
+```bash
+qsub -v BUCEX_N_ITER=6000,BUCEX_BURN=1000,BUCEX_PRIORS=regularized jobs/fit_uccle_array.pbs
 ```
 
-The slope plot uses degrees Celsius per decade by default (`beta * 120`) for a
-monthly model. Pass `slope_scale="raw"` for the model-scale monthly slope.
+For a targeted TNx diagnostic:
 
-## Generic high-level API
-
-```python
-from bucex import fit_bayes
-
-fit = fit_bayes(
-    y,
-    family="gev",
-    period=12,
-    dates=dates,
-    name="my_extreme_series",
-    tail="max",                 # use "min" for block minima
-    priors="manuscript",
-    n_iter=10_000,
-    burn=2_500,
-)
+```bash
+qsub -v BUCEX_SERIES=TNx,BUCEX_CHAIN_ID=4,BUCEX_N_ITER=1000,BUCEX_BURN=200 jobs/fit_uccle_single.pbs
 ```
 
-A custom model and custom prior object may still be supplied explicitly.
+After all three chains finish, pool them and write basic diagnostics:
 
-## Important inference note
+```bash
+python examples/pool_uccle_chains.py \
+    --chains-dir results/uccle_v033_regularized/chains \
+    --out-dir results/uccle_v033_regularized
+```
 
-The DGEV latent-state and regression updates use the local Laplace
-pseudo-observation approximation described in the manuscript. The observation
-parameter Metropolis-Hastings steps use the exact GEV likelihood. This is the
-same approximation structure as the manuscript code, not an exact particle-MCMC
-fit.
+The pooled files under `results/uccle_v033_regularized/fits` can then be passed
+to `examples/make_uccle_poster_figures.py`. Pooling is a convenience step, not
+a substitute for checking `diagnostics/split_rhat.csv` and
+`diagnostics/restoration_summary.csv`.

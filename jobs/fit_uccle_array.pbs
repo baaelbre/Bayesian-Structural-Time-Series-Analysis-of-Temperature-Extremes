@@ -1,89 +1,96 @@
 #!/usr/bin/env bash
 #
-# PBS array job for the six Uccle series.
+# Three independent chains for each of the six Uccle series.
+# The 18 array tasks are ordered as:
+#   0-5   chain 1: TXm TNm TXx TXn TNx TNn
+#   6-11  chain 2: TXm TNm TXx TXn TNx TNn
+#   12-17 chain 3: TXm TNm TXx TXn TNx TNn
 #
 # Submit from the repository root:
-#
 #   mkdir -p logs
 #   qsub jobs/fit_uccle_array.pbs
 #
-# Series mapping:
-#   0 = TXm
-#   1 = TNm
-#   2 = TXx
-#   3 = TXn
-#   4 = TNx
-#   5 = TNn
+# Defaults are deliberately shorter than the old single 20,000-iteration run:
+#   3 chains x (8,000 iterations, 1,500 burn-in)
+# Override at submission time, for example:
+#   qsub -v BUCEX_N_ITER=6000,BUCEX_BURN=1000 jobs/fit_uccle_array.pbs
 #
-# Some older PBS/Torque installations use:
-#
-#   #PBS -t 0-5
-#
-# instead of:
-#
-#   #PBS -J 0-5
-#
+# The Torque resource syntax below matches the VSC cluster used for the Uccle runs.
 
-#PBS -N bucex_uccle
-#PBS -J 0-5
-#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -N bucex_v033
+#PBS -t 0-17
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=8gb
 #PBS -l walltime=12:00:00
 #PBS -j oe
 
 set -euo pipefail
 
 TASK_ID="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-}}"
-
 if [[ -z "${TASK_ID}" ]]; then
     echo "No PBS array index was found." >&2
     exit 2
 fi
 
 SERIES=(TXm TNm TXx TXn TNx TNn)
+N_SERIES=${#SERIES[@]}
+N_CHAINS=3
+MAX_TASKS=$((N_SERIES * N_CHAINS))
 
-if (( TASK_ID < 0 || TASK_ID >= ${#SERIES[@]} )); then
+if (( TASK_ID < 0 || TASK_ID >= MAX_TASKS )); then
     echo "Invalid PBS array index: ${TASK_ID}" >&2
     exit 2
 fi
 
-NAME="${SERIES[$TASK_ID]}"
-SEED=$((40 + TASK_ID))
+SERIES_INDEX=$((TASK_ID % N_SERIES))
+CHAIN_ID=$((TASK_ID / N_SERIES + 1))
+NAME="${SERIES[$SERIES_INDEX]}"
+SEED_BASE="${BUCEX_SEED_BASE:-40}"
+SEED=$((SEED_BASE + SERIES_INDEX + 100 * (CHAIN_ID - 1)))
+N_ITER="${BUCEX_N_ITER:-8000}"
+BURN="${BUCEX_BURN:-1500}"
+THIN="${BUCEX_THIN:-1}"
+PRIORS="${BUCEX_PRIORS:-regularized}"
 
 REPO_DIR="${BUCEX_REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}"
 cd "${REPO_DIR}"
-
 mkdir -p logs
 
 SAFE_JOB_ID="${PBS_JOBID//[^[:alnum:]_.-]/_}"
-LOG_FILE="logs/uccle_${SAFE_JOB_ID}_${TASK_ID}_${NAME}.log"
+LOG_FILE="logs/uccle_${SAFE_JOB_ID}_task${TASK_ID}_${NAME}_chain${CHAIN_ID}.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "============================================================"
 echo "PBS job ID:       ${PBS_JOBID:-unknown}"
-echo "PBS array index:  ${TASK_ID}"
+echo "PBS task:         ${TASK_ID}"
 echo "Series:           ${NAME}"
+echo "Chain:            ${CHAIN_ID}/${N_CHAINS}"
 echo "Seed:             ${SEED}"
+echo "Iterations:       ${N_ITER}"
+echo "Burn-in:          ${BURN}"
+echo "Priors:           ${PRIORS}"
 echo "Host:             $(hostname)"
 echo "Working dir:      ${REPO_DIR}"
 echo "Started:          $(date --iso-8601=seconds 2>/dev/null || date)"
 echo "============================================================"
 
-# Adapt this module name to your HPC if needed, for example:
-#   export BUCEX_PYTHON_MODULE="Python/3.11.3-GCCcore-12.3.0"
 if type module >/dev/null 2>&1; then
     module purge
     module load "${BUCEX_PYTHON_MODULE:-Python}"
 fi
 
+OUT_ROOT="${BUCEX_OUT_ROOT:-${REPO_DIR}/results/uccle_v033_${PRIORS}}"
 export BUCEX_REPO_DIR="${REPO_DIR}"
 export BUCEX_DATA_DIR="${BUCEX_DATA_DIR:-${REPO_DIR}/data}"
-export BUCEX_OUT_DIR="${BUCEX_OUT_DIR:-${REPO_DIR}/results/uccle_v02}"
+export BUCEX_OUT_DIR="${OUT_ROOT}/chains/chain_${CHAIN_ID}"
 export BUCEX_VENV="${BUCEX_VENV:-${REPO_DIR}/.venv}"
+export BUCEX_CHAIN_ID="${CHAIN_ID}"
+export BUCEX_MAX_STATE_TRIES="${BUCEX_MAX_STATE_TRIES:-25}"
 
 bash jobs/run_uccle_series.sh \
     "${NAME}" \
     "${SEED}" \
-    20000 \
-    5000 \
-    1 \
-    manuscript
+    "${N_ITER}" \
+    "${BURN}" \
+    "${THIN}" \
+    "${PRIORS}"

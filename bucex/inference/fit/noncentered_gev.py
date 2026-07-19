@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -12,6 +13,7 @@ from .noncentered_utils import (
     NCPLayout,
     build_ncp_system,
     canonicalize_ncp_params,
+    design_matrix_ncp,
     ffbs_gaussian_1d_tvR,
     gev_theta_update,
     infer_ncp_layout,
@@ -22,11 +24,30 @@ from .noncentered_utils import (
     ncp_particle_state_sample,
     random_sign_switches,
     update_lasso_scales,
+    apply_theta_draw,
+    copy_lasso_lambda2,
+)
+from .model_space import (
+    enumerate_structural_models,
+    initial_structural_state,
+    sample_structural_regression,
 )
 from .priors import NonCenteredGEVPriors, NormalPrior, UniformPrior
 
 Array = np.ndarray
 ParamDict = Dict[str, Any]
+
+
+def _compact_counter(counter: Counter[str], *, limit: int = 6) -> str:
+    """Format failure counts for one-line MCMC progress messages."""
+    if not counter:
+        return "none"
+    items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    shown = items[: max(1, int(limit))]
+    text = ",".join(f"{key}:{value}" for key, value in shown)
+    if len(items) > len(shown):
+        text += f",other:{sum(value for _, value in items[len(shown):])}"
+    return text
 
 
 def _as_1d_y(y: Array) -> Array:
@@ -203,6 +224,13 @@ class NonCenteredGEVGibbs:
         if "sigma" not in params_obs or "xi" not in params_obs:
             raise KeyError("init_params_obs must contain both 'sigma' and 'xi'.")
         tau, lambda2 = initialise_lasso(self.priors, self.layout)
+        model_state = initial_structural_state(params_state, self.layout)
+        model_candidates = enumerate_structural_models(self.layout)
+        model_index = (
+            model_candidates.index(model_state)
+            if self.priors.ssvs is not None
+            else -1
+        )
 
         z_path = np.zeros((Tn + 1, self.layout.ncp_state_dim))
         if not _gev_support_ok(y1, mu_from_ncp(z_path, params_state, self.layout), self.model, params_obs):
@@ -234,29 +262,52 @@ class NonCenteredGEVGibbs:
                 q_season=np.zeros(n_keep),
             )
         if self.priors.lasso is not None:
-            draws_static["lambda2"] = np.zeros(n_keep)
+            if isinstance(lambda2, dict):
+                for block in tau:
+                    draws_static[f"lambda2_{block}"] = np.zeros(n_keep)
+            else:
+                draws_static["lambda2"] = np.zeros(n_keep)
             for block in tau:
                 draws_static[f"tau_{block}"] = np.zeros(n_keep)
+        if self.priors.ssvs is not None:
+            draws_static["state_level"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["state_trend"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["state_season"] = np.zeros(n_keep, dtype=np.int8)
+            draws_static["model_index"] = np.zeros(n_keep, dtype=np.int16)
 
         logpost = np.full(n_keep, np.nan)
         G, Q = build_ncp_system(self.layout)
         accept_sigma = accept_xi = 0
         keep_idx = 0
         progress_every = self.config.progress_every or max(1, n_iter // 50)
+        restored_iterations = 0
+        attempt_failure_totals: Counter[str] = Counter()
+        restore_failure_totals: Counter[str] = Counter()
+        window_attempt_failures: Counter[str] = Counter()
+        window_restored = 0
+        window_iterations = 0
         max_state_tries = int(state_kwargs.get("max_state_tries", 25))
         lasso_var = (
             self.priors.lasso.variance_scale(None) if self.priors.lasso is not None else 1.0
         )
 
         for it in range(n_iter):
-            last_good = (z_path.copy(), dict(params_state), dict(params_obs), dict(tau), float(lambda2))
+            window_iterations += 1
+            last_good = (
+                z_path.copy(), dict(params_state), dict(params_obs), dict(tau),
+                copy_lasso_lambda2(lambda2), model_state, int(model_index)
+            )
             iteration_ok = False
+            iteration_failures: Counter[str] = Counter()
+            last_failure_detail = ""
 
-            for _ in range(max_state_tries):
+            for attempt in range(max_state_tries):
                 work_state = dict(params_state)
                 work_obs = dict(params_obs)
+                stage = "state_update"
                 try:
                     if state_method == "laplace":
+                        stage = "laplace_pseudo_observations"
                         mu_cur = mu_from_ncp(z_path, work_state, self.layout)
                         z_star, R_t = _laplace_pseudo_mu(
                             y1,
@@ -268,6 +319,7 @@ class NonCenteredGEVGibbs:
                         )
                         from .noncentered_utils import baseline_mu_path
 
+                        stage = "laplace_ffbs"
                         offset = baseline_mu_path(Tn, work_state, self.layout)
                         cand_z = ffbs_gaussian_1d_tvR(
                             y=z_star - offset,
@@ -281,6 +333,7 @@ class NonCenteredGEVGibbs:
                             rng=self.rng,
                         )
                     elif state_method == "particle":
+                        stage = "particle_state_update"
                         particle_method = str(state_kwargs.get("particle_method", "bootstrap"))
                         n_particles = int(state_kwargs.get("particle_n_particles", 1000))
                         particle_config = state_kwargs.get("particle_config") or ParticleConfig(
@@ -303,26 +356,56 @@ class NonCenteredGEVGibbs:
                     else:
                         raise ValueError("state_method must be 'laplace' or 'particle'.")
 
+                    stage = "structural_parameter_update"
                     cand_state = dict(work_state)
-                    cand_state.update(
-                        gev_theta_update(
-                            z_pseudo=z_star,
-                            R_t=R_t,
-                            z_path=cand_z,
+                    cand_model_state = model_state
+                    cand_model_index = -1
+                    if self.priors.ssvs is not None:
+                        X, theta_names, tbar = design_matrix_ncp(
+                            cand_z, self.layout, center_time=True
+                        )
+                        selection = sample_structural_regression(
+                            y=z_star,
+                            X=X,
+                            theta_names=theta_names,
+                            tbar=tbar,
+                            noise_variance=R_t,
                             priors=self.priors,
                             layout=self.layout,
                             rng=self.rng,
-                            tau=tau or None,
-                            lasso_variance_scale=lasso_var,
+                            apply_theta_draw=apply_theta_draw,
                         )
-                    )
+                        cand_state.update(selection.params_state)
+                        cand_model_state = selection.state
+                        cand_model_index = selection.selected_index
+                    else:
+                        cand_state.update(
+                            gev_theta_update(
+                                z_pseudo=z_star,
+                                R_t=R_t,
+                                z_path=cand_z,
+                                priors=self.priors,
+                                layout=self.layout,
+                                rng=self.rng,
+                                tau=tau or None,
+                                lasso_variance_scale=lasso_var,
+                            )
+                        )
+                    stage = "sign_switch"
                     cand_z, cand_state = random_sign_switches(
                         cand_z, cand_state, self.layout, self.rng
                     )
+                    stage = "support_after_state_parameters"
                     mu_exact = mu_from_ncp(cand_z, cand_state, self.layout)
                     if not _gev_support_ok(y1, mu_exact, self.model, work_obs):
+                        reason = "support_after_state_parameters"
+                        iteration_failures[reason] += 1
+                        attempt_failure_totals[reason] += 1
+                        window_attempt_failures[reason] += 1
+                        last_failure_detail = f"attempt={attempt + 1}:{reason}"
                         continue
 
+                    stage = "shrinkage_update"
                     cand_tau, cand_lambda2 = tau, lambda2
                     if self.priors.lasso is not None:
                         cand_tau, cand_lambda2 = update_lasso_scales(
@@ -335,22 +418,46 @@ class NonCenteredGEVGibbs:
                             rng=self.rng,
                         )
 
+                    stage = "observation_parameter_update"
                     cand_obs, acc_s = self._mh_update_log_sigma(y1, mu_exact, work_obs)
                     cand_obs, acc_x = self._mh_update_xi(y1, mu_exact, cand_obs)
+                    stage = "support_after_observation_parameters"
                     if not _gev_support_ok(y1, mu_exact, self.model, cand_obs):
+                        reason = "support_after_observation_parameters"
+                        iteration_failures[reason] += 1
+                        attempt_failure_totals[reason] += 1
+                        window_attempt_failures[reason] += 1
+                        last_failure_detail = f"attempt={attempt + 1}:{reason}"
                         continue
 
                     z_path, params_state, params_obs = cand_z, cand_state, cand_obs
-                    tau, lambda2 = dict(cand_tau), float(cand_lambda2)
+                    tau, lambda2 = dict(cand_tau), copy_lasso_lambda2(cand_lambda2)
+                    model_state, model_index = cand_model_state, int(cand_model_index)
                     accept_sigma += int(acc_s)
                     accept_xi += int(acc_x)
                     iteration_ok = True
                     break
-                except (FloatingPointError, ValueError, np.linalg.LinAlgError):
+                except (FloatingPointError, ValueError, np.linalg.LinAlgError) as exc:
+                    reason = f"{stage}:{type(exc).__name__}"
+                    iteration_failures[reason] += 1
+                    attempt_failure_totals[reason] += 1
+                    window_attempt_failures[reason] += 1
+                    detail = str(exc).replace("\n", " ").strip()
+                    if len(detail) > 140:
+                        detail = detail[:137] + "..."
+                    last_failure_detail = f"attempt={attempt + 1}:{reason}"
+                    if detail:
+                        last_failure_detail += f":{detail}"
                     continue
 
             if not iteration_ok:
-                z_path, params_state, params_obs, tau, lambda2 = last_good
+                (
+                    z_path, params_state, params_obs, tau, lambda2,
+                    model_state, model_index
+                ) = last_good
+                restored_iterations += 1
+                window_restored += 1
+                restore_failure_totals.update(iteration_failures)
 
             mu_exact = mu_from_ncp(z_path, params_state, self.layout)
             cur_ll = _exact_gev_loglik(y1, mu_exact, self.model, params_obs)
@@ -366,10 +473,35 @@ class NonCenteredGEVGibbs:
                 if self.layout.season_dim > 0:
                     msg += f" Q_season={params_state['q_season']:.3g}"
                 if self.priors.lasso is not None:
-                    msg += f" lambda2={lambda2:.3g}"
+                    if isinstance(lambda2, dict):
+                        compact = ",".join(
+                            f"{key[0]}:{value:.2g}" for key, value in lambda2.items()
+                        )
+                        msg += f" lambda2=({compact})"
+                    else:
+                        msg += f" lambda2={lambda2:.3g}"
+                if self.priors.ssvs is not None:
+                    msg += (
+                        f" structure=({model_state.level.label},"
+                        f"{model_state.trend.label},{model_state.season.label})"
+                    )
                 if not iteration_ok:
-                    msg += " [restored]"
-                print(msg)
+                    msg += (
+                        f" [restored attempts={sum(iteration_failures.values())}"
+                        f" reasons=({_compact_counter(iteration_failures)})"
+                    )
+                    if last_failure_detail:
+                        msg += f" last={last_failure_detail}"
+                    msg += "]"
+                if window_restored or window_attempt_failures:
+                    msg += (
+                        f" window_restored={window_restored}/{window_iterations}"
+                        f" window_failures=({_compact_counter(window_attempt_failures)})"
+                    )
+                print(msg, flush=True)
+                window_restored = 0
+                window_iterations = 0
+                window_attempt_failures.clear()
 
             if it in save_set:
                 draws_states[keep_idx] = x_path
@@ -387,9 +519,18 @@ class NonCenteredGEVGibbs:
                     for key in ("s_season", "q_season"):
                         draws_static[key][keep_idx] = float(params_state[key])
                 if self.priors.lasso is not None:
-                    draws_static["lambda2"][keep_idx] = float(lambda2)
+                    if isinstance(lambda2, dict):
+                        for block, value in lambda2.items():
+                            draws_static[f"lambda2_{block}"][keep_idx] = float(value)
+                    else:
+                        draws_static["lambda2"][keep_idx] = float(lambda2)
                     for block, value in tau.items():
                         draws_static[f"tau_{block}"][keep_idx] = float(value)
+                if self.priors.ssvs is not None:
+                    draws_static["state_level"][keep_idx] = int(model_state.level)
+                    draws_static["state_trend"][keep_idx] = int(model_state.trend)
+                    draws_static["state_season"][keep_idx] = int(model_state.season)
+                    draws_static["model_index"][keep_idx] = int(model_index)
                 logpost[keep_idx] = cur_ll
                 keep_idx += 1
 
@@ -402,7 +543,15 @@ class NonCenteredGEVGibbs:
                 "xi_mh": accept_xi / max(n_iter, 1),
             },
             meta={
-                "sampler": "noncentered_gev_laplace_lasso_gibbs",
+                "sampler": (
+                    "noncentered_gev_laplace_ssvs_gibbs"
+                    if self.priors.ssvs is not None
+                    else (
+                        "noncentered_gev_laplace_lasso_gibbs"
+                        if self.priors.lasso is not None
+                        else "noncentered_gev_laplace_normal_gibbs"
+                    )
+                ),
                 "parameterization": "noncentered",
                 "n_iter": n_iter,
                 "burn": burn,
@@ -414,5 +563,21 @@ class NonCenteredGEVGibbs:
                 "step_log_sigma": self.step_log_sigma,
                 "step_xi": self.step_xi,
                 "bayesian_lasso": self.priors.lasso is not None,
+                "componentwise_lasso": bool(
+                    self.priors.lasso is not None
+                    and getattr(self.priors.lasso, "componentwise", False)
+                ),
+                "structural_ssvs": self.priors.ssvs is not None,
+                "model_selection_exact": False,
+                "model_selection_basis": (
+                    "laplace_pseudo_observations"
+                    if self.priors.ssvs is not None
+                    else None
+                ),
+                "restored_iterations": int(restored_iterations),
+                "restored_fraction": float(restored_iterations / max(n_iter, 1)),
+                "attempt_failure_counts": dict(attempt_failure_totals),
+                "restore_failure_counts": dict(restore_failure_totals),
+                "max_state_tries": int(max_state_tries),
             },
         )

@@ -3,8 +3,11 @@ from .centered_gaussian import CenteredGaussianGibbs
 from .centered_gev import CenteredGEVGibbs
 from .noncentered_gaussian import NonCenteredGaussianGibbs
 from .noncentered_gev import NonCenteredGEVGibbs
+from .model_space import ComponentState, StructuralModelState
 from .priors import (
     BayesianLassoPrior,
+    ComponentwiseBayesianLassoPrior,
+    SSVSPrior,
     CenteredGaussianPriors,
     CenteredGEVPriors,
     DiagonalNormalPrior,
@@ -17,6 +20,12 @@ from .priors import (
     UniformPrior,
     manuscript_gaussian_priors,
     manuscript_gev_priors,
+    normal_gaussian_priors,
+    normal_gev_priors,
+    regularized_gaussian_priors,
+    regularized_gev_priors,
+    ssvs_gaussian_priors,
+    ssvs_gev_priors,
 )
 
 __all__ = [
@@ -32,6 +41,10 @@ __all__ = [
     "NormalPrior",
     "DiagonalNormalPrior",
     "BayesianLassoPrior",
+    "ComponentwiseBayesianLassoPrior",
+    "SSVSPrior",
+    "ComponentState",
+    "StructuralModelState",
     "InitialStatePriors",
     "CenteredGaussianPriors",
     "CenteredGEVPriors",
@@ -39,4 +52,10 @@ __all__ = [
     "NonCenteredGEVPriors",
     "manuscript_gaussian_priors",
     "manuscript_gev_priors",
+    "normal_gaussian_priors",
+    "normal_gev_priors",
+    "regularized_gaussian_priors",
+    "regularized_gev_priors",
+    "ssvs_gaussian_priors",
+    "ssvs_gev_priors",
 ]

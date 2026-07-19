@@ -17,6 +17,12 @@ from ..inference.fit.priors import (
     NonCenteredGEVPriors,
     manuscript_gaussian_priors,
     manuscript_gev_priors,
+    normal_gaussian_priors,
+    normal_gev_priors,
+    regularized_gaussian_priors,
+    regularized_gev_priors,
+    ssvs_gaussian_priors,
+    ssvs_gev_priors,
 )
 from ..models.base import StateSpaceModel
 from ..models.structural import StructuralModel
@@ -181,7 +187,7 @@ def fit_bayes(
 ) -> PosteriorBundle:
     """Fit a Bayesian structural Gaussian or DGEV model.
 
-    This is the v0.2 high-level API. A complete manuscript-style fit can be
+    This is the v0.3.3 high-level API. A complete manuscript-style fit can be
     requested without manually constructing priors or initial values::
 
         fit = fit_bayes(y, family="gev", dates=dates, name="TXx")
@@ -190,7 +196,7 @@ def fit_bayes(
     and all high-level plots and risk calculations are transformed back.
     """
     if method != "gibbs":
-        raise NotImplementedError("v0.2 exposes Gibbs / MH-within-Gibbs fitting.")
+        raise NotImplementedError("v0.3.3 exposes Gibbs / MH-within-Gibbs fitting.")
 
     if tail is not None:
         if tail.lower() in {"min", "minimum", "lower"}:
@@ -215,7 +221,7 @@ def fit_bayes(
 
     y_original = np.asarray(y, dtype=float).reshape(-1)
     if not np.all(np.isfinite(y_original)):
-        raise ValueError("y must contain only finite observations in v0.2.")
+        raise ValueError("y must contain only finite observations in v0.3.3.")
     y_model = float(transform_sign) * y_original
 
     if config is None:
@@ -233,15 +239,29 @@ def fit_bayes(
     if config.thin < 1:
         raise ValueError("thin must be >= 1.")
 
-    built_in_priors = priors is None or priors == "manuscript"
+    prior_profile = "manuscript" if priors is None else priors
+    built_in_priors = isinstance(prior_profile, str)
     if built_in_priors:
-        priors = (
-            manuscript_gaussian_priors(period)
-            if obs_name == "gaussian"
-            else manuscript_gev_priors(period)
-        )
-    elif isinstance(priors, str):
-        raise ValueError("The only built-in prior profile is 'manuscript'.")
+        profile = str(prior_profile).lower().replace("-", "_")
+        builders = {
+            ("gaussian", "manuscript"): manuscript_gaussian_priors,
+            ("gev", "manuscript"): manuscript_gev_priors,
+            ("gaussian", "normal"): normal_gaussian_priors,
+            ("gev", "normal"): normal_gev_priors,
+            ("gaussian", "regularized"): regularized_gaussian_priors,
+            ("gev", "regularized"): regularized_gev_priors,
+            ("gaussian", "ssvs"): ssvs_gaussian_priors,
+            ("gev", "ssvs"): ssvs_gev_priors,
+        }
+        key = (obs_name, profile)
+        if key not in builders:
+            raise ValueError(
+                "Built-in prior profiles are 'manuscript', 'normal', 'regularized', and 'ssvs'."
+            )
+        priors = builders[key](period)
+        prior_profile = profile
+    else:
+        prior_profile = "custom"
 
     auto_state, auto_obs = _default_initial_values(y_model, model, period=period)
     if init_params_state is not None:
@@ -298,8 +318,8 @@ def fit_bayes(
             "family": obs_name,
             "series_name": name,
             "transform_sign": float(transform_sign),
-            "prior_profile": "manuscript" if built_in_priors else "custom",
-            "bucex_version": "0.2.0",
+            "prior_profile": str(prior_profile),
+            "bucex_version": "0.3.3",
         }
     )
     return fit

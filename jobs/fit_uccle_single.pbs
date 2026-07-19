@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# Targeted single-series run, useful for diagnosing or rerunning TNx.
+# Example:
+#   qsub -v BUCEX_SERIES=TNx,BUCEX_CHAIN_ID=4,BUCEX_N_ITER=1000,BUCEX_BURN=200 jobs/fit_uccle_single.pbs
+
+#PBS -N bucex_one
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=8gb
+#PBS -l walltime=12:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+SERIES="${BUCEX_SERIES:-TNx}"
+CHAIN_ID="${BUCEX_CHAIN_ID:-1}"
+N_ITER="${BUCEX_N_ITER:-8000}"
+BURN="${BUCEX_BURN:-1500}"
+THIN="${BUCEX_THIN:-1}"
+PRIORS="${BUCEX_PRIORS:-regularized}"
+SEED="${BUCEX_SEED:-$((40 + 100 * (CHAIN_ID - 1)))}"
+
+REPO_DIR="${BUCEX_REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}"
+cd "${REPO_DIR}"
+mkdir -p logs
+
+SAFE_JOB_ID="${PBS_JOBID//[^[:alnum:]_.-]/_}"
+LOG_FILE="logs/uccle_${SAFE_JOB_ID}_${SERIES}_chain${CHAIN_ID}.log"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+
+if type module >/dev/null 2>&1; then
+    module purge
+    module load "${BUCEX_PYTHON_MODULE:-Python}"
+fi
+
+OUT_ROOT="${BUCEX_OUT_ROOT:-${REPO_DIR}/results/uccle_v033_${PRIORS}}"
+export BUCEX_REPO_DIR="${REPO_DIR}"
+export BUCEX_DATA_DIR="${BUCEX_DATA_DIR:-${REPO_DIR}/data}"
+export BUCEX_OUT_DIR="${OUT_ROOT}/chains/chain_${CHAIN_ID}"
+export BUCEX_VENV="${BUCEX_VENV:-${REPO_DIR}/.venv}"
+export BUCEX_CHAIN_ID="${CHAIN_ID}"
+export BUCEX_MAX_STATE_TRIES="${BUCEX_MAX_STATE_TRIES:-25}"
+
+bash jobs/run_uccle_series.sh \
+    "${SERIES}" "${SEED}" "${N_ITER}" "${BURN}" "${THIN}" "${PRIORS}"

@@ -7,6 +7,7 @@ from typing import Any, Iterable, Iterator, Mapping, Optional
 import numpy as np
 import pandas as pd
 
+from ..__about__ import __version__
 from ..api.fit import fit_bayes
 from ..core.results import PosteriorBundle
 from ..inference.fit.base import GibbsConfig
@@ -104,7 +105,7 @@ class UccleFitCollection:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         for name, fit in self.fits.items():
-            fit.save(directory / f"{name}_bucex_v0.2.pkl")
+            fit.save(directory / f"{name}_bucex_v{__version__}.pkl")
 
     def summary(self) -> pd.DataFrame:
         rows = []

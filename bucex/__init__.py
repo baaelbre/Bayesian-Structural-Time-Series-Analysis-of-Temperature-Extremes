@@ -1,7 +1,7 @@
 """bucex: Bayesian unobserved components for extremes.
 
-v0.2 adds manuscript-faithful non-centred Bayesian-lasso fitting, complete fit
-objects, Uccle wrappers, and a high-level plotting/risk API.
+v0.3.3 adds transparent Laplace restoration diagnostics and
+short multi-chain HPC workflows while preserving the v0.3.2 samplers.
 """
 from __future__ import annotations
 
@@ -18,6 +18,10 @@ from .datasets import (
 )
 from .inference.fit import (
     BayesianLassoPrior,
+    ComponentwiseBayesianLassoPrior,
+    SSVSPrior,
+    ComponentState,
+    StructuralModelState,
     DiagonalNormalPrior,
     GammaPrior,
     GibbsConfig,
@@ -28,6 +32,12 @@ from .inference.fit import (
     UniformPrior,
     manuscript_gaussian_priors,
     manuscript_gev_priors,
+    normal_gaussian_priors,
+    normal_gev_priors,
+    regularized_gaussian_priors,
+    regularized_gev_priors,
+    ssvs_gaussian_priors,
+    ssvs_gev_priors,
 )
 from .models.structural import StructuralModel, StructuralSSM
 from .observation.gaussian import GaussianObs
@@ -51,10 +61,20 @@ __all__ = [
     "NormalPrior",
     "DiagonalNormalPrior",
     "BayesianLassoPrior",
+    "ComponentwiseBayesianLassoPrior",
+    "SSVSPrior",
+    "ComponentState",
+    "StructuralModelState",
     "NonCenteredGaussianPriors",
     "NonCenteredGEVPriors",
     "manuscript_gaussian_priors",
     "manuscript_gev_priors",
+    "normal_gaussian_priors",
+    "normal_gev_priors",
+    "regularized_gaussian_priors",
+    "regularized_gev_priors",
+    "ssvs_gaussian_priors",
+    "ssvs_gev_priors",
     "fit_bayes",
     "fit_gaussian_structural",
     "fit_gev_structural",

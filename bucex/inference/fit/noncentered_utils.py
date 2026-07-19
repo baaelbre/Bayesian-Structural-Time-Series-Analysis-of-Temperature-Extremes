@@ -40,6 +40,25 @@ def _symmetrize(A: Array) -> Array:
     return 0.5 * (A + A.T)
 
 
+def _project_psd(A: Array, floor: float = 1e-12) -> Array:
+    """Return a symmetric positive-semidefinite numerical projection.
+
+    Kalman and smoothing covariance updates can acquire tiny negative
+    eigenvalues from floating-point cancellation. We repair only the numerical
+    part: eigenvalues below a scale-aware floor are clipped before sampling.
+    """
+
+    A = _symmetrize(np.asarray(A, dtype=float))
+    if A.size == 0:
+        return A
+    values, vectors = np.linalg.eigh(A)
+    scale = max(1.0, float(np.max(np.abs(values))))
+    min_value = max(float(floor), 100.0 * np.finfo(float).eps * scale)
+    values = np.maximum(values, min_value)
+    out = (vectors * values) @ vectors.T
+    return _symmetrize(out)
+
+
 def spd_solve(A: Array, B: Array, jitter: float = 1e-12) -> Array:
     A = _symmetrize(np.asarray(A, dtype=float))
     B = np.asarray(B, dtype=float)
@@ -52,19 +71,38 @@ def spd_solve(A: Array, B: Array, jitter: float = 1e-12) -> Array:
             return np.linalg.solve(L.T, Y)
         except np.linalg.LinAlgError:
             continue
-    return np.linalg.solve(A + 1e-8 * eye, B)
+    repaired = _project_psd(A, floor=max(jitter, 1e-12))
+    L = np.linalg.cholesky(repaired)
+    Y = np.linalg.solve(L, B)
+    return np.linalg.solve(L.T, Y)
 
 
-def _sample_gaussian(mean: Array, cov: Array, rng: np.random.Generator, jitter: float = 1e-12) -> Array:
+def _sample_gaussian(
+    mean: Array,
+    cov: Array,
+    rng: np.random.Generator,
+    jitter: float = 1e-12,
+) -> Array:
+    """Sample from a Gaussian after deterministic PSD repair.
+
+    This avoids NumPy's warning-based fallback, which can silently alter an
+    indefinite covariance matrix.
+    """
+
     mean = np.asarray(mean, dtype=float)
-    cov = _symmetrize(np.asarray(cov, dtype=float))
-    d = mean.size
-    for k in range(8):
+    covariance = _symmetrize(np.asarray(cov, dtype=float))
+    eye = np.eye(mean.size)
+    for power in range(8):
         try:
-            return rng.multivariate_normal(mean, cov + (10.0**k) * jitter * np.eye(d), check_valid="raise")
-        except Exception:
+            L = np.linalg.cholesky(
+                covariance + (10.0**power) * max(jitter, 1e-12) * eye
+            )
+            return mean + L @ rng.normal(size=mean.size)
+        except np.linalg.LinAlgError:
             continue
-    return rng.multivariate_normal(mean, cov + 1e-8 * np.eye(d))
+    repaired = _project_psd(covariance, floor=max(jitter, 1e-12))
+    L = np.linalg.cholesky(repaired)
+    return mean + L @ rng.normal(size=mean.size)
 
 
 def _weighted_mean_cov(x: Array, w: Array) -> Tuple[Array, Array]:
@@ -428,7 +466,10 @@ def ffbs_gaussian_1d(
         K = (Rm[t] @ H.T) / F
         v = float(y[t - 1] - (H @ a[t]).item())
         m[t] = a[t] + K[:, 0] * v
-        C[t] = _symmetrize(Rm[t] - K @ (H @ Rm[t])) + jitter * np.eye(d)
+        I_KH = np.eye(d) - K @ H
+        C[t] = _symmetrize(
+            I_KH @ Rm[t] @ I_KH.T + float(R) * (K @ K.T)
+        ) + jitter * np.eye(d)
 
     z = np.zeros((Tn + 1, d), dtype=float)
     z[Tn] = _sample_gaussian(m[Tn], C[Tn], rng, jitter=jitter)
@@ -490,7 +531,10 @@ def ffbs_gaussian_1d_tvR(
         K = (Rm[t] @ H.T) / F
         v = float(y[t - 1] - (H @ a[t]).item())
         m[t] = a[t] + K[:, 0] * v
-        C[t] = _symmetrize(Rm[t] - K @ (H @ Rm[t])) + jitter * np.eye(d)
+        I_KH = np.eye(d) - K @ H
+        C[t] = _symmetrize(
+            I_KH @ Rm[t] @ I_KH.T + Robs * (K @ K.T)
+        ) + jitter * np.eye(d)
 
     z = np.zeros((Tn + 1, d), dtype=float)
     z[Tn] = _sample_gaussian(m[Tn], C[Tn], rng, jitter=jitter)
@@ -595,13 +639,27 @@ def _active_scale_names(layout: NCPLayout) -> list[str]:
     return names
 
 
-def initialise_lasso(priors: Any, layout: NCPLayout) -> tuple[dict[str, float], float]:
-    """Initialise local ``tau`` scales and global ``lambda2``."""
+def initialise_lasso(priors: Any, layout: NCPLayout) -> tuple[dict[str, float], Any]:
+    """Initialise local scales and global or component-wise shrinkage."""
     if getattr(priors, "lasso", None) is None:
         return {}, np.nan
     lp = priors.lasso
-    tau = {name: float(lp.initial_tau) for name in _active_scale_names(layout)}
+    names = _active_scale_names(layout)
+    if bool(getattr(lp, "componentwise", False)):
+        tau = {name: float(lp.initial_tau_for(name)) for name in names}
+        lambda2 = {name: float(lp.initial_lambda2_for(name)) for name in names}
+        return tau, lambda2
+    tau = {name: float(lp.initial_tau) for name in names}
     return tau, float(lp.initial_lambda2)
+
+
+def copy_lasso_lambda2(lambda2: Any) -> Any:
+    return dict(lambda2) if isinstance(lambda2, dict) else float(lambda2)
+
+
+def lasso_coefficient_scale(lp: Any, component: str) -> float:
+    method = getattr(lp, "coefficient_scale_for", None)
+    return float(method(component)) if callable(method) else 1.0
 
 
 def _rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
@@ -621,44 +679,57 @@ def _rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
 def update_lasso_scales(
     params_state: ParamDict,
     tau: dict[str, float],
-    lambda2: float,
+    lambda2: Any,
     priors: Any,
     layout: NCPLayout,
     *,
     variance_scale: float,
     rng: np.random.Generator,
-) -> tuple[dict[str, float], float]:
-    """Park-Casella local- and global-scale Gibbs update."""
+) -> tuple[dict[str, float], Any]:
+    """Park-Casella local-scale update with optional component-wise lambdas."""
     lp = getattr(priors, "lasso", None)
     if lp is None:
         return tau, lambda2
 
-    lam2 = max(float(lambda2), 1e-12)
     sig2 = max(float(variance_scale), 1e-12)
     out: dict[str, float] = {}
     key_map = {"level": "s_level", "trend": "s_trend", "season": "s_season"}
-    for name in _active_scale_names(layout):
+    names = _active_scale_names(layout)
+    componentwise = bool(getattr(lp, "componentwise", False))
+
+    for name in names:
+        lam2 = max(
+            float(lambda2[name]) if componentwise else float(lambda2),
+            1e-12,
+        )
+        coefficient_scale = max(lasso_coefficient_scale(lp, name), 1e-16)
         sk = float(params_state.get(key_map[name], 0.0))
-        s2 = sk * sk
-        if s2 < 1e-16:
-            # The exact conditional degenerates toward very large means. A safe
-            # finite draw keeps the chain mobile without changing the limiting
-            # shrinkage behaviour.
-            out[name] = max(float(tau.get(name, lp.initial_tau)), 1e-8)
+        standardized_s2 = (sk / coefficient_scale) ** 2
+        if standardized_s2 < 1e-16:
+            if componentwise:
+                initial_tau = float(lp.initial_tau_for(name))
+            else:
+                initial_tau = float(lp.initial_tau)
+            out[name] = max(float(tau.get(name, initial_tau)), 1e-8)
         else:
-            # Under the Park-Casella mixture, u_k = 1 / tau_k has an
-            # inverse-Gaussian full conditional. Draw u_k and invert it; using
-            # the inverse-Gaussian draw directly as tau_k is a common but
-            # consequential implementation error.
-            mu_u = np.sqrt(lam2 * sig2 / s2)
+            mu_u = np.sqrt(lam2 * sig2 / standardized_s2)
             u_k = _rand_invgauss(mu_u, lam2, rng)
             out[name] = float(np.clip(1.0 / u_k, 1e-12, 1e12))
+
+    if componentwise:
+        new_lambda2 = {}
+        for name in names:
+            shape = float(lp.a_for(name) + 1.0)
+            rate = float(lp.b_for(name) + 0.5 * out[name])
+            new_lambda2[name] = float(
+                rng.gamma(shape=shape, scale=1.0 / max(rate, 1e-12))
+            )
+        return out, new_lambda2
 
     shape = float(lp.a_lambda + len(out))
     rate = float(lp.b_lambda + 0.5 * sum(out.values()))
     new_lambda2 = float(rng.gamma(shape=shape, scale=1.0 / max(rate, 1e-12)))
     return out, new_lambda2
-
 
 def _prior_mean_precision(
     priors: Any,
@@ -714,7 +785,13 @@ def _prior_mean_precision(
         if getattr(priors, "lasso", None) is not None:
             if tau is None or block_name not in tau:
                 raise ValueError(f"Missing tau scale for {block_name}.")
-            precision[i, i] = 1.0 / max(lasso_variance_scale * float(tau[block_name]), 1e-16)
+            coefficient_scale = lasso_coefficient_scale(priors.lasso, block_name)
+            prior_variance = (
+                lasso_variance_scale
+                * coefficient_scale**2
+                * float(tau[block_name])
+            )
+            precision[i, i] = 1.0 / max(prior_variance, 1e-16)
         else:
             prior = getattr(priors, theta_name)
             if prior is None:
