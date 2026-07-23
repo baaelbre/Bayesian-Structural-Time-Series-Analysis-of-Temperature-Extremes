@@ -1,0 +1,15 @@
+bucex version: 0.3.3
+PBS job ID: 65237798
+started: 2026-07-19T18:30:12+02:00
+iterations: 1500
+burn-in: 300
+thinning: 1
+priors: regularized
+seed base: 940
+repository: /kyukon/data/gent/vo/000/gvo00048/vsc42619/Bayesian-Structural-Time-Series-Analysis-of-Temperature-Extremes
+output: /kyukon/data/gent/vo/000/gvo00048/vsc42619/Bayesian-Structural-Time-Series-Analysis-of-Temperature-Extremes/results/quick/uccle_v033_regularized_65237798
+
+These are quick one-chain results for plotting and inspection only.
+They must not be treated as final posterior inference.
+completed: 2026-07-19T19:56:48+02:00
+poster directory: /kyukon/data/gent/vo/000/gvo00048/vsc42619/Bayesian-Structural-Time-Series-Analysis-of-Temperature-Extremes/results/quick/uccle_v033_regularized_65237798/poster

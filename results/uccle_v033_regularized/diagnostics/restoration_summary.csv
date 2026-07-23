@@ -1,0 +1,19 @@
+series,chain,path,n_draws,restored_iterations,restored_fraction,restore_failure_counts
+TXm,1,results\uccle_v033_regularized\chains\chain_1\fits\TXm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXm,2,results\uccle_v033_regularized\chains\chain_2\fits\TXm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXm,3,results\uccle_v033_regularized\chains\chain_3\fits\TXm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNm,1,results\uccle_v033_regularized\chains\chain_1\fits\TNm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNm,2,results\uccle_v033_regularized\chains\chain_2\fits\TNm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNm,3,results\uccle_v033_regularized\chains\chain_3\fits\TNm_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXx,1,results\uccle_v033_regularized\chains\chain_1\fits\TXx_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXx,2,results\uccle_v033_regularized\chains\chain_2\fits\TXx_bucex_v0.3.3.pkl,5000,8,0.0013333333333333333,"{""support_after_state_parameters"": 200}"
+TXx,3,results\uccle_v033_regularized\chains\chain_3\fits\TXx_bucex_v0.3.3.pkl,5000,1,0.00016666666666666666,"{""support_after_state_parameters"": 25}"
+TXn,1,results\uccle_v033_regularized\chains\chain_1\fits\TXn_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXn,2,results\uccle_v033_regularized\chains\chain_2\fits\TXn_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TXn,3,results\uccle_v033_regularized\chains\chain_3\fits\TXn_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNx,1,results\uccle_v033_regularized\chains\chain_1\fits\TNx_bucex_v0.3.3.pkl,5000,827,0.13783333333333334,"{""support_after_state_parameters"": 20675}"
+TNx,2,results\uccle_v033_regularized\chains\chain_2\fits\TNx_bucex_v0.3.3.pkl,5000,355,0.059166666666666666,"{""support_after_state_parameters"": 8875}"
+TNx,3,results\uccle_v033_regularized\chains\chain_3\fits\TNx_bucex_v0.3.3.pkl,5000,241,0.04016666666666667,"{""support_after_state_parameters"": 6025}"
+TNn,1,results\uccle_v033_regularized\chains\chain_1\fits\TNn_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNn,2,results\uccle_v033_regularized\chains\chain_2\fits\TNn_bucex_v0.3.3.pkl,5000,0,0.0,{}
+TNn,3,results\uccle_v033_regularized\chains\chain_3\fits\TNn_bucex_v0.3.3.pkl,5000,0,0.0,{}
