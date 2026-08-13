@@ -1,0 +1,23 @@
+include LICENSE
+include README.md
+include CHANGELOG.md
+include PACKAGE_STRUCTURE.md
+include VALIDATION.md
+include ARCHITECTURE_V0_2.md
+include ARCHITECTURE_V0_3_1.md
+include MIGRATION_V0_2.md
+include MIGRATION_V0_3_1.md
+include MIGRATION_V0_3_2.md
+include MIGRATION_V0_3_3.md
+include VALIDATION_V0_3_1.md
+include VALIDATION_V0_3_2.md
+include VALIDATION_V0_3_3.md
+include demo_*.py
+recursive-include docs *.md
+recursive-include examples *.py
+recursive-include jobs *.sh *.pbs
+recursive-include validation *.py *.json
+recursive-include data *.csv *.md *.py
+recursive-include tests *.py
+global-exclude __pycache__
+global-exclude *.py[cod]

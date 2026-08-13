@@ -1,0 +1,921 @@
+{
+  "archive_and_forecast": {
+    "archive_bytes": 37692,
+    "forecast_finite": true,
+    "forecast_shape": [
+      1,
+      3
+    ],
+    "model_type": "Model",
+    "prior_type": "FSGEVPriors",
+    "roundtrip_equal": true
+  },
+  "bucex_version": "1.2.1",
+  "dynamic_regression": {
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "parameters": [
+      "sd.level",
+      "sd.x[1]",
+      "sigma"
+    ],
+    "plan": {
+      "approximation": null,
+      "asis": true,
+      "backend": "state_space",
+      "engine": "ffbs",
+      "family": "gaussian",
+      "interweaves_with": "centered",
+      "parameterization": "disturbance",
+      "state_update": "exact Gaussian FFBS",
+      "targets_exact_posterior": true,
+      "warnings": []
+    },
+    "prior_profile": "half_normal",
+    "state_shape": [
+      2,
+      2,
+      37,
+      2
+    ]
+  },
+  "fs_prior_profiles": {
+    "manuscript_lasso": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "lambda2",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "tau_level",
+        "tau_season",
+        "tau_trend"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "manuscript_lasso",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    },
+    "normal": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    },
+    "pc": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "pc_tau_level",
+        "pc_tau_season",
+        "pc_tau_trend",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "pc",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    },
+    "regularized_horseshoe": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "horseshoe_global",
+        "horseshoe_local_level",
+        "horseshoe_local_season",
+        "horseshoe_local_trend",
+        "horseshoe_slab2",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "regularized_horseshoe",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    },
+    "regularized_lasso": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "lambda2_level",
+        "lambda2_season",
+        "lambda2_trend",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "tau_level",
+        "tau_season",
+        "tau_trend"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "regularized_lasso",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    },
+    "ssvs": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "model_index",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "state_level",
+        "state_season",
+        "state_trend"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "ssvs",
+      "state_shape": [
+        1,
+        1,
+        49,
+        13
+      ]
+    }
+  },
+  "full_uccle_smoke": {
+    "TNm": {
+      "engine_diagnostics": {},
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 0.31971059972420335,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    },
+    "TNn": {
+      "engine_diagnostics": {
+        "convergence_rate": 1.0,
+        "mean_support_rejections": 0.0,
+        "median_iterations": 5.0,
+        "median_relative_change": 3.360170480168466e-08
+      },
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "xi"
+      ],
+      "plan": {
+        "approximation": "iterated_laplace",
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "laplace",
+        "family": "gev",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "iterated Laplace FFBS approximation",
+        "targets_exact_posterior": false,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 7.459378599654883,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    },
+    "TNx": {
+      "engine_diagnostics": {
+        "convergence_rate": 1.0,
+        "mean_support_rejections": 0.0,
+        "median_iterations": 4.0,
+        "median_relative_change": 8.71915047298304e-06
+      },
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "xi"
+      ],
+      "plan": {
+        "approximation": "iterated_laplace",
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "laplace",
+        "family": "gev",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "iterated Laplace FFBS approximation",
+        "targets_exact_posterior": false,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 6.687432300299406,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    },
+    "TXm": {
+      "engine_diagnostics": {},
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 0.3108196002431214,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    },
+    "TXn": {
+      "engine_diagnostics": {
+        "convergence_rate": 1.0,
+        "mean_support_rejections": 0.0,
+        "median_iterations": 5.0,
+        "median_relative_change": 4.253080580113231e-08
+      },
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "xi"
+      ],
+      "plan": {
+        "approximation": "iterated_laplace",
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "laplace",
+        "family": "gev",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "iterated Laplace FFBS approximation",
+        "targets_exact_posterior": false,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 7.538202099967748,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    },
+    "TXx": {
+      "engine_diagnostics": {
+        "convergence_rate": 1.0,
+        "mean_support_rejections": 0.0,
+        "median_iterations": 4.0,
+        "median_relative_change": 3.757909825739278e-06
+      },
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope",
+        "xi"
+      ],
+      "plan": {
+        "approximation": "iterated_laplace",
+        "asis": false,
+        "backend": "fruehwirth_schnatter",
+        "engine": "laplace",
+        "family": "gev",
+        "interweaves_with": null,
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "iterated Laplace FFBS approximation",
+        "targets_exact_posterior": false,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "seconds": 6.849187199957669,
+      "state_shape": [
+        1,
+        1,
+        1573,
+        13
+      ]
+    }
+  },
+  "gaussian_parameterizations": {
+    "centered": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": true,
+        "backend": "state_space",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": "disturbance",
+        "parameterization": "centered",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "half_normal",
+      "state_shape": [
+        1,
+        2,
+        49,
+        13
+      ]
+    },
+    "disturbance": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": true,
+        "backend": "state_space",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": "centered",
+        "parameterization": "disturbance",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "half_normal",
+      "state_shape": [
+        1,
+        2,
+        49,
+        13
+      ]
+    },
+    "fruehwirth_schnatter": {
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sd.level",
+        "sd.seasonal",
+        "sd.slope",
+        "sigma",
+        "sigma2",
+        "signed_sd.level",
+        "signed_sd.seasonal",
+        "signed_sd.slope"
+      ],
+      "plan": {
+        "approximation": null,
+        "asis": true,
+        "backend": "fruehwirth_schnatter",
+        "engine": "ffbs",
+        "family": "gaussian",
+        "interweaves_with": "centered",
+        "parameterization": "fruehwirth_schnatter",
+        "state_update": "exact Gaussian FFBS",
+        "targets_exact_posterior": true,
+        "warnings": []
+      },
+      "prior_profile": "normal",
+      "state_shape": [
+        1,
+        2,
+        49,
+        13
+      ]
+    }
+  },
+  "gev_laplace": {
+    "engine_diagnostics": {
+      "convergence_rate": 1.0,
+      "mean_support_rejections": 0.0,
+      "median_iterations": 3.0,
+      "median_relative_change": 1.7292912561846724e-08
+    },
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "parameters": [
+      "alpha0",
+      "beta0",
+      "gamma0_season",
+      "lambda2_level",
+      "lambda2_season",
+      "lambda2_trend",
+      "q_level",
+      "q_season",
+      "q_trend",
+      "s_level",
+      "s_season",
+      "s_trend",
+      "sd.level",
+      "sd.seasonal",
+      "sd.slope",
+      "sigma",
+      "sigma2",
+      "signed_sd.level",
+      "signed_sd.seasonal",
+      "signed_sd.slope",
+      "tau_level",
+      "tau_season",
+      "tau_trend",
+      "xi"
+    ],
+    "plan": {
+      "approximation": "iterated_laplace",
+      "asis": true,
+      "backend": "fruehwirth_schnatter",
+      "engine": "laplace",
+      "family": "gev",
+      "interweaves_with": "centered",
+      "parameterization": "fruehwirth_schnatter",
+      "state_update": "iterated Laplace FFBS approximation",
+      "targets_exact_posterior": false,
+      "warnings": []
+    },
+    "prior_profile": "regularized_lasso",
+    "restored_iterations": 0,
+    "state_shape": [
+      1,
+      2,
+      61,
+      13
+    ]
+  },
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.11.4",
+  "single_result_type": true,
+  "total_seconds": 72.4208221998997,
+  "txm_full_centered": {
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "parameters": [
+      "sd.level",
+      "sd.seasonal",
+      "sd.slope",
+      "sigma"
+    ],
+    "plan": {
+      "approximation": null,
+      "asis": true,
+      "backend": "state_space",
+      "engine": "ffbs",
+      "family": "gaussian",
+      "interweaves_with": "disturbance",
+      "parameterization": "centered",
+      "state_update": "exact Gaussian FFBS",
+      "targets_exact_posterior": true,
+      "warnings": []
+    },
+    "prior_profile": "half_normal",
+    "seconds": 1.6034979997202754,
+    "state_shape": [
+      1,
+      1,
+      1573,
+      13
+    ]
+  },
+  "txx_full_pgas": {
+    "engine_diagnostics": {
+      "mean_changed_fraction": 0.019071837253655435,
+      "mean_unique_ancestors": 15.325699745547073,
+      "median_min_particle_ess": 12.613748370898556,
+      "path_change_rate": 1.0
+    },
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "parameters": [
+      "alpha0",
+      "beta0",
+      "gamma0_season",
+      "horseshoe_global",
+      "horseshoe_local_level",
+      "horseshoe_local_season",
+      "horseshoe_local_trend",
+      "horseshoe_slab2",
+      "q_level",
+      "q_season",
+      "q_trend",
+      "s_level",
+      "s_season",
+      "s_trend",
+      "sd.level",
+      "sd.seasonal",
+      "sd.slope",
+      "sigma",
+      "sigma2",
+      "signed_sd.level",
+      "signed_sd.seasonal",
+      "signed_sd.slope",
+      "xi"
+    ],
+    "particles": 24,
+    "plan": {
+      "approximation": null,
+      "asis": true,
+      "backend": "fruehwirth_schnatter",
+      "engine": "pgas",
+      "family": "gev",
+      "interweaves_with": "centered",
+      "parameterization": "fruehwirth_schnatter",
+      "state_update": "conditional SMC with ancestor sampling",
+      "targets_exact_posterior": true,
+      "warnings": [
+        "The transition is singular; PGAS operates on its affine support. Inspect particle ESS and ancestor diversity."
+      ]
+    },
+    "prior_profile": "regularized_horseshoe",
+    "restored_iterations": 0,
+    "seconds": 39.550001400057226,
+    "state_shape": [
+      1,
+      1,
+      1573,
+      13
+    ]
+  },
+  "uccle_data": [
+    {
+      "daily_max_abs_difference": 3.552713678800501e-15,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 28.583870967741937,
+      "minimum": -2.389655172413793,
+      "n": 1572,
+      "series": "TXm",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 1.7763568394002505e-15,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 17.212903225806453,
+      "minimum": -10.06206896551724,
+      "n": 1572,
+      "series": "TNm",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 39.7,
+      "minimum": 3.2,
+      "n": 1572,
+      "series": "TXx",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 23.0,
+      "minimum": -11.6,
+      "n": 1572,
+      "series": "TXn",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 23.5,
+      "minimum": -0.5,
+      "n": 1572,
+      "series": "TNx",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 13.0,
+      "minimum": -18.4,
+      "n": 1572,
+      "series": "TNn",
+      "start": "1892-01-01T00:00:00"
+    }
+  ]
+}

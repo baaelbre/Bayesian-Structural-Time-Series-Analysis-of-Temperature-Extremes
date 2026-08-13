@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Six short independent fits for workflow/figure checks, not final inference.
+#PBS -N bucex_quick
+#PBS -l nodes=1:ppn=6
+#PBS -l mem=32gb
+#PBS -l walltime=06:00:00
+#PBS -j oe
+
+set -euo pipefail
+REPO_DIR="${BUCEX_REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}"
+cd "${REPO_DIR}"
+if type module >/dev/null 2>&1; then
+    module purge
+    module load "${BUCEX_PYTHON_MODULE:-Python}"
+fi
+
+JOB_LABEL="${PBS_JOBID:-manual}"
+JOB_LABEL="${JOB_LABEL//[^[:alnum:]_.-]/_}"
+OUT_ROOT="${BUCEX_QUICK_OUT_ROOT:-${REPO_DIR}/results/quick/uccle_v1_1_${JOB_LABEL}}"
+if [[ -e "${OUT_ROOT}" ]]; then
+    echo "Refusing to overwrite ${OUT_ROOT}." >&2
+    exit 4
+fi
+mkdir -p "${OUT_ROOT}" logs
+
+export BUCEX_REPO_DIR="${REPO_DIR}" BUCEX_DATA_DIR="${BUCEX_DATA_DIR:-${REPO_DIR}/data}"
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+SERIES=(TXm TNm TXx TXn TNx TNn)
+PIDS=()
+for INDEX in "${!SERIES[@]}"; do
+    NAME="${SERIES[$INDEX]}"
+    (
+        export BUCEX_OUT_DIR="${OUT_ROOT}"
+        bash jobs/run_uccle_series.sh \
+            "${NAME}" "$(( ${BUCEX_SEED_BASE:-900} + INDEX ))" \
+            "${BUCEX_DRAWS:-100}" "${BUCEX_WARMUP:-100}" 1 \
+            "${BUCEX_PRIORS:-regularized_lasso}" auto 128
+    ) > "logs/quick_${JOB_LABEL}_${NAME}.log" 2>&1 &
+    PIDS+=("$!")
+done
+
+FAILED=0
+for PID in "${PIDS[@]}"; do
+    wait "${PID}" || FAILED=1
+done
+if (( FAILED )); then
+    echo "At least one quick fit failed." >&2
+    exit 5
+fi
+
+python examples/make_uccle_poster_figures.py \
+    --fit-dir "${OUT_ROOT}/fits" --out-dir "${OUT_ROOT}/poster" --formats png
+echo "Quick validation outputs: ${OUT_ROOT}"

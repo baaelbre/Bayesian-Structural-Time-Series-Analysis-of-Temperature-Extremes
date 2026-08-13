@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Four independent chains for each of six series: PBS array indices 0-23.
+# Submit from the repository root with: qsub jobs/fit_uccle_array.pbs
+#PBS -N bucex_v11
+#PBS -t 0-23
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=8gb
+#PBS -l walltime=48:00:00
+#PBS -j oe
+
+set -euo pipefail
+
+TASK_ID="${PBS_ARRAY_INDEX:-${PBS_ARRAYID:-}}"
+if [[ -z "${TASK_ID}" ]]; then
+    echo "No PBS array index was found." >&2
+    exit 2
+fi
+
+SERIES=(TXm TNm TXx TXn TNx TNn)
+SERIES_INDEX=$((TASK_ID % 6))
+CHAIN_ID=$((TASK_ID / 6 + 1))
+if (( TASK_ID < 0 || TASK_ID >= 24 )); then
+    echo "Invalid array index ${TASK_ID}." >&2
+    exit 2
+fi
+
+NAME="${SERIES[$SERIES_INDEX]}"
+SEED=$(( ${BUCEX_SEED_BASE:-40} + SERIES_INDEX + 100 * (CHAIN_ID - 1) ))
+REPO_DIR="${BUCEX_REPO_DIR:-${PBS_O_WORKDIR:-$PWD}}"
+OUT_ROOT="${BUCEX_OUT_ROOT:-${REPO_DIR}/results/uccle_v1_1_${BUCEX_PRIORS:-regularized_lasso}}"
+
+cd "${REPO_DIR}"
+mkdir -p logs
+SAFE_JOB_ID="${PBS_JOBID:-manual}"
+SAFE_JOB_ID="${SAFE_JOB_ID//[^[:alnum:]_.-]/_}"
+exec > >(tee -a "logs/${SAFE_JOB_ID}_${NAME}_chain${CHAIN_ID}.log") 2>&1
+
+if type module >/dev/null 2>&1; then
+    module purge
+    module load "${BUCEX_PYTHON_MODULE:-Python}"
+fi
+
+export BUCEX_REPO_DIR="${REPO_DIR}"
+export BUCEX_OUT_DIR="${OUT_ROOT}/chains/chain_${CHAIN_ID}"
+export BUCEX_DATA_DIR="${BUCEX_DATA_DIR:-${REPO_DIR}/data}"
+
+bash jobs/run_uccle_series.sh \
+    "${NAME}" \
+    "${SEED}" \
+    "${BUCEX_DRAWS:-2000}" \
+    "${BUCEX_WARMUP:-2000}" \
+    "${BUCEX_THIN:-1}" \
+    "${BUCEX_PRIORS:-regularized_lasso}" \
+    "${BUCEX_GEV_ENGINE:-auto}" \
+    "${BUCEX_PARTICLES:-256}"

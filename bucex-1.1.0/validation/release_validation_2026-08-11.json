@@ -1,0 +1,243 @@
+{
+  "bucex_version": "1.1.0",
+  "fs_gaussian_profiles": {
+    "horseshoe": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "regularized_horseshoe",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "horseshoe_global",
+        "horseshoe_local_level",
+        "horseshoe_local_season",
+        "horseshoe_local_trend",
+        "horseshoe_slab2",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2"
+      ]
+    },
+    "manuscript": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "manuscript_lasso",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "lambda2",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2",
+        "tau_level",
+        "tau_season",
+        "tau_trend"
+      ]
+    },
+    "normal": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "half_normal",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2"
+      ]
+    },
+    "pc": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "pc",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "pc_tau_level",
+        "pc_tau_season",
+        "pc_tau_trend",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2"
+      ]
+    },
+    "regularized_lasso": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "regularized_lasso",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "lambda2_level",
+        "lambda2_season",
+        "lambda2_trend",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2",
+        "tau_level",
+        "tau_season",
+        "tau_trend"
+      ]
+    },
+    "ssvs": {
+      "draws": 3,
+      "finite_states": true,
+      "prior_profile": "ssvs",
+      "stored_parameters": [
+        "alpha0",
+        "beta0",
+        "gamma0_season",
+        "model_index",
+        "q_level",
+        "q_season",
+        "q_trend",
+        "s_level",
+        "s_season",
+        "s_trend",
+        "sigma",
+        "sigma2",
+        "state_level",
+        "state_season",
+        "state_trend"
+      ]
+    }
+  },
+  "fs_laplace": {
+    "approximation": "Iterated Laplace approximation to the GEV state block",
+    "engine": {
+      "convergence_rate": 1.0,
+      "mean_support_rejections": 0.0,
+      "median_iterations": 3.0,
+      "median_relative_change": 1.0349361172042172e-07,
+      "restored_fraction": 0.0
+    },
+    "exact_target": false,
+    "restored_iterations": 0
+  },
+  "general_engine": {
+    "exact_target": true,
+    "finite": true,
+    "parameterization": "noncentered",
+    "state_shape": [
+      2,
+      5,
+      31,
+      2
+    ]
+  },
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+  "python": "3.12.13",
+  "safe_archive": {
+    "bytes": 40545,
+    "model_type": "StructuralSSM",
+    "prior_type": "NonCenteredGEVPriors",
+    "roundtrip_equal": true
+  },
+  "total_seconds": 38.55391166800018,
+  "txx_full_length_pgas_seed40": {
+    "engine": {
+      "mean_changed_fraction": 0.03560076287349014,
+      "mean_unique_ancestors": 40.401717557251914,
+      "median_min_particle_ess": 17.182253861808956,
+      "path_change_rate": 1.0,
+      "restored_fraction": 0.0
+    },
+    "exact_target": true,
+    "finite_states": true,
+    "particles": 64,
+    "restored_iterations": 0,
+    "seconds": 36.88336741799958
+  },
+  "uccle_data": [
+    {
+      "daily_max_abs_difference": 3.552713678800501e-15,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 28.583870967741937,
+      "minimum": -2.389655172413793,
+      "n": 1572,
+      "series": "TXm",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 1.7763568394002505e-15,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 17.212903225806453,
+      "minimum": -10.06206896551724,
+      "n": 1572,
+      "series": "TNm",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 39.7,
+      "minimum": 3.2,
+      "n": 1572,
+      "series": "TXx",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 23.0,
+      "minimum": -11.6,
+      "n": 1572,
+      "series": "TXn",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 23.5,
+      "minimum": -0.5,
+      "n": 1572,
+      "series": "TNx",
+      "start": "1892-01-01T00:00:00"
+    },
+    {
+      "daily_max_abs_difference": 0.0,
+      "daily_mismatches": 0.0,
+      "end": "2022-12-01T00:00:00",
+      "maximum": 13.0,
+      "minimum": -18.4,
+      "n": 1572,
+      "series": "TNn",
+      "start": "1892-01-01T00:00:00"
+    }
+  ]
+}
