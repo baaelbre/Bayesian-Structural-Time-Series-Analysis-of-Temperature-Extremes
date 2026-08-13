@@ -1,0 +1,189 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+
+\title{bucex 1.2.1 --- Revision Plan, Hierarchical Partial-Pooling Model, and Prior Sensitivity}
+\author{B.A. Van Velthoven, S. Luca}
+\date{\today}
+
+\begin{document}
+
+\begin{titlepage}
+\maketitle
+\thispagestyle{empty}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Package architecture overview}
+The \texttt{bucex} 1.2.1 package is organized into functional modules: \texttt{api/}, \texttt{components/}, \texttt{models/} (model + compiler), \texttt{observation/} (Gaussian, GEV), \texttt{priors/} (\texttt{process.py} general SD priors, \texttt{structural.py} FS hierarchical profiles), \texttt{inference/} (\texttt{config.py}, \texttt{plan.py}, \texttt{state/} with FFBS/Laplace/PGAS kernels, \texttt{fit/}), \texttt{core/} (\texttt{FitResult}), \texttt{diagnostics/}, \texttt{datasets/} (Uccle), \texttt{io/} (checksummed \texttt{.bucex} archives), \texttt{plotting/}, and \texttt{simulate/}.
+
+The inference interface has three orthogonal axes:
+\begin{align}
+\text{parameterization} &\in \{\texttt{centered},\,\texttt{disturbance},\,\texttt{fruehwirth\_schnatter}\}, \\
+\text{engine} &\in \{\texttt{ffbs},\,\texttt{laplace},\,\texttt{pgas}\}, \\
+\text{prior profile} &\in \{\texttt{manuscript\_lasso},\,\texttt{regularized\_lasso},\,\texttt{regularized\_horseshoe},\,\texttt{pc},\,\texttt{normal},\,\texttt{ssvs}\}.
+\end{align}
+
+A single \texttt{FitResult} object stores chain-preserving outputs with array conventions
+\begin{align}
+\texttt{state\_draws} &\in \mathbb{R}^{C \times D \times (T+1) \times d_\alpha}, \\
+\texttt{parameter\_draws},\; \texttt{plan},\; \texttt{sampler\_diagnostics},\; \texttt{auxiliary\_draws} &\text{ as companion objects.}
+\end{align}
+
+The Uccle dataset contains six monthly series from 1892--2022 ($1572$ observations each): TXm and TNm (Gaussian monthly means of daily max/min), TXx and TNx (GEV upper-tail monthly maxima), and TXn and TNn (GEV lower-tail monthly minima, sign-flipped internally). The v1.2.1 release validation reported 39 passing tests, finite state arrays of shape $(1,1,1573,13)$ for all six full-length fits, and for PGAS/FS TXx a particle count of 24, path-change rate $1.0$, and median minimum particle ESS $12.61$.
+
+\section{Revision plan: pseudo-Laplace to PGAS}
+The revision direction is to replace or supplement the iterated-Laplace pseudo-observation GEV engine with PGAS (Particle Gibbs with Ancestor Sampling) as the primary reported method. Iterated-Laplace is approximate because it linearizes the GEV score/Hessian around a current state estimate and embeds this Gaussian pseudo-observation inside FFBS. PGAS instead uses a conditional SMC with ancestor sampling kernel that is exact-invariant for the target posterior \cite{andrieu2010,lindsten2014}.
+
+Before making PGAS the headline result, the observed median minimum particle ESS of $12.61/24$ should be stress-tested by scaling particle count and reporting ESS degradation over the full time axis, not only a summary median. The revision should include direct Laplace-versus-PGAS comparisons on identical series/prior settings, alongside wall-clock trade-offs. A practical split is to keep Laplace for fast approximate prior-sensitivity screening while reserving PGAS for confirmatory final inference.
+
+\section{The base model as a state-space model (per series)}
+For series $i$ and month $t=1,\ldots,T$, define latent predictor
+\begin{equation}
+\eta_{i,t} = Z_t'\alpha_{i,t}.
+\end{equation}
+The observation model is
+\begin{equation}
+y_{i,t} \mid \eta_{i,t},\theta_i \sim
+\begin{cases}
+\mathcal{N}(\eta_{i,t},\sigma_i^2), & \text{for TXm, TNm},\\
+\operatorname{GEV}(\eta_{i,t},\sigma_i,\xi_i), & \text{for TXx, TXn, TNx, TNn}.
+\end{cases}
+\end{equation}
+The latent state recursion is linear-Gaussian:
+\begin{align}
+\alpha_{i,t+1} &= T_t\alpha_{i,t} + R_t\zeta_{i,t}, \\
+\zeta_{i,t} &\sim \mathcal{N}(0,Q_i),
+\end{align}
+with block-diagonal $T_t$ and $R_t$ assembled from local-linear-trend, dummy-seasonal, and optional regression components as in \texttt{bucex/models/compiler.py}. For GEV observations this is a dynamic generalized linear model \cite{west1985,fahrmeir1994}, specialized to extreme-value dynamics \cite{nogaj2006,parey2007,huerta2007,rootzen2013}. The FS parameterization is an algebraic reparameterization of the same state recursion using signed scale coefficients \cite{fruehwirth2010}.
+
+\section{Adding partial pooling: hierarchical layer across the six series}
+Partial pooling introduces a hyperprior layer without altering within-series state dynamics (hierarchical DLM structure \cite{gamerman1993,gelman2007}). For GEV shape parameters on four series ($i=1,\ldots,4$):
+\begin{align}
+\xi_i \mid \mu_\xi,\tau_\xi &\sim \mathcal{N}(\mu_\xi,\tau_\xi^2), \\
+\mu_\xi &\sim \mathcal{N}(0,s_0^2), \\
+\tau_\xi &\sim \operatorname{Half\text{-}Cauchy}(0,A) \quad (\text{or } \operatorname{Half\text{-}Normal}(0,A)).
+\end{align}
+Trend-rate pooling by series type $g(i)\in\{\text{mean},\text{extreme}\}$ can be written
+\begin{equation}
+\beta_i \mid \mu_\beta^{(g(i))},\tau_\beta \sim \mathcal{N}(\mu_\beta^{(g(i))},\tau_\beta^2),
+\end{equation}
+where the key climate estimand is
+\begin{equation}
+\Delta_\beta = \mu_\beta^{(\mathrm{extreme})} - \mu_\beta^{(\mathrm{mean})},
+\end{equation}
+reported with a credible interval.
+
+A full posterior factorization is
+\begin{align}
+p\!\left(\mu_\xi,\tau_\xi,\{\alpha_i,\xi_i,\sigma_i,Q_i\}_{i=1}^{6}\mid\{y_i\}_{i=1}^{6}\right)
+&\propto p(\mu_\xi)\,p(\tau_\xi)
+\prod_{i=1}^{6}\Bigg[p(\xi_i\mid\mu_\xi,\tau_\xi)\,p(\sigma_i)\,p(Q_i)\,p(\alpha_{i,0}) \\
+&\qquad\times \prod_{t=1}^{T} p(\alpha_{i,t+1}\mid\alpha_{i,t},Q_i)\,p(y_{i,t}\mid\alpha_{i,t},\sigma_i,\xi_i)\Bigg].
+\end{align}
+
+Implementation can remain post-hoc hierarchical: conditional on $(\mu_\xi,\tau_\xi)$, each series likelihood factorizes exactly as now, so FFBS/PGAS stay per-series and unchanged. Add one Gibbs step per sweep:
+\begin{equation}
+\mu_\xi\mid\{\xi_i\},\tau_\xi \sim \mathcal{N}\!\left(
+\frac{\tau_\xi^{-2}\sum_i \xi_i}{n\tau_\xi^{-2}+s_0^{-2}},
+\left(n\tau_\xi^{-2}+s_0^{-2}\right)^{-1}
+\right),
+\end{equation}
+plus Metropolis or slice sampling for $\tau_\xi$. This requires no changes to \texttt{compiler.py}/\texttt{CompiledModel}; pooling lives in the prior graph. Hierarchical GEV and regional-frequency precedents include \cite{coles1996,cooley2007,renard2011,sang2009,martins2000}.
+
+\section{Prior choice discussion, especially for $\xi$}
+FS structural SSVS uses discrete component-inclusion spike-and-slab indicators (trend/seasonal active, static, dynamic), whereas general process-SD spike-and-slab continuously shrinks innovation SDs toward zero \cite{george1993,george1997}. Regularized horseshoe \cite{carvalho2010,piironen2017} and SSVS are complementary: horseshoe yields smooth shrinkage factors $\kappa_j$, while SSVS yields interpretable posterior inclusion probabilities. Reporting both is recommended.
+
+For the GEV shape parameter $\xi$, current choices (Uniform$(-0.5,0.5)$ or truncated Normal$(0,1)$) can over-weight heavy-tail behavior near $|\xi|\approx 0.5$ relative to expected temperature-extreme regimes (often $|\xi|<0.2$). A better default is
+\begin{equation}
+\xi \sim \mathcal{N}(0,\sigma_\xi^2)\,\mathbf{1}_{(-0.5,0.5)}(\xi), \qquad \sigma_\xi \in [0.2,0.3],
+\end{equation}
+or a PC prior shrinking toward the Gumbel base model ($\xi=0$) with explicit tail-probability calibration \cite{simpson2017}. Prior sensitivity should compare Uniform, truncated Normal, and PC-$\xi$ via decision-relevant outputs (50- and 100-year return levels), and extend \texttt{prior\_sensitivity.py} to include \texttt{ssvs}. Summaries should emphasize \texttt{period\_rate\_summary} and \texttt{static\_summary} rather than raw parameter tables.
+
+\section{Mean/max dependence problem}
+For each month $t$, TXm and TXx are deterministic functionals of shared daily values $X_{t,d}$ (and similarly TNm, TNx, and TNn are all deterministic functionals of the same month-$t$ daily minima path):
+\begin{align}
+\mathrm{TXm}_t &= \frac{1}{n_t}\sum_{d=1}^{n_t}X_{t,d}, \\
+\mathrm{TXx}_t &= \max_{d=1,\ldots,n_t} X_{t,d}.
+\end{align}
+Independent per-series fitting imposes zero contemporaneous residual/innovation covariance, which is generally false and can understate joint uncertainty and invalidate naive tests of trend differences.
+
+Candidate fixes, increasing in invasiveness:
+\begin{enumerate}
+\item \textbf{SUTSE / correlated innovations across series.} Use correlated disturbances and, for mixed Gaussian/GEV pairs, a Gaussian-copula residual link:
+\begin{align}
+u_{\mathrm{TXm},t} &= \Phi\!\left(\frac{y_{\mathrm{TXm},t}-\eta_{\mathrm{TXm},t}}{\sigma_{\mathrm{TXm}}}\right), \\
+u_{\mathrm{TXx},t} &= F_{\mathrm{GEV}}\!\left(y_{\mathrm{TXx},t};\eta_{\mathrm{TXx},t},\sigma_{\mathrm{TXx}},\xi_{\mathrm{TXx}}\right), \\
+\left(\Phi^{-1}(u_{\mathrm{TXm},t}),\Phi^{-1}(u_{\mathrm{TXx},t})\right)
+&\sim \mathcal{N}_2\!\left(\mathbf{0},R_t\right),
+\quad
+R_t=\begin{bmatrix}1&\rho\\\rho&1\end{bmatrix}.
+\end{align}
+\item \textbf{Shared dynamic factor model.} Introduce
+\begin{align}
+\eta_{i,t} &= \mu_{i,t}+\lambda_i f_t, \\
+f_{t+1} &= T_f f_t + w_t,\qquad w_t\sim\mathcal{N}(0,Q_f),
+\end{align}
+to test common climate forcing in mean and extreme series.
+\item \textbf{Full daily-process model.} Model daily temperatures directly and derive monthly mean/max as induced functionals.
+\end{enumerate}
+A concrete revision recommendation is to implement (1) first (low overhead, one extra $\rho$ per mean/max pair), then layer (2) if time allows.
+
+\section{Cross-validation approach}
+Standard random $k$-fold CV is invalid because it breaks temporal dependence. Use leave-future-out / expanding-window CV: fit on 1892--$T$, forecast ahead, score, then roll $T$ forward \cite{burkner2020}. Tail-aware scoring should prioritize CRPS or quantile/pinball loss at high quantiles (90th/95th/99th) over RMSE \cite{gneiting2007}. Engine and prior comparisons (PGAS vs Laplace, alternative prior profiles) should use this same blocked protocol, aligned across all six series, to support fair hierarchical/joint model comparisons.
+
+\section{Main paper contribution points (summary)}
+\begin{enumerate}
+\item Unified inference framework in \texttt{bucex}: one model grammar with exactness-labeled engines and orthogonal parameterization/engine/prior choices.
+\item PGAS as exact-invariant benchmark to validate or replace historical pseudo-Laplace approximations, especially near tail events.
+\item Systematic prior sensitivity (especially $\xi$) linked to return-level consequences.
+\item Leave-future-out CV with tail-appropriate scores to justify inference settings empirically.
+\item Partial pooling across six Uccle series (hierarchical $\xi$ and trend-rate contrasts), including explicit treatment of mean/max dependence, to support valid climate-trend claims.
+\end{enumerate}
+
+\begin{thebibliography}{99}
+\bibitem{harvey1989} Harvey, A.C. (1989). \emph{Forecasting, Structural Time Series Models and the Kalman Filter}.
+\bibitem{west1997} West, M. \& Harrison, J. (1997). \emph{Bayesian Forecasting and Dynamic Models} (2nd ed.).
+\bibitem{durbin2012} Durbin, J. \& Koopman, S.J. (2012). \emph{Time Series Analysis by State Space Methods} (2nd ed.).
+\bibitem{fruehwirth2010} Fr\"uhwirth-Schnatter, S. \& Wagner, H. (2010). Stochastic model specification search for Gaussian and partial non-Gaussian state space models. \emph{Journal of Econometrics}.
+\bibitem{west1985} West, M., Harrison, J. \& Migon, H.S. (1985). Dynamic generalized linear models and Bayesian forecasting. \emph{JASA}.
+\bibitem{fahrmeir1994} Fahrmeir, L. \& Tutz, G. (1994). \emph{Multivariate Statistical Modelling Based on Generalized Linear Models}.
+\bibitem{huerta2007} Huerta, G. \& Sans\'o, B. (2007). Time-varying models for extreme values. \emph{Environmental and Ecological Statistics}.
+\bibitem{nogaj2006} Nogaj, M., Yiou, P., Parey, S., Malek, F. \& Naveau, P. (2006). Amplitude and frequency of temperature extremes over the North Atlantic region. \emph{GRL}.
+\bibitem{parey2007} Parey, S., Malek, F., Laurent, C. \& Dacunha-Castelle, D. (2007). Trends and climate evolution: statistical approach for very high temperatures in France. \emph{Climatic Change}.
+\bibitem{rootzen2013} Rootz\'en, H. \& Katz, R.W. (2013). Design Life Level: quantifying risk in a changing climate. \emph{Water Resources Research}.
+\bibitem{andrieu2010} Andrieu, C., Doucet, A. \& Holenstein, R. (2010). Particle Markov chain Monte Carlo methods. \emph{JRSS-B}.
+\bibitem{lindsten2014} Lindsten, F., Jordan, M.I. \& Sch\"on, T.B. (2014). Particle Gibbs with Ancestor Sampling. \emph{JMLR}.
+\bibitem{chopin2020} Chopin, N. \& Papaspiliopoulos, O. (2020). \emph{An Introduction to Sequential Monte Carlo}.
+\bibitem{yu2011} Yu, Y. \& Meng, X.-L. (2011). To center or not to center: interweaving techniques for Bayesian data augmentation (ASIS). \emph{JCGS}.
+\bibitem{carvalho2010} Carvalho, C.M., Polson, N.G. \& Scott, J.G. (2010). The horseshoe estimator for sparse signals. \emph{Biometrika}.
+\bibitem{piironen2017} Piironen, J. \& Vehtari, A. (2017). Sparsity information and regularization in the horseshoe and other shrinkage priors. \emph{Electronic Journal of Statistics}.
+\bibitem{park2008} Park, T. \& Casella, G. (2008). The Bayesian lasso. \emph{JASA}.
+\bibitem{george1993} George, E.I. \& McCulloch, R.E. (1993). Variable selection via Gibbs sampling. \emph{JASA}.
+\bibitem{george1997} George, E.I. \& McCulloch, R.E. (1997). Approaches for Bayesian variable selection. \emph{Statistica Sinica}.
+\bibitem{simpson2017} Simpson, D., Rue, H., Riebler, A., Martins, T.G. \& S{\o}rbye, S.H. (2017). Penalizing model component complexity: a principled, practical approach to constructing priors. \emph{Statistical Science}.
+\bibitem{martins2000} Martins, E.S. \& Stedinger, J.R. (2000). Generalized maximum-likelihood generalized extreme-value quantile estimators for hydrologic data. \emph{Water Resources Research}.
+\bibitem{coles2001} Coles, S. (2001). \emph{An Introduction to Statistical Modeling of Extreme Values}.
+\bibitem{coles1996} Coles, S. \& Tawn, J.A. (1996). A Bayesian analysis of extreme rainfall data. \emph{Applied Statistics}.
+\bibitem{cooley2007} Cooley, D., Nychka, D. \& Naveau, P. (2007). Bayesian spatial modeling of extreme precipitation return levels. \emph{JASA}.
+\bibitem{renard2011} Renard, B. (2011). A Bayesian hierarchical approach to regional frequency analysis. \emph{Water Resources Research}.
+\bibitem{sang2009} Sang, H. \& Gelfand, A.E. (2009). Hierarchical modeling for extreme values observed over space and time. \emph{Environmental and Ecological Statistics}.
+\bibitem{gamerman1993} Gamerman, D. \& Migon, H.S. (1993). Dynamic hierarchical models. \emph{JRSS-B}.
+\bibitem{gelman2007} Gelman, A. \& Hill, J. (2007). \emph{Data Analysis Using Regression and Multilevel/Hierarchical Models}.
+\bibitem{renard2007} Renard, B. \& Lang, M. (2007). Use of a Gaussian copula for multivariate extreme value analysis: some case studies in hydrology. \emph{Advances in Water Resources}.
+\bibitem{genest2007} Genest, C. \& Favre, A.-C. (2007). Everything you always wanted to know about copula modeling but were afraid to ask. \emph{Journal of Hydrologic Engineering}.
+\bibitem{sang2014} Sang, H. \& Genton, M.G. (2014). Tapered composite likelihood for spatial max-stable models. \emph{Spatial Statistics}.
+\bibitem{katz2002} Katz, R.W., Parlange, M.B. \& Naveau, P. (2002). Statistics of extremes in hydrology. \emph{Advances in Water Resources}.
+\bibitem{fawcett2006} Fawcett, L. \& Walshaw, D. (2006). A hierarchical model for extreme wind speeds. \emph{JRSS-C}.
+\bibitem{aguilar2000} Aguilar, O. \& West, M. (2000). Bayesian dynamic factor models and portfolio allocation. \emph{Journal of Business \& Economic Statistics}.
+\bibitem{stock2016} Stock, J.H. \& Watson, M.W. (2016). Dynamic factor models, factor-augmented VARs, and SVARs in macroeconomics. In \emph{Handbook of Macroeconomics}.
+\bibitem{burkner2020} B\"urkner, P.-C., Gabry, J. \& Vehtari, A. (2020). Approximate leave-future-out cross-validation for Bayesian time series models. \emph{Journal of Statistical Computation and Simulation}.
+\bibitem{gneiting2007} Gneiting, T. \& Raftery, A.E. (2007). Strictly proper scoring rules, prediction, and estimation. \emph{JASA}.
+\bibitem{harveykoopman1997} Harvey, A.C. \& Koopman, S.J. (1997). Multivariate structural time series models. In \emph{System Dynamics in Economic and Financial Models}.
+\end{thebibliography}
+
+\end{document}
