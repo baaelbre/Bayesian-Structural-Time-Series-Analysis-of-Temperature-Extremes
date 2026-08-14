@@ -24,7 +24,7 @@ sim_gev = bx.simulate(
     initial_state=np.r_[20.0, 0.01, np.zeros(11)],
     seed=200,
 )
-
+print('Laplace fit')
 fit_laplace = bx.fit(
     sim_gev.y,
     model_gev,
@@ -35,12 +35,15 @@ fit_laplace = bx.fit(
     mcmc=bx.MCMC(
         draws=1000,
         warmup=1000,
-        chains=4,
+        chains=1,
         seed=201,
+        progress=True
     ),
 )
 
 # PGAS
+print("\n\nPGAS fit")
+
 fit_pgas = bx.fit(
     sim_gev.y,
     model_gev,
@@ -57,6 +60,7 @@ fit_pgas = bx.fit(
         warmup=500,
         chains=4,
         seed=202,
+        progress=True
     ),
 )
 

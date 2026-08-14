@@ -1,0 +1,238 @@
+# bucex 2.0.0
+
+`bucex` fits Bayesian structural time-series models to Gaussian bulk data and
+dynamic-location GEV extremes. Version 2 adds mixed-family dynamic factor
+models without creating a second inference framework: univariate `Model` and
+multichannel `FactorModel` both compile to the same linear state-space
+contract, enter through `fit()`, and return `FitResult`.
+
+## Dynamic factors
+
+For channel \(i\) at time \(t\), the v2 predictor is
+
+\[
+\eta_{i,t} = \text{individual}_{i,t} + \sum_k \lambda_{ik} f_{k,t}.
+\]
+
+Each factor and each individual term is assembled from the existing trend and
+seasonal components. Channel likelihoods are conditionally independent given
+the state path; they are marginally dependent through shared factors.
+
+```python
+import bucex as bx
+
+model = bx.FactorModel(
+    channels=(
+        bx.Channel(
+            "TXm",
+            bx.Gaussian(),
+            components=(bx.LocalLevel(mode="static"),),
+        ),
+        bx.Channel(
+            "TXx",
+            bx.GEV(),
+            components=(bx.LocalLevel(mode="static"),),
+        ),
+        bx.Channel(
+            "TXn",
+            bx.GEV(),
+            components=(bx.LocalLevel(mode="static"),),
+            tail="lower",
+        ),
+    ),
+    factors=(
+        bx.Factor(
+            "climate",
+            components=(
+                bx.LocalLinearTrend(initial_level=0.0, initial_level_sd=0.0),
+            ),
+            loadings={
+                "TXm": 1.0,  # fixed scale/sign anchor
+                "TXx": bx.Loading.estimated(0.8, sd=1.0),
+                "TXn": bx.Loading.estimated(0.7, sd=1.0),
+            },
+        ),
+    ),
+    name="Uccle shared climate trend",
+)
+
+fit = bx.fit(
+    observations,  # DataFrame columns TXm, TXx, TXn; or a (T, 3) array
+    model,
+    engine="pgas",
+    parameterization="disturbance",
+    priors="regularized",
+    mcmc=bx.MCMC(draws=1_000, warmup=1_000, chains=4, seed=42),
+    particles=bx.Particles(n=512, proposal="guided"),
+)
+
+fit.factor_draws("climate")
+fit.loading_draws("climate", "TXx")
+fit.channel_eta_draws("TXx")
+fit.diagnostics()
+forecast = fit.forecast(12, seed=43)
+```
+
+Plain numeric loadings are fixed. `Loading.estimated(...)` loadings are sampled
+under their stored normal priors. If any loading is estimated, the factor must
+have at least one fixed non-zero anchor. This is a deliberate pre-sampling
+identification check, not a post-hoc sign correction.
+For multiple factors, the complete matrix of fixed anchors and implicit fixed
+zeros must also have full column rank; this blocks rotational ambiguity from
+reusing the same anchor pattern.
+
+Factors may share `LocalLevel`, `LocalLinearTrend`, and `DummySeasonal` blocks.
+Channels may additionally contain the existing static or dynamic
+`Regression` component. Exogenous values for a factor model are supplied as a
+mapping from channel name to that channel's design matrix.
+
+## Univariate models remain unchanged
+
+```python
+fit = bx.fit(
+    y,
+    family="gev",
+    period=12,
+    parameterization="fruehwirth_schnatter",
+    engine="pgas",
+    priors="regularized_horseshoe",
+    asis=True,
+    mcmc=bx.MCMC(draws=1_000, warmup=1_000, chains=4, seed=42),
+    particles=bx.Particles(n=256, proposal="guided"),
+)
+
+fit.state("level")
+fit.parameter("sd.level")
+fit.forecast(12, seed=43)
+```
+
+A fully declarative univariate model is still built as before:
+
+```python
+model = bx.Model(
+    bx.Gaussian(),
+    [
+        bx.LocalLinearTrend(),
+        bx.DummySeasonal(period=12),
+        bx.Regression(
+            2,
+            dynamic=True,
+            name="climate",
+            feature_names=("nao", "enso"),
+        ),
+    ],
+)
+```
+
+## Inference choices
+
+| Model | Engine | Exactness | Parameterizations |
+| --- | --- | --- | --- |
+| Univariate Gaussian | `ffbs` | exact | centered, disturbance, FS |
+| Univariate GEV | `pgas` | exact-invariant | centered, disturbance, FS |
+| Univariate GEV | `laplace` | approximate | centered, disturbance, FS |
+| All-Gaussian factor | `ffbs` | exact | centered, disturbance |
+| Mixed/GEV factor | `pgas` | exact-invariant | centered, disturbance |
+| Mixed/GEV factor | `laplace` | approximate | centered, disturbance |
+
+For mixed factor models, `engine="auto"` chooses PGAS so the default targets
+the exact posterior. Laplace remains useful for fast screening and should be
+reported as an approximation. Factor models do not silently enter the
+Frühwirth-Schnatter augmentation; requesting it fails during planning.
+
+The all-Gaussian backend uses a multivariate Kalman update with diagonal
+channel observation covariance. The mixed backend evaluates the product of
+channel likelihoods inside one global-state Laplace or PGAS update. PGAS uses
+conditional SMC with ancestor sampling on the affine support of singular
+structural transitions.
+
+## One compiler and result contract
+
+`compile_model()` returns either `CompiledModel` or `CompiledFactorModel`.
+Both expose:
+
+- `transition`, `loading`, `initial_mean`, and `initial_cov`;
+- semantic `state_names` and `noise_names`;
+- `design()`, `eta()`, and disturbance round-trips;
+- process covariance construction and path-support projection.
+
+Factor states are namespaced, for example `factor.climate.level` and
+`channel.TXm.level`. Process parameters follow the same names:
+`sd.factor.climate.level`. Observation parameters are channel-specific:
+`sigma.TXm` and `xi.TXx`.
+
+Every fit returns `FitResult`, with chain-preserving arrays:
+
+- `state_draws`: `(chains, draws, T + 1, state_dim)`;
+- `parameter_draws[name]`: `(chains, draws, ...)`;
+- `plan`: resolved engine, parameterization, backend and exactness;
+- `sampler_diagnostics`: acceptance plus Laplace/particle diagnostics;
+- `auxiliary_draws`: algorithm-specific draws.
+
+For a factor model, `eta_draws()` has shape `(combined_draws, T, channels)`.
+Forecast observations have shape `(draws, horizon, channels)`. Risk methods
+such as `return_level_draws()` accept `channel=`.
+
+`FitResult.save()` writes a checksummed, non-pickle `.bucex` archive. The v2
+loader reads both v2 and v1.2 archives, validates the checksum and reconstructs
+only allowlisted model/prior classes.
+
+## Modeling cautions
+
+- Shared factors induce dependence, but v2 does not add residual Gaussian
+  copulas or unrestricted contemporaneous covariance. The resolved plan stores
+  this limitation as a warning.
+- A very flexible shared trend plus equally flexible individual trends can be
+  weakly identified even when factor scale/sign are anchored. Start with
+  static channel offsets or strongly regularized individual innovations, then
+  add individual dynamics only when supported.
+- Inspect PGAS minimum ESS, ancestor diversity and path-change diagnostics.
+  Long records and high-dimensional state graphs generally require more
+  particles.
+- Lower-tail GEV channels use `Channel(..., tail="lower")`; input, forecasts
+  and risk summaries stay on the original orientation.
+- Missing channel observations are allowed, but every time point must retain
+  at least one observed channel and every channel needs at least two values.
+
+## Uccle and command line
+
+The existing six-series Uccle helpers and `bucex-uccle` command remain
+univariate compatibility workflows. They are useful for separate fits; build a
+`FactorModel` explicitly when the inferential target is a shared trend.
+
+```bash
+bucex-uccle validate-data
+bucex-uccle fit TXx --engine pgas --draws 2000 --warmup 2000 \
+  --chains 4 --particles 512 --output results/TXx.bucex
+bucex-uccle inspect results/TXx.bucex
+```
+
+## Installation and validation
+
+```bash
+python -m pip install .
+python -m pytest -q
+python validation/run_factor_validation.py
+python -m build
+```
+
+Required dependencies are NumPy, SciPy and pandas. Matplotlib is optional via
+`bucex[plot]`.
+
+Further reading:
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Dynamic factor guide](docs/DYNAMIC_FACTORS.md)
+- [Inference matrix](docs/INFERENCE_MATRIX.md)
+- [Migration to 2.0](docs/MIGRATION.md)
+- [Release validation](docs/VALIDATION.md)
+
+`fit_bayes`, `fit_gaussian_structural`, `fit_gev_structural`,
+`combine_fs_fits`, and `PosteriorBundle` remain compatibility names. The first
+and fourth are deprecated.
+
+## License
+
+The software is MIT licensed. That license does not establish the right to
+redistribute the Uccle observations; consult `data/README.md` before publishing
+the data files.
