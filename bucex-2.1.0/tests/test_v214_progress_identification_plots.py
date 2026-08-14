@@ -290,3 +290,54 @@ def test_factor_identification_diagnostics_and_plot_api():
     assert all(figure is not None for figure, _ in figures)
     for figure, _ in figures:
         plt.close(figure)
+
+
+def test_univariate_predictor_density_trace_and_truth_plot_api():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    model = bx.Model(
+        bx.Gaussian(),
+        (bx.LocalLinearTrend(), bx.DummySeasonal(4)),
+    )
+    truth = {
+        "sd.level": 0.02,
+        "sd.slope": 0.0001,
+        "sd.seasonal": 0.01,
+        "sigma": 0.20,
+    }
+    simulation = bx.simulate(model, 16, truth, seed=301)
+    fit = bx.fit(
+        simulation.y,
+        model,
+        parameterization="fruehwirth_schnatter",
+        engine="ffbs",
+        priors="normal",
+        mcmc=bx.MCMC(draws=4, warmup=3, chains=2, seed=302),
+    )
+
+    figures = [
+        fit.plot("predictor"),
+        fit.plot(
+            "parameter_density",
+            parameters=("sd.level", "sigma"),
+            truths=truth,
+        ),
+        fit.plot(
+            "traces",
+            parameters=("sd.level", "sd.slope", "sd.seasonal", "sigma"),
+            truths=truth,
+        ),
+        fit.plot("process_sd", truths=truth, title="normal prior"),
+    ]
+    assert all(figure is not None for figure, _ in figures)
+    process_figure, process_axes = figures[-1]
+    assert process_figure._suptitle.get_text() == "normal prior"
+    assert any(
+        line.get_label() == "truth"
+        for axis in process_axes
+        for line in axis.lines
+    )
+    for figure, _ in figures:
+        plt.close(figure)

@@ -212,8 +212,20 @@ predictor is more interpretable than its shared and idiosyncratic pieces.
 
 ## Simple plotting API
 
-Every result uses `fit.plot(kind, ...)`. Factor fits add the diagnostic plots
-needed for simulation recovery and identification checks:
+Every result uses `fit.plot(kind, ...)`. Univariate fits expose the complete
+predictor separately from individual structural components, together with
+prior/posterior and chain diagnostics:
+
+```python
+fit.plot("predictor")                      # complete eta, including seasonality
+fit.plot("level_slope")                    # structural level and latent slope
+fit.plot("process_sd", truths=truth)       # prior, posterior, and optional truth
+fit.plot("parameter_density", parameters=["sigma", "xi"])
+fit.plot("traces")                         # every innovation SD, by chain
+```
+
+Factor fits add the plots needed for decomposition recovery and identification
+checks:
 
 ```python
 fit.plot("factor_decomposition", baseline=slice(0, 30 * 12))

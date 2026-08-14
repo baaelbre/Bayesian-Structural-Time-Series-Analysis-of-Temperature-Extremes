@@ -1,41 +1,69 @@
-# bucex 2.1.4 play scripts
+# bucex 2.1.4 examples
 
-These scripts are deliberately small experiments, not publication analyses.
-They all use the same configuration in `play_config.py`, print the inference
-plan, set `progress=True` by default, and finish with a small set of relevant
-plots.
-
-| Script | Question to play with |
-|---|---|
-| `quickstart.py` | Does the same structural model work for Gaussian and GEV observations? |
-| `compare_parameterizations.py` | How do centered, disturbance, and Fruehwirth--Schnatter sampling compare? |
-| `compare_priors.py` | How sensitive are the process innovation SDs to the prior profile? |
-| `identified_gaussian_factor.py` | What is shared, what is idiosyncratic, and is that split identified? |
-| `dynamic_factor.py` | Can a Gaussian series and a GEV extreme share one dynamic factor? |
-| `combined_bulk_tail.py` | How do independent Gaussian bulk and GEV tail analyses look side by side? |
-| `uccle_factor.py` | How do the six Uccle summaries enter the proposed factor analysis? |
-
-Start with, for example:
+The examples form one sequential workflow. Each file is standalone: it
+imports only normal Python packages and `bucex`, contains its own settings at
+the top, and can be run directly from the project directory.
 
 ```bash
-python examples/identified_gaussian_factor.py
+python examples/01_gaussian_local_trend.py
 ```
 
-The default is a short exploratory run. A longer run requires no source-code
-changes:
+There is no shared configuration file and no environment-variable machinery.
+To change draws, warmup, chains, particles, dates, priors, or the selected
+Uccle series, edit the clearly labelled constants near the top of the script.
 
-```bash
-BUCEX_QUICK=0 BUCEX_SHOW=1 python examples/identified_gaussian_factor.py
-```
+| Order | Script | Purpose |
+|---:|---|---|
+| 1 | `01_gaussian_local_trend.py` | Complete univariate Gaussian workflow with exact FFBS |
+| 2 | `02_gev_local_trend.py` | Complete univariate GEV workflow with exact PGAS and support checks |
+| 3 | `03_diagnose_gev_pgas.py` | Separate short-chain, low-particle, restoration, and parameterization problems |
+| 4 | `04_compare_priors.py` | Compare normal, PC, regularized-horseshoe, and exact SSVS priors on the same data |
+| 5 | `05_compare_parameterizations.py` | Compare centered, disturbance, and FS sampling under matched scientific priors |
+| 6 | `06_factor_gaussian.py` | Shared Gaussian warming factor plus channel-specific deviations |
+| 7 | `07_factor_mixed_gaussian_gev.py` | Joint Gaussian/GEV factor model for a mean and an extreme |
+| 8 | `08_bulk_tail_independent.py` | Parallel but independent Gaussian bulk and GEV tail analyses |
+| 9 | `09_uccle_univariate.py` | Fit one of the six bundled Uccle summaries |
+| 10 | `10_uccle_factor.py` | Fit the proposed six-summary Uccle factor model |
 
-Every setting can also be overridden separately:
+## What to check after every fit
 
-```bash
-BUCEX_DRAWS=500 BUCEX_WARMUP=750 BUCEX_CHAINS=4 \
-BUCEX_PARTICLES=256 BUCEX_PROGRESS_EVERY=25 python examples/dynamic_factor.py
-```
+Do not interpret posterior paths or forecasts before checking:
 
-Set `BUCEX_SHOW=0` for a non-interactive run and `BUCEX_PROGRESS=0` to silence
-progress. Short runs are useful for API checks only; use multiple long chains
-and inspect R-hat, effective sample sizes, traces, and factor-identification
-diagnostics before making scientific claims.
+1. Rank-normalized split R-hat, preferably below 1.01.
+2. Bulk ESS for every scientific innovation SD, observation parameter, and
+   estimated loading.
+3. Chain-specific traces rather than only pooled posterior densities.
+4. For PGAS, particle ESS, ancestor diversity, path-change rate, and changed
+   fraction.
+5. For GEV FS fits, `restored_iterations`, failure counts, and the minimum GEV
+   support margin.
+6. For factor fits, loading--deviation correlations and whether the complete
+   predictor is more stable than its shared/idiosyncratic decomposition.
+
+The run lengths in these files are development-scale starting points. They
+are more serious than a 100-draw smoke test, but they are not a promise of
+convergence. Increase warmup and draws whenever diagnostics ask for it;
+validate particle sensitivity before a final GEV analysis.
+
+## Interpreting the prior comparison
+
+`sd.slope` is the innovation SD of the latent slope per observation interval,
+not the slope itself. The built-in monthly structural profiles use reference
+scales of approximately 0.03 for level/seasonal innovations and 0.0002 for
+slope innovations. Example 4 simulates a slope innovation compatible with
+that calibration so it compares prior *shape* rather than silently placing the
+truth far into every prior's tail.
+
+- `normal` gives each signed FS scale a normal prior, hence a half-normal prior
+  on the scientific innovation SD.
+- `pc` gives the innovation SD an exponential prior calibrated through
+  `P(SD > upper) = alpha`.
+- `regularized_horseshoe` combines strong shrinkage near zero with a heavy tail
+  and a regularizing slab.
+- `ssvs` assigns exact posterior probabilities to zero, fixed, and dynamic
+  structures. Its point mass at zero must be inspected with component
+  probabilities, not only a smoothed density.
+
+Prior-sensitivity conclusions are meaningful only when every compared fit has
+converged. A difference between two unconverged posterior curves is a sampler
+difference, not evidence of scientific prior sensitivity.

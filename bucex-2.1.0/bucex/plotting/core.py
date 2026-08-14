@@ -102,6 +102,8 @@ def plot_process_sds(
     bins: int = 35,
     credible_interval: float = 0.90,
     prior_draws: int = 5000,
+    truths=None,
+    title: str | None = None,
     figsize=None,
 ):
     """Overlay each process-SD prior with its marginal posterior."""
@@ -110,6 +112,7 @@ def plot_process_sds(
     from scipy.stats import gaussian_kde
 
     names = list(fit.compiled.noise_names)
+    truths = {} if truths is None else dict(truths)
     if not names:
         raise ValueError("The model has no stochastic process standard deviations.")
     figure, axes = plt.subplots(
@@ -139,16 +142,30 @@ def plot_process_sds(
             prior_sample = np.asarray(prior.sample(np.random.default_rng(140), size=prior_draws))
             grid_upper = max(grid_upper, float(np.quantile(prior_sample, 0.995)))
         grid = np.linspace(0.0, grid_upper * 1.05, 400)
+        structural_ssvs = bool(
+            prior is None and getattr(fit.priors, "ssvs", None) is not None
+        )
         if prior is None:
+            positive_prior = prior_sample[prior_sample > 0.0]
+            prior_zero_mass = float(np.mean(prior_sample == 0.0))
+            plotted_prior = (
+                positive_prior
+                if structural_ssvs and positive_prior.size
+                else prior_sample
+            )
             axis.hist(
-                prior_sample,
+                plotted_prior,
                 bins=bins,
                 range=(0.0, grid[-1]),
                 density=True,
                 histtype="step",
                 color="0.35",
                 linestyle="--",
-                label="prior",
+                label=(
+                    f"prior slab; P(SD=0)={prior_zero_mass:.2f}"
+                    if structural_ssvs
+                    else "prior"
+                ),
             )
         elif isinstance(prior, FixedSD):
             axis.axvline(prior.value, color="0.35", linestyle="--", label="prior")
@@ -160,20 +177,52 @@ def plot_process_sds(
                 linestyle="--",
                 label="prior",
             )
-        if np.std(posterior) > 1e-12 and np.unique(posterior).size > 2:
-            density = gaussian_kde(posterior)
-            axis.plot(grid, density(grid), color="C0", label="posterior")
+        posterior_zero_mass = float(np.mean(posterior == 0.0))
+        positive_posterior = posterior[posterior > 0.0]
+        density_values = (
+            positive_posterior
+            if posterior_zero_mass > 0.0 and positive_posterior.size > 2
+            else posterior
+        )
+        if np.std(density_values) > 1e-12 and np.unique(density_values).size > 2:
+            density = gaussian_kde(density_values)
+            axis.plot(
+                grid,
+                density(grid),
+                color="C0",
+                label=("posterior slab" if posterior_zero_mass > 0.0 else "posterior"),
+            )
             axis.fill_between(grid, 0.0, density(grid), color="C0", alpha=0.18)
         else:
             axis.axvline(float(np.mean(posterior)), color="C0", label="posterior")
+        if posterior_zero_mass > 0.0:
+            axis.axvline(
+                0.0,
+                color="C0",
+                linewidth=2.0,
+                label=f"posterior P(SD=0)={posterior_zero_mass:.2f}",
+            )
         lower, median, upper = _interval(posterior, credible_interval)
         axis.axvspan(lower, upper, color="C0", alpha=0.08)
         axis.axvline(median, color="C0", linewidth=1.0)
+        truth_name = f"sd.{name}"
+        if truth_name in truths:
+            axis.axvline(
+                float(truths[truth_name]),
+                color="black",
+                linewidth=1.1,
+                linestyle="--",
+                label="truth",
+            )
         axis.set_title(f"Process SD: {name}")
         axis.set_xlabel("innovation standard deviation")
         axis.set_ylabel("density")
         axis.legend()
-    figure.tight_layout()
+    if title is not None:
+        figure.suptitle(str(title), y=0.995)
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+    else:
+        figure.tight_layout()
     return figure, axes[:, 0]
 
 
@@ -206,6 +255,41 @@ def plot_state(
     )
     ax.plot(x, median, color=color, label=f"{state} median")
     ax.set_title(fit.series_name or f"Posterior {state}")
+    ax.legend()
+    return figure, ax
+
+
+def plot_predictor(
+    fit,
+    *,
+    credible_interval: float = 0.90,
+    ax=None,
+    color: str = "C3",
+):
+    """Plot observations against the complete univariate latent predictor."""
+
+    import matplotlib.pyplot as plt
+
+    if fit.is_factor_model:
+        raise ValueError("Use plot_channel_predictor for a factor model.")
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(9, 4))
+    else:
+        figure = ax.figure
+    values = fit.eta_draws(original_scale=True)
+    lower, median, upper = _interval(values, credible_interval)
+    x = _time(fit)
+    ax.scatter(x, fit.observed, s=9, color="0.55", alpha=0.55, label="observed")
+    ax.fill_between(
+        x,
+        lower,
+        upper,
+        color=color,
+        alpha=0.2,
+        label=f"{credible_interval:.0%} credible interval",
+    )
+    ax.plot(x, median, color=color, label="complete latent predictor")
+    ax.set_title(fit.series_name or "Posterior predictor")
     ax.legend()
     return figure, ax
 
@@ -721,6 +805,12 @@ def plot_fit(fit, kind: str = "state", **kwargs):
         )
     if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
         return plot_process_sds(fit, **kwargs)
+    if key in {"predictor", "eta", "fit"}:
+        return plot_predictor(fit, **kwargs)
+    if key in {"parameter_density", "parameter_densities", "densities"}:
+        return plot_parameter_densities(fit, **kwargs)
+    if key in {"trace", "traces", "process_sd_traces"}:
+        return plot_process_sd_traces(fit, **kwargs)
     if key in {"state", "level", "slope"}:
         if key in {"level", "slope"} and "state" not in kwargs:
             kwargs["state"] = key
@@ -734,8 +824,9 @@ def plot_fit(fit, kind: str = "state", **kwargs):
     if key in {"component_probabilities", "inclusion_probabilities"}:
         return plot_component_probabilities(fit, **kwargs)
     raise ValueError(
-        "kind must be state, level, slope, level_slope, process_sd, endpoint, "
-        "exceedance, return_period, or component_probabilities."
+        "kind must be state, level, slope, level_slope, predictor, process_sd, "
+        "parameter_density, traces, endpoint, exceedance, return_period, or "
+        "component_probabilities."
     )
 
 
