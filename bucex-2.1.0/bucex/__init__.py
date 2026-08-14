@@ -117,6 +117,7 @@ from .priors import (
     UniformPrior,
     default_priors,
     default_factor_priors,
+    identified_factor_priors,
     manuscript_gaussian_priors,
     manuscript_gev_priors,
     normal_gaussian_priors,
@@ -174,7 +175,8 @@ __all__ = [
     "fit_gaussian_structural", "fit_gev_structural", "make_gaussian_model",
     "make_gev_model",
     # Priors.
-    "Priors", "FactorPriors", "default_factor_priors", "HalfNormalSD",
+    "Priors", "FactorPriors", "default_factor_priors",
+    "identified_factor_priors", "HalfNormalSD",
     "HalfStudentTSD", "ExponentialSD", "PCSD",
     "InverseGammaVariance", "FixedSD", "SpikeSlabSD", "SDUniformPrior",
     "TruncatedNormalPrior", "default_priors", "InverseGammaPrior", "GammaPrior",

@@ -1,35 +1,84 @@
-"""Small synthetic Gaussian and GEV fits through the same framework."""
-import numpy as np
+"""Play 01: the same structural model with Gaussian and GEV observations."""
+from __future__ import annotations
 
 import bucex as bx
+from play_config import describe, mcmc, particles, show_figures
 
 
-rng = np.random.default_rng(7)
-time = np.arange(120)
-level = 8.0 + 0.01 * time + np.sin(2.0 * np.pi * time / 12.0)
+PERIOD = 12
+N_TIME = 120
+PARAMETERIZATION = "fruehwirth_schnatter"
+GAUSSIAN_PRIOR = "pc"
+GEV_PRIOR = "regularized_horseshoe"
 
-gaussian = bx.fit(
-    level + rng.normal(scale=0.3, size=time.size),
-    family="gaussian",
-    period=12,
-    parameterization="disturbance",
-    priors="pc",
-    asis=True,
-    mcmc=bx.MCMC(draws=250, warmup=250, chains=2, seed=8),
-)
 
-gev = bx.fit(
-    level + rng.gumbel(scale=0.5, size=time.size),
-    family="gev",
-    period=12,
-    parameterization="fruehwirth_schnatter",
-    engine="pgas",
-    priors="regularized_horseshoe",
-    asis=True,
-    mcmc=bx.MCMC(draws=250, warmup=250, chains=2, seed=9),
-    particles=bx.Particles(n=128),
-)
+def main() -> None:
+    print(describe())
+    gaussian_model = bx.Model(
+        bx.Gaussian(),
+        (bx.LocalLinearTrend(), bx.DummySeasonal(PERIOD)),
+        name="monthly Gaussian",
+    )
+    gev_model = bx.Model(
+        bx.GEV(),
+        (bx.LocalLinearTrend(), bx.DummySeasonal(PERIOD)),
+        name="monthly GEV",
+    )
 
-print(gaussian.summary_dict())
-print(gev.diagnostics()["engine"])
-print(gev.forecast(12, draws=500, seed=10).summary())
+    gaussian_truth = {
+        "sd.level": 0.025,
+        "sd.slope": 0.002,
+        "sd.seasonal": 0.018,
+        "sigma": 0.30,
+    }
+    gev_truth = {
+        "sd.level": 0.025,
+        "sd.slope": 0.002,
+        "sd.seasonal": 0.018,
+        "sigma": 0.50,
+        "xi": -0.08,
+    }
+    gaussian_data = bx.simulate(
+        gaussian_model, N_TIME, gaussian_truth, seed=10
+    ).y
+    gev_data = bx.simulate(gev_model, N_TIME, gev_truth, seed=11).y
+
+    print("\nGAUSSIAN FIT")
+    gaussian = bx.fit(
+        gaussian_data,
+        gaussian_model,
+        parameterization=PARAMETERIZATION,
+        engine="ffbs",
+        priors=GAUSSIAN_PRIOR,
+        asis=True,
+        mcmc=mcmc(12),
+    )
+    print(gaussian.plan)
+    print(gaussian.diagnostics()["parameters"].round(3))
+
+    print("\nGEV FIT")
+    gev = bx.fit(
+        gev_data,
+        gev_model,
+        parameterization=PARAMETERIZATION,
+        engine="pgas",
+        priors=GEV_PRIOR,
+        asis=True,
+        mcmc=mcmc(13),
+        particles=particles(),
+    )
+    print(gev.plan)
+    print(gev.diagnostics()["parameters"].round(3))
+    print(
+        "\n12-step GEV forecast\n",
+        gev.forecast(12, draws=500, seed=14).summary(),
+    )
+
+    gaussian.plot("level_slope")
+    gev.plot("level_slope")
+    gev.plot("endpoint")
+    show_figures()
+
+
+if __name__ == "__main__":
+    main()

@@ -59,6 +59,7 @@ model = bx.FactorModel(
                     initial_level=0.0,
                     initial_level_sd=0.0,
                     initial_slope=0.0,
+                    initial_slope_sd=0.0,
                 ),
             ),
             loadings={

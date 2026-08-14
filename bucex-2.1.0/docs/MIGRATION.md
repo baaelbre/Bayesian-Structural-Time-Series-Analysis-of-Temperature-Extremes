@@ -1,5 +1,45 @@
 # Migrating to bucex 2.1
 
+## From 2.1.2 to 2.1.4
+
+Existing model and fit calls remain source compatible. Progress output is now
+uniform and uses `it`; set `MCMC(progress_every=...)` if a script depends on a
+specific reporting cadence.
+
+Factor prior strings are normalized more generously. The new helper below
+replaces manual `FactorPriors` edits used by earlier examples:
+
+```python
+compiled = bx.compile_model(model, data)
+priors = bx.identified_factor_priors(
+    compiled,
+    profile="regularized_horseshoe",
+    smooth_factor=True,
+    reference_channel="TXm",
+)
+```
+
+Loading anchors still identify factor scale/sign, not the allocation of a
+persistent signal between `lambda[i] * f[t]` and `alpha[i,t]`. Existing fits
+are valid, but decomposition claims should now be accompanied by
+`factor_identification_diagnostics()` and sensitivity fits. New result and
+plot methods are additive; no archive fields were removed.
+
+## From 2.1.1 to 2.1.2
+
+The public construction and fit APIs remain source compatible. Three
+behaviours are intentionally stronger:
+
+- `LocalLinearTrend(initial_slope_sd=0.0)` is now honoured as an exact fixed
+  factor initial condition under FS inference;
+- eligible Gaussian factor loadings and their channel deviations use a joint
+  collapsed/FFBS block instead of scalar path-conditional loading proposals;
+- eligible GEV loadings receive a predictor-preserving interweaving move.
+
+Existing result code continues to work. New analyses can replace manual
+factor centering and channel bookkeeping with `normalized_factor()` and
+`channel_decomposition()`.
+
 ## From 2.0 to 2.1
 
 The univariate API is unchanged. Existing multi-factor models continue to use

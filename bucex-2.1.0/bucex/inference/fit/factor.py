@@ -22,7 +22,12 @@ from ..state.laplace import (
 )
 from ..state.particle import pgas
 from .disturbance import _adapt, _prior_logpdf
-from ._progress import mcmc_progress_line
+from ._progress import (
+    factor_progress_parameters,
+    mcmc_progress_line,
+    progress_interval,
+    should_report_progress,
+)
 from .factor_horseshoe import (
     factor_horseshoe_coefficient_logpdf,
     factor_horseshoe_logpdf,
@@ -302,12 +307,17 @@ def _loading_sweep(
     *,
     adapt: bool,
     iteration: int,
+    keys: tuple[str, ...] | None = None,
 ) -> tuple[dict[str, bool], dict[str, float]]:
     accepted: dict[str, bool] = {}
     current_likelihood = observation_log_likelihood(
         y, compiled.eta(path, params=params), compiled, params
     )
-    for key in compiled.estimated_loading_names:
+    selected = compiled.estimated_loading_names if keys is None else tuple(keys)
+    unknown = sorted(set(selected) - set(compiled.estimated_loading_names))
+    if unknown:
+        raise ValueError(f"Unknown estimated loading parameters: {unknown}.")
+    for key in selected:
         spec = compiled.loading_specs[key]
         current = float(params[key])
         proposal = float(current + steps[key] * rng.normal())
@@ -490,7 +500,9 @@ def sample_factor_posterior(
         accepts = {name: 0 for name in acceptance_names}
         last_metrics = {name: np.nan for name in metric_names}
         saved = 0
-        progress_every = max(1, mcmc.iterations // 20)
+        progress_every = progress_interval(
+            mcmc.iterations, mcmc.progress_every
+        )
         chain_started = perf_counter()
 
         for iteration in range(mcmc.iterations):
@@ -669,10 +681,12 @@ def sample_factor_posterior(
                     draw_metrics[name][chain, saved] = value
                 saved += 1
 
-            if mcmc.progress and (
-                (iteration + 1) % progress_every == 0
-                or iteration + 1 == mcmc.warmup
-                or iteration + 1 == mcmc.iterations
+            completed = iteration + 1
+            if mcmc.progress and should_report_progress(
+                completed,
+                total=mcmc.iterations,
+                warmup=mcmc.warmup,
+                every=progress_every,
             ):
                 print(
                     mcmc_progress_line(
@@ -680,12 +694,17 @@ def sample_factor_posterior(
                         engine=plan.engine,
                         chain=chain + 1,
                         chains=chains,
-                        completed=iteration + 1,
+                        completed=completed,
                         total=mcmc.iterations,
                         warmup=mcmc.warmup,
                         saved=saved,
                         draws=mcmc.draws,
                         elapsed=perf_counter() - chain_started,
+                        parameters=factor_progress_parameters(
+                            compiled,
+                            params,
+                            horseshoe_state=horseshoe_state,
+                        ),
                         metrics=last_metrics,
                         particles=particles.n if plan.engine == "pgas" else None,
                     ),

@@ -1,4 +1,4 @@
-# bucex 2.1.1
+# bucex 2.1.4
 
 `bucex` fits Bayesian structural time-series models to Gaussian bulk data and
 dynamic-location GEV extremes. Version 2.1 adds the manuscript's single shared
@@ -26,15 +26,28 @@ import bucex as bx
 
 data = bx.load_uccle_factor_data()
 model = bx.make_uccle_factor_model()
+compiled = bx.compile_model(model, data)
+priors = bx.identified_factor_priors(
+    compiled,
+    profile="regularized_horseshoe",
+    smooth_factor=True,
+    reference_channel="TXm",
+)
 
 fit = bx.fit(
     data,
     model,
     parameterization="fruehwirth_schnatter",  # aliases: "fs", "ncp"
     engine="pgas",
-    priors="regularized_horseshoe",
+    priors=priors,
     asis=True,
-    mcmc=bx.MCMC(draws=2_000, warmup=2_000, chains=4, seed=42),
+    mcmc=bx.MCMC(
+        draws=2_000,
+        warmup=2_000,
+        chains=4,
+        seed=42,
+        progress=True,
+    ),
     particles=bx.Particles(n=1_024, proposal="guided"),
 )
 
@@ -43,6 +56,8 @@ fit.factor_rate_summary("common")
 fit.factor_probabilities("common")
 fit.loading_probability("common", "TXx", threshold=1.0)
 fit.reconstructed_state("TXx")
+fit.normalized_factor(slice(0, 30 * 12), "common")
+fit.channel_decomposition("TXx", "common", baseline=slice(0, 30 * 12))
 ```
 
 The same graph can be built explicitly and extended with existing components:
@@ -75,6 +90,7 @@ model = bx.FactorModel(
                     initial_level=0.0,
                     initial_slope=0.0,
                     initial_level_sd=0.0,
+                    initial_slope_sd=0.0,
                 ),
             ),
             loadings={
@@ -91,7 +107,9 @@ model = bx.FactorModel(
 Plain numeric loadings are fixed. `Loading.estimated(...)` values are sampled
 under their stored normal priors. A fixed non-zero loading anchors the factor's
 scale and sign; fixing its initial level to zero separates the shared location
-from channel intercepts.
+from channel intercepts. Setting `initial_slope_sd=0.0` makes the declared
+initial slope a true fixed coefficient while stochastic slope innovations
+still allow the common rate to evolve.
 
 ## Frühwirth--Schnatter and disturbance parameterizations
 
@@ -121,6 +139,15 @@ likelihood (the product of all channel likelihoods) for each particle. The
 default guided proposal works in unit-disturbance coordinates and retains the
 exact prior/proposal correction. `engine="laplace"` is available as an
 explicitly labelled approximation.
+
+Version 2.1.4 samples the loading/deviation ridge more effectively but does not
+claim that an unrestricted persistent decomposition is identified by the
+likelihood. For Gaussian channels, the intercept, estimated loading,
+idiosyncratic innovation SD, and complete deviation path are updated through
+collapsed Kalman likelihoods plus an exact three-state FFBS draw. For GEV
+channels, a loading/deviation interweaving move changes both components while
+preserving the complete predictor and GEV support exactly. The resolved
+kernels are recorded in `fit.sampler_diagnostics["loading_kernels"]`.
 
 ## Regularized horseshoe
 
@@ -152,6 +179,64 @@ Idiosyncratic (\alpha_{i,t}) can still change a channel's total rate, so use
 about the complete `TXx` trajectory. This distinction prevents a loading
 contrast from being overstated as a total-trend result.
 
+`channel_decomposition()` returns baseline, shared contribution, dynamic
+deviation, seasonality, and complete predictor draws and verifies their sum
+numerically.
+This avoids mistaking `state("channel.<name>.level")`, which contains the
+intercept plus deviation, for the deviation alone.
+
+An anchored loading identifies factor scale and sign, but it does not on its
+own distinguish `lambda[i] * f[t]` from a persistent `alpha[i,t]`. The helper
+`identified_factor_priors()` makes the structural restrictions explicit:
+
+```python
+priors = bx.identified_factor_priors(
+    compiled,
+    smooth_factor=True,          # no direct factor-level shock
+    reference_channel="TXm",    # no TXm idiosyncratic level shock
+)
+```
+
+Use `fixed_idiosyncratic="all"` for a loading-only sensitivity analysis, or
+remove these restrictions deliberately for a weak-identification stress test.
+After fitting, inspect:
+
+```python
+fit.factor_identification_diagnostics()
+fit.loading_deviation_correlation("TXx", summary="factor_projection")
+fit.idiosyncratic_innovation_draws("TXx")
+```
+
+A large loading--deviation correlation or `ridge_flag=True` means the complete
+predictor is more interpretable than its shared and idiosyncratic pieces.
+
+## Simple plotting API
+
+Every result uses `fit.plot(kind, ...)`. Factor fits add the diagnostic plots
+needed for simulation recovery and identification checks:
+
+```python
+fit.plot("factor_decomposition", baseline=slice(0, 30 * 12))
+fit.plot("parameter_density", parameters=["loading.common.TXx"])
+fit.plot("traces")                         # every innovation SD, by chain
+fit.plot("loading_deviation", channel="TXx")
+fit.plot("identification")
+fit.plot("idiosyncratic_innovations", channel="TXx")
+```
+
+`factor_decomposition` includes posterior bands for the complete predictor,
+shared contribution, and idiosyncratic path. Simulation truth can be supplied
+to the decomposition, density, trace, joint, and innovation plots.
+
+## Uniform progress output
+
+Set `MCMC(progress=True)` for the same log-friendly display in Gaussian, GEV,
+and factor fits. Each line reports chain, `it`, warmup/sampling phase, saved
+draws, current scientific parameters, elapsed time, and ETA. PGAS also reports
+particle ESS, ancestor diversity, and path change. Use
+`progress_every=<integer>` for an explicit cadence; otherwise each chain emits
+about twenty updates.
+
 Lower-tail channels are sign-reversed internally. Result methods return the
 original temperature orientation by default; pass `original_scale=False` when
 inspecting internal model coordinates.
@@ -167,13 +252,22 @@ fit = bx.fit(
     engine="pgas",
     priors="regularized_horseshoe",
     asis=True,
-    mcmc=bx.MCMC(draws=1_000, warmup=1_000, chains=4, seed=42),
+    mcmc=bx.MCMC(
+        draws=1_000,
+        warmup=1_000,
+        chains=4,
+        seed=42,
+        progress=True,
+    ),
     particles=bx.Particles(n=256),
 )
 ```
 
 Declarative univariate `Model`, forecasting, return levels, diagnostics,
 plotting, collection helpers, and safe `.bucex` archives retain their v2 API.
+The small configurable experiments in [`examples/README.md`](examples/README.md)
+cover Gaussian, GEV, parameterization, prior, factor, mixed, bulk/tail, and
+Uccle workflows.
 
 ## Inference summary
 

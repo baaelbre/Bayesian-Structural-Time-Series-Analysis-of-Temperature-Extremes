@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from collections import Counter
+from time import perf_counter
 from typing import Any, Dict, Optional
 
 import numpy as np
 
 from ._fs_output import FSOutput
+from ._progress import (
+    mcmc_progress_line,
+    progress_interval,
+    should_report_progress,
+    univariate_progress_parameters,
+)
 from ...models.base import StateSpaceModel
 from ..config import GibbsConfig, MCMC
 from .fs_utils import (
@@ -298,7 +305,11 @@ class FSGEVKernel:
         G, Q = build_ncp_system(self.layout)
         accept_sigma = accept_xi = 0
         keep_idx = 0
-        progress_every = self.config.progress_every or max(1, n_iter // 50)
+        progress_every = progress_interval(n_iter, self.config.progress_every)
+        chain_started = perf_counter()
+        progress_chain = int(state_kwargs.get("_progress_chain", 1))
+        progress_chains = int(state_kwargs.get("_progress_chains", 1))
+        progress_label = str(state_kwargs.get("_progress_label", "univariate"))
         restored_iterations = 0
         attempt_failure_totals: Counter[str] = Counter()
         restore_failure_totals: Counter[str] = Counter()
@@ -639,64 +650,6 @@ class FSGEVKernel:
             cur_ll = _exact_gev_loglik(y1, mu_exact, self.model, params_obs)
             x_path = map_ncp_to_centered(z_path, params_state, self.layout)
 
-            if self.config.progress and (((it + 1) % progress_every == 0) or it == n_iter - 1):
-                msg = (
-                    f"[it {it + 1}/{n_iter}] sigma={params_obs['sigma']:.4f} "
-                    f"xi={params_obs['xi']:.4f} Q_level={params_state['q_level']:.3g}"
-                )
-                if self.layout.has_beta:
-                    msg += f" Q_trend={params_state['q_trend']:.3g}"
-                if self.layout.season_dim > 0:
-                    msg += f" Q_season={params_state['q_season']:.3g}"
-                if self.priors.lasso is not None:
-                    if isinstance(lambda2, dict):
-                        compact = ",".join(
-                            f"{key[0]}:{value:.2g}" for key, value in lambda2.items()
-                        )
-                        msg += f" lambda2=({compact})"
-                    else:
-                        msg += f" lambda2={lambda2:.3g}"
-                if self.priors.horseshoe is not None:
-                    msg += (
-                        f" hs_global={horseshoe_state['global']:.3g}"
-                        f" hs_slab={np.sqrt(horseshoe_state['slab2']):.3g}"
-                    )
-                if self.priors.pc is not None:
-                    compact = ",".join(f"{key[0]}:{value:.2g}" for key, value in tau.items())
-                    msg += f" pc_tau=({compact})"
-                if self.priors.ssvs is not None:
-                    msg += (
-                        f" structure=({model_state.level.label},"
-                        f"{model_state.trend.label},{model_state.season.label})"
-                    )
-                if successful_laplace_result is not None:
-                    msg += (
-                        f" laplace_iter={successful_laplace_result.iterations}"
-                        f" converged={int(successful_laplace_result.converged)}"
-                    )
-                if successful_pgas_result is not None:
-                    msg += (
-                        f" particle_min_ess={np.min(successful_pgas_result.ess[1:]):.1f}"
-                        f" path_change={successful_pgas_result.changed_fraction:.2f}"
-                    )
-                if not iteration_ok:
-                    msg += (
-                        f" [restored attempts={sum(iteration_failures.values())}"
-                        f" reasons=({_compact_counter(iteration_failures)})"
-                    )
-                    if last_failure_detail:
-                        msg += f" last={last_failure_detail}"
-                    msg += "]"
-                if window_restored or window_attempt_failures:
-                    msg += (
-                        f" window_restored={window_restored}/{window_iterations}"
-                        f" window_failures=({_compact_counter(window_attempt_failures)})"
-                    )
-                print(msg, flush=True)
-                window_restored = 0
-                window_iterations = 0
-                window_attempt_failures.clear()
-
             if it in save_set:
                 draws_states[keep_idx] = x_path
                 z_draws[keep_idx] = z_path
@@ -739,6 +692,95 @@ class FSGEVKernel:
                     draws_static["model_index"][keep_idx] = int(model_index)
                 logpost[keep_idx] = cur_ll
                 keep_idx += 1
+
+            completed = it + 1
+            if self.config.progress and should_report_progress(
+                completed,
+                total=n_iter,
+                warmup=burn,
+                every=progress_every,
+            ):
+                details: list[str] = []
+                if self.priors.lasso is not None:
+                    if isinstance(lambda2, dict):
+                        compact = ",".join(
+                            f"{key[0]}:{value:.2g}"
+                            for key, value in lambda2.items()
+                        )
+                        details.append(f"lambda2=({compact})")
+                    else:
+                        details.append(f"lambda2={lambda2:.3g}")
+                if self.priors.pc is not None:
+                    compact = ",".join(
+                        f"{key[0]}:{value:.2g}" for key, value in tau.items()
+                    )
+                    details.append(f"pc_tau=({compact})")
+                if self.priors.ssvs is not None:
+                    details.append(
+                        "structure=("
+                        f"{model_state.level.label},{model_state.trend.label},"
+                        f"{model_state.season.label})"
+                    )
+                if not iteration_ok:
+                    restored = (
+                        f"restored_attempts={sum(iteration_failures.values())}"
+                        f" reasons=({_compact_counter(iteration_failures)})"
+                    )
+                    if last_failure_detail:
+                        restored += f" last={last_failure_detail}"
+                    details.append(restored)
+                if window_restored or window_attempt_failures:
+                    details.append(
+                        f"window_restored={window_restored}/{window_iterations}"
+                        f" failures=({_compact_counter(window_attempt_failures)})"
+                    )
+                current_metrics = {
+                    name: values[-1]
+                    for name, values in engine_diagnostics.items()
+                    if values
+                }
+                print(
+                    mcmc_progress_line(
+                        label=progress_label,
+                        engine=state_method,
+                        chain=progress_chain,
+                        chains=progress_chains,
+                        completed=completed,
+                        total=n_iter,
+                        warmup=burn,
+                        saved=keep_idx,
+                        draws=n_keep,
+                        elapsed=perf_counter() - chain_started,
+                        parameters=univariate_progress_parameters(
+                            {
+                                "q_level": params_state["q_level"],
+                                **(
+                                    {"q_trend": params_state["q_trend"]}
+                                    if self.layout.has_beta
+                                    else {}
+                                ),
+                                **(
+                                    {"q_season": params_state["q_season"]}
+                                    if self.layout.season_dim > 0
+                                    else {}
+                                ),
+                            },
+                            params_obs,
+                            horseshoe_state=horseshoe_state,
+                        ),
+                        metrics=current_metrics,
+                        particles=(
+                            int(state_kwargs.get("particles", 256))
+                            if state_method == "pgas"
+                            else None
+                        ),
+                        details=tuple(details),
+                    ),
+                    flush=True,
+                )
+                window_restored = 0
+                window_iterations = 0
+                window_attempt_failures.clear()
 
         return FSOutput(
             draws_static=draws_static,

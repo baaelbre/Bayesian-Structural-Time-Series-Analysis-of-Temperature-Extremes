@@ -386,9 +386,13 @@ def _fit_fruehwirth_schnatter(
     seeds = _chain_seeds(mcmc.seed, mcmc.chains)
     outputs: list[FSOutput] = []
     for chain, seed in enumerate(seeds):
-        if mcmc.progress and mcmc.chains > 1:
-            print(f"[chain {chain + 1}/{mcmc.chains}] seed={seed}", flush=True)
         chain_mcmc = replace(mcmc, chains=1, seed=seed)
+        chain_options = {
+            **options,
+            "_progress_chain": chain + 1,
+            "_progress_chains": mcmc.chains,
+            "_progress_label": "univariate",
+        }
         if model.family == "gaussian":
             sampler = FSGaussianKernel(model, priors, config=chain_mcmc)
         else:
@@ -400,7 +404,7 @@ def _fit_fruehwirth_schnatter(
                 dict(params_obs),
                 exog=exog,
                 state_method=plan.engine,
-                state_kwargs=options,
+                state_kwargs=chain_options,
             )
         )
     return _stack_fs_chains(

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -115,18 +115,29 @@ class FactorPriors:
         )
 
 
+def normalize_factor_prior_profile(profile: str | None) -> str:
+    """Normalize documented aliases, whitespace and UK/US spellings."""
+
+    raw = "regularized_horseshoe" if profile is None else str(profile)
+    key = "_".join(raw.strip().lower().replace("-", "_").split())
+    key = key.replace("regularised", "regularized")
+    aliases = {
+        "default": "regularized_horseshoe",
+        "rh": "regularized_horseshoe",
+        "horseshoe": "regularized_horseshoe",
+        "pc": "regularized",
+        "normal": "half_normal",
+    }
+    return aliases.get(key, key)
+
+
 def default_factor_priors(
     compiled: CompiledFactorModel,
     profile: str = "regularized_horseshoe",
 ) -> FactorPriors:
     """Data-scaled defaults that do not depend on record length."""
 
-    key = str(profile).lower().replace("-", "_")
-    key = {
-        "normal": "half_normal",
-        "pc": "regularized",
-        "horseshoe": "regularized_horseshoe",
-    }.get(key, key)
+    key = normalize_factor_prior_profile(profile)
     if key not in {
         "regularized_horseshoe",
         "regularized",
@@ -135,8 +146,10 @@ def default_factor_priors(
         "strong",
     }:
         raise ValueError(
-            "Factor prior profile must be regularized_horseshoe/horseshoe, "
-            "regularized/pc, half_normal/normal, weak, or strong."
+            f"Unknown factor prior profile {profile!r}. Choose "
+            "regularized_horseshoe (or horseshoe), regularized (or pc), "
+            "half_normal (or normal), weak, or strong. Univariate-only "
+            "profiles such as manuscript_lasso are not factor priors."
         )
     multiplier = {"weak": 2.0, "strong": 0.5}.get(key, 1.0)
     process: dict[str, SDPrior] = {}
@@ -368,4 +381,108 @@ def resolve_factor_priors(
     return replace(resolved, metadata=metadata)
 
 
-__all__ = ["FactorPriors", "default_factor_priors", "resolve_factor_priors"]
+def identified_factor_priors(
+    compiled: CompiledFactorModel,
+    profile: str = "regularized_horseshoe",
+    *,
+    smooth_factor: bool = True,
+    reference_channel: str | None = None,
+    fixed_idiosyncratic: str | Iterable[str] = (),
+) -> FactorPriors:
+    """Build factor priors with explicit dynamic-identification constraints.
+
+    ``smooth_factor=True`` fixes direct factor-level innovations at zero while
+    retaining stochastic slope innovations. ``reference_channel`` fixes that
+    channel's idiosyncratic local-level innovation at zero, making it a pure
+    reference trajectory. Additional deviations can be fixed through
+    ``fixed_idiosyncratic``; use ``"all"`` for a loading-only sensitivity fit.
+
+    These constraints address different scientific questions explicitly. They
+    do not pretend that an estimated loading and an unrestricted persistent
+    idiosyncratic random walk are separately identified by the likelihood.
+    """
+
+    priors = default_factor_priors(compiled, profile)
+    known_channels = set(compiled.channel_names)
+    if isinstance(fixed_idiosyncratic, str):
+        fixed_channels = (
+            set(known_channels)
+            if fixed_idiosyncratic.strip().lower() == "all"
+            else {fixed_idiosyncratic.strip()}
+        )
+    else:
+        fixed_channels = {str(name) for name in fixed_idiosyncratic}
+    if reference_channel is not None:
+        fixed_channels.add(str(reference_channel))
+    unknown = sorted(fixed_channels - known_channels)
+    if unknown:
+        raise KeyError(
+            f"Unknown fixed-idiosyncratic channels {unknown}; "
+            f"available={sorted(known_channels)}."
+        )
+
+    process = dict(priors.process)
+    fixed_processes: set[str] = set()
+    if smooth_factor:
+        for factor in compiled.model.factors:
+            for component in factor.components:
+                if not isinstance(component, LocalLinearTrend):
+                    continue
+                name = f"factor.{factor.name}.{component.level_name}"
+                if name in process:
+                    process[name] = FixedSD(0.0)
+                    fixed_processes.add(name)
+    for channel in compiled.model.channels:
+        if channel.name not in fixed_channels:
+            continue
+        for component in channel.components:
+            if isinstance(component, LocalLevel) and component.mode == "dynamic":
+                name = f"channel.{channel.name}.{component.name}"
+                if name in process:
+                    process[name] = FixedSD(0.0)
+                    fixed_processes.add(name)
+
+    selected = tuple(
+        name
+        for name in priors.horseshoe_processes
+        if name not in fixed_processes
+    )
+    horseshoe = priors.horseshoe
+    if horseshoe is not None:
+        coefficient_scale = {
+            name: scale
+            for name, scale in horseshoe.coefficient_scale.items()
+            if name in selected
+        }
+        horseshoe = (
+            replace(horseshoe, coefficient_scale=coefficient_scale)
+            if coefficient_scale
+            else None
+        )
+
+    metadata = dict(priors.metadata)
+    metadata.update(
+        identification_strategy="explicit_constraints",
+        smooth_factor=bool(smooth_factor),
+        pure_reference_channel=reference_channel,
+        fixed_idiosyncratic_channels=sorted(fixed_channels),
+        fixed_processes=sorted(fixed_processes),
+    )
+    result = replace(
+        priors,
+        process=process,
+        horseshoe=horseshoe,
+        horseshoe_processes=selected,
+        profile=f"identified_{priors.profile}",
+        metadata=metadata,
+    )
+    return resolve_factor_priors(compiled, result)
+
+
+__all__ = [
+    "FactorPriors",
+    "default_factor_priors",
+    "identified_factor_priors",
+    "normalize_factor_prior_profile",
+    "resolve_factor_priors",
+]

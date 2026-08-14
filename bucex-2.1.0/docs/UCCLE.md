@@ -35,7 +35,13 @@ fit = bx.fit_uccle_series(
     parameterization="fruehwirth_schnatter",
     engine="laplace",
     asis=True,
-    mcmc=bx.MCMC(draws=2_000, warmup=1_000, chains=4, seed=40),
+    mcmc=bx.MCMC(
+        draws=2_000,
+        warmup=1_000,
+        chains=4,
+        seed=40,
+        progress=True,
+    ),
     laplace=bx.Laplace(max_iterations=30, tolerance=1e-5),
 )
 ```
@@ -75,14 +81,27 @@ data = bx.load_uccle_factor_data(
     end="2022-12-01",
 )
 model = bx.make_uccle_factor_model()
+compiled = bx.compile_model(model, data)
+priors = bx.identified_factor_priors(
+    compiled,
+    profile="regularized_horseshoe",
+    smooth_factor=True,
+    reference_channel="TXm",
+)
 joint = bx.fit(
     data,
     model,
     engine="pgas",
     parameterization="fruehwirth_schnatter",
-    priors="regularized_horseshoe",
+    priors=priors,
     asis=True,
-    mcmc=bx.MCMC(draws=2_000, warmup=2_000, chains=4, seed=50),
+    mcmc=bx.MCMC(
+        draws=2_000,
+        warmup=2_000,
+        chains=4,
+        seed=50,
+        progress=True,
+    ),
     particles=bx.Particles(n=1_024, proposal="guided"),
 )
 ```
@@ -91,7 +110,8 @@ The shortcut `fit_uccle_factor(...)` loads and fits the same graph. Its one
 common local-linear trend is anchored at `TXm=1`. Each channel has an
 independent dynamic local level and an independent dynamic dummy-seasonal
 block. Lower-tail loading initial values are converted to the internal sign
-orientation.
+orientation. The helper fixes both factor initial conditions at zero; the
+factor remains dynamic through its level and slope innovation scales.
 
 The default factor prior is a regularized horseshoe on the six idiosyncratic
 local-level innovation scales only. This continuous shrinkage lets a channel
@@ -112,11 +132,22 @@ joint.factor_rate_summary("common", 1950, 2022)
 joint.loading_probability("common", "TXx", threshold=1.0)
 joint.factor_probabilities("common", start_year=1950, end_year=2022)
 joint.reconstructed_state("TXx")
+joint.normalized_factor(slice(0, 30 * 12), "common")
+joint.channel_decomposition("TXx", baseline=slice(0, 30 * 12))
 joint.channel_rate_draws("TXx", 1950, 2022)
+joint.idiosyncratic_innovation_draws("TXx")
+joint.factor_identification_diagnostics()
+joint.plot("factor_decomposition", baseline=slice(0, 30 * 12))
+joint.plot("identification", baseline=slice(0, 30 * 12))
 ```
 
 A `TXx` loading above one concerns the shared-factor contribution; a claim
 about the complete `TXx` rate must also include its idiosyncratic deviation.
+The fixed `TXm` loading identifies scale/sign; the smooth-factor and pure-
+reference restrictions above improve dynamic separation. They do not make an
+unrestricted loading/random-walk split automatically identifiable, so report
+the identification diagnostics and sensitivity fits with decomposition
+claims.
 The helper retains conditional channel independence and does not add a
 mean/extreme residual copula.
 

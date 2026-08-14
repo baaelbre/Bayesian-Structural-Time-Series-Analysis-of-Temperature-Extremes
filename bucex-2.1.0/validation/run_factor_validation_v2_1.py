@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-seed validation for the bucex 2.1 one-factor release."""
+"""Fixed-seed validation for the bucex 2.1.2 one-factor release."""
 from __future__ import annotations
 
 import argparse
@@ -56,6 +56,7 @@ def _two_channel_model(*, mixed: bool = True) -> bx.FactorModel:
                         initial_level=0.0,
                         initial_slope=0.0,
                         initial_level_sd=0.0,
+                        initial_slope_sd=0.0,
                     ),
                 ),
                 {
@@ -81,6 +82,7 @@ def uccle_graph_check(data_dir: str | Path) -> tuple[dict[str, object], object, 
     expected_horseshoe = {
         f"channel.{channel}.level" for channel in model.channel_names
     }
+    trend = model.factor("common").components[0]
     passed = bool(
         model.factor_names == ("common",)
         and model.supports_fs_parameterization
@@ -90,6 +92,7 @@ def uccle_graph_check(data_dir: str | Path) -> tuple[dict[str, object], object, 
         and plan.parameterization == "fruehwirth_schnatter"
         and plan.engine == "pgas"
         and set(priors.horseshoe_processes) == expected_horseshoe
+        and trend.initial_slope_sd == 0.0
     )
     return (
         {
@@ -101,6 +104,7 @@ def uccle_graph_check(data_dir: str | Path) -> tuple[dict[str, object], object, 
             "plan": plan.to_dict(),
             "prior_profile": priors.profile,
             "horseshoe_processes": list(priors.horseshoe_processes),
+            "initial_factor_slope_fixed": bool(trend.initial_slope_sd == 0.0),
             "passed": passed,
         },
         data,
@@ -225,6 +229,12 @@ def uccle_fs_pgas_check(data, model) -> tuple[dict[str, object], bx.FitResult]:
         and np.mean(changed) > 0.0
         and present_local == expected_local
         and fit.auxiliary_draws["fs_state"].shape == (1, 3, 25, 76)
+        and np.allclose(fit.parameter("initial.factor.common.slope"), 0.0)
+        and fit.meta["loading_kernels"]["loading.common.TNm"]
+        == "collapsed_gaussian_ffbs"
+        and fit.meta["loading_kernels"]["loading.common.TXx"].startswith(
+            "predictor_preserving_interweave"
+        )
     )
     return (
         {
@@ -235,6 +245,10 @@ def uccle_fs_pgas_check(data, model) -> tuple[dict[str, object], bx.FitResult]:
             "particle_min_ess": minimum_ess.reshape(-1).tolist(),
             "particle_path_change_rate": float(np.nanmean(changed)),
             "horseshoe_local_parameters": sorted(present_local),
+            "loading_kernels": fit.meta["loading_kernels"],
+            "fixed_initial_factor_slopes": fit.meta[
+                "fixed_initial_factor_slopes"
+            ],
             "elapsed_seconds": float(time.perf_counter() - started),
             "passed": passed,
         },
@@ -282,6 +296,11 @@ def results_and_archive_check(fit: bx.FitResult) -> dict[str, object]:
     loading_probability = fit.loading_probability(
         "common", "TXx", threshold=1.0
     )
+    normalized = fit.normalized_factor(slice(0, 12), "common")
+    decomposition = fit.channel_decomposition(
+        "TXx", "common", baseline=slice(0, 12)
+    )
+    decomposition_error = float(decomposition["reconstruction_error"])
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "factor-v2.1.bucex"
         fit.save(path)
@@ -307,6 +326,8 @@ def results_and_archive_check(fit: bx.FitResult) -> dict[str, object]:
         and state_error == 0.0
         and fs_error == 0.0
         and schema == "2.1"
+        and np.max(np.abs(np.mean(normalized[:, :12], axis=1))) < 1e-10
+        and decomposition_error < 1e-10
     )
     return {
         "factor_shape": list(factor.shape),
@@ -314,6 +335,10 @@ def results_and_archive_check(fit: bx.FitResult) -> dict[str, object]:
         "factor_rate_summary": rate,
         "TXx_loading_above_one_probability": loading_probability,
         "factor_probabilities": probabilities,
+        "normalized_factor_baseline_max_abs_mean": float(
+            np.max(np.abs(np.mean(normalized[:, :12], axis=1)))
+        ),
+        "decomposition_max_abs_error": decomposition_error,
         "archive_schema": schema,
         "archive_state_max_abs_error": state_error,
         "archive_fs_state_max_abs_error": fs_error,
@@ -344,8 +369,8 @@ def univariate_compatibility_check() -> dict[str, object]:
 
 
 def run(data_dir: str | Path) -> dict[str, object]:
-    if bx.__version__ != "2.1.1":
-        raise RuntimeError(f"Expected bucex 2.1.1, found {bx.__version__}.")
+    if bx.__version__ != "2.1.2":
+        raise RuntimeError(f"Expected bucex 2.1.2, found {bx.__version__}.")
     started = time.perf_counter()
     graph, data, compiled = uccle_graph_check(data_dir)
     algebra = fs_algebra_check(compiled)
@@ -364,7 +389,7 @@ def run(data_dir: str | Path) -> dict[str, object]:
         "univariate_compatibility": univariate,
     }
     return {
-        "release": "bucex 2.1.1",
+        "release": "bucex 2.1.2",
         "version": bx.__version__,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "sections": sections,
@@ -381,7 +406,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("validation/factor_validation_2.1.1.json"),
+        default=Path("validation/factor_validation_2.1.2.json"),
     )
     args = parser.parse_args()
     result = run(args.data_dir)

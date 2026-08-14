@@ -10,7 +10,13 @@ fit = bx.fit_uccle_series(
     parameterization="fruehwirth_schnatter",
     engine="laplace",
     asis=True,
-    mcmc=bx.MCMC(draws=1_000, warmup=1_000, chains=4, seed=40),
+    mcmc=bx.MCMC(
+        draws=1_000,
+        warmup=1_000,
+        chains=4,
+        seed=40,
+        progress=True,
+    ),
 )
 
 Path("results").mkdir(exist_ok=True)

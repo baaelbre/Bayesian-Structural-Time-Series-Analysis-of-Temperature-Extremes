@@ -100,6 +100,16 @@ class LocalLinearTrend:
             raise ValueError("level_mode must be 'dynamic' or 'static'.")
         if self.trend_mode not in {"dynamic", "static", "off"}:
             raise ValueError("trend_mode must be 'dynamic', 'static', or 'off'.")
+        if self.initial_level_sd is not None and (
+            not np.isfinite(float(self.initial_level_sd))
+            or float(self.initial_level_sd) < 0.0
+        ):
+            raise ValueError("initial_level_sd must be finite and non-negative.")
+        if self.initial_slope_sd is not None and (
+            not np.isfinite(float(self.initial_slope_sd))
+            or float(self.initial_slope_sd) < 0.0
+        ):
+            raise ValueError("initial_slope_sd must be finite and non-negative.")
         state_names = [self.level_name]
         if self.trend_mode != "off":
             state_names.append(self.slope_name)

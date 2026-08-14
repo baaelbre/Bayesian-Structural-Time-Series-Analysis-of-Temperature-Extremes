@@ -1,5 +1,11 @@
 """Innovation, observation and shape priors."""
-from .factor import FactorPriors, default_factor_priors, resolve_factor_priors
+from .factor import (
+    FactorPriors,
+    default_factor_priors,
+    identified_factor_priors,
+    normalize_factor_prior_profile,
+    resolve_factor_priors,
+)
 from .process import (
     ExponentialSD,
     FixedSD,
@@ -51,6 +57,8 @@ __all__ = [
     "Priors",
     "FactorPriors",
     "default_factor_priors",
+    "identified_factor_priors",
+    "normalize_factor_prior_profile",
     "resolve_factor_priors",
     "HalfNormalSD",
     "HalfStudentTSD",

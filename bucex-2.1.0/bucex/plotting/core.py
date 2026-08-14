@@ -271,6 +271,317 @@ def plot_channel_predictor(
     return figure, ax
 
 
+def plot_factor_decomposition(
+    fit,
+    *,
+    factor: str | None = None,
+    channels=None,
+    baseline=None,
+    credible_interval: float = 0.90,
+    truth=None,
+    figsize=None,
+):
+    """Plot complete, shared and idiosyncratic paths with credible bands."""
+
+    import matplotlib.pyplot as plt
+
+    if not fit.is_factor_model:
+        raise ValueError("plot_factor_decomposition requires a factor-model fit.")
+    selected = list(fit.channel_names if channels is None else channels)
+    unknown = sorted(set(selected) - set(fit.channel_names))
+    if unknown:
+        raise KeyError(f"Unknown channels {unknown}; available={fit.channel_names}.")
+    figure, axes = plt.subplots(
+        len(selected),
+        3,
+        figsize=figsize or (16, max(3.0, 3.0 * len(selected))),
+        squeeze=False,
+        sharex=True,
+    )
+    x = _time(fit)
+    truth = {} if truth is None else truth
+    truth_colors = {"predictor": "black", "shared": "black", "deviation": "0.35"}
+    colors = {"predictor": "C3", "shared": "C0", "deviation": "C1"}
+    titles = {
+        "predictor": "complete predictor",
+        "shared": "loading x common factor",
+        "deviation": "idiosyncratic deviation",
+    }
+    for row, channel in enumerate(selected):
+        decomposition = fit.channel_decomposition(
+            channel,
+            factor,
+            baseline=baseline,
+        )
+        for column, component in enumerate(("predictor", "shared", "deviation")):
+            axis = axes[row, column]
+            values = decomposition[component]
+            lower, median, upper = _interval(values, credible_interval)
+            if component == "predictor":
+                index = fit.channel_names.index(channel)
+                axis.scatter(
+                    x,
+                    fit.observed[:, index],
+                    s=8,
+                    color="0.55",
+                    alpha=0.35,
+                    label="observed",
+                )
+            axis.fill_between(
+                x,
+                lower,
+                upper,
+                color=colors[component],
+                alpha=0.18,
+                label=f"posterior {credible_interval:.0%} interval",
+            )
+            axis.plot(x, median, color=colors[component], label="posterior median")
+            component_truth = truth.get(component, {})
+            if channel in component_truth:
+                axis.plot(
+                    x,
+                    np.asarray(component_truth[channel]),
+                    color=truth_colors[component],
+                    linestyle="--" if component == "deviation" else "-",
+                    label="truth",
+                )
+            axis.axhline(0.0, color="0.5", linewidth=0.7, alpha=0.6)
+            axis.set_title(f"{channel}: {titles[component]}")
+            if row == 0:
+                axis.legend(fontsize=8)
+    figure.tight_layout()
+    return figure, axes
+
+
+def plot_parameter_densities(
+    fit,
+    *,
+    parameters,
+    truths=None,
+    credible_interval: float = 0.90,
+    figsize=None,
+):
+    """Posterior scalar densities with optional simulation truths."""
+
+    import matplotlib.pyplot as plt
+    from scipy.stats import gaussian_kde
+
+    names = [parameters] if isinstance(parameters, str) else list(parameters)
+    if not names:
+        raise ValueError("Choose at least one parameter.")
+    truths = {} if truths is None else truths
+    figure, axes = plt.subplots(
+        len(names),
+        1,
+        figsize=figsize or (7.5, max(2.5, 2.4 * len(names))),
+        squeeze=False,
+    )
+    for axis, name in zip(axes[:, 0], names):
+        values = np.asarray(fit.parameter(name), dtype=float).reshape(-1)
+        lower, median, upper = _interval(values, credible_interval)
+        spread = max(float(np.std(values)), abs(float(median)) * 1e-3, 1e-10)
+        grid = np.linspace(
+            min(float(np.min(values)), float(lower)) - 0.25 * spread,
+            max(float(np.max(values)), float(upper)) + 0.25 * spread,
+            400,
+        )
+        if np.unique(values).size > 2 and np.std(values) > 1e-12:
+            density = gaussian_kde(values)
+            axis.plot(grid, density(grid), color="C0", label="posterior")
+            axis.fill_between(grid, 0.0, density(grid), color="C0", alpha=0.18)
+        else:
+            axis.axvline(float(np.mean(values)), color="C0", label="posterior (fixed)")
+        axis.axvspan(lower, upper, color="C0", alpha=0.08)
+        axis.axvline(median, color="C0", linewidth=1.0, linestyle="--")
+        if name in truths:
+            axis.axvline(float(truths[name]), color="black", label="truth")
+        axis.set_title(name)
+        axis.set_ylabel("density")
+        axis.legend(fontsize=8)
+    axes[-1, 0].set_xlabel("parameter value")
+    figure.tight_layout()
+    return figure, axes[:, 0]
+
+
+def plot_process_sd_traces(
+    fit,
+    *,
+    parameters=None,
+    truths=None,
+    figsize=None,
+):
+    """Chain-specific traces for every innovation standard deviation."""
+
+    import matplotlib.pyplot as plt
+
+    names = (
+        [f"sd.{name}" for name in fit.compiled.noise_names]
+        if parameters is None
+        else ([parameters] if isinstance(parameters, str) else list(parameters))
+    )
+    truths = {} if truths is None else truths
+    figure, axes = plt.subplots(
+        len(names),
+        1,
+        figsize=figsize or (10, max(2.5, 2.1 * len(names))),
+        squeeze=False,
+        sharex=True,
+    )
+    for axis, name in zip(axes[:, 0], names):
+        values = np.asarray(fit.parameter(name, combine_chains=False), dtype=float)
+        for chain in range(values.shape[0]):
+            axis.plot(values[chain], linewidth=0.8, alpha=0.8, label=f"chain {chain + 1}")
+        if name in truths:
+            axis.axhline(float(truths[name]), color="black", linestyle="--", label="truth")
+        axis.set_ylabel(name)
+    axes[0, 0].legend(ncol=min(fit.n_chains + int(bool(truths)), 5), fontsize=8)
+    axes[-1, 0].set_xlabel("retained draw")
+    figure.tight_layout()
+    return figure, axes[:, 0]
+
+
+def plot_loading_deviation_joint(
+    fit,
+    *,
+    channel: str,
+    factor: str | None = None,
+    summary: str = "factor_projection",
+    baseline=None,
+    truth=None,
+    ax=None,
+):
+    """Joint posterior revealing loading--deviation compensation."""
+
+    import matplotlib.pyplot as plt
+
+    paired = fit.loading_deviation_draws(
+        channel,
+        factor,
+        summary=summary,
+        baseline=baseline,
+    )
+    loading = paired["loading"]
+    deviation = paired["deviation_summary"]
+    correlation = fit.loading_deviation_correlation(
+        channel,
+        factor,
+        summary=summary,
+        baseline=baseline,
+    )
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(6.5, 5.5))
+    else:
+        figure = ax.figure
+    ax.scatter(loading, deviation, s=10, alpha=0.25, color="C0")
+    if truth is not None:
+        ax.scatter(
+            [float(truth[0])],
+            [float(truth[1])],
+            marker="*",
+            s=130,
+            color="black",
+            label="truth",
+        )
+        ax.legend()
+    ax.set_xlabel("factor loading")
+    ax.set_ylabel(str(summary).replace("_", " "))
+    suffix = "undefined (fixed loading)" if not np.isfinite(correlation) else f"{correlation:.3f}"
+    ax.set_title(f"{channel}: loading vs deviation; posterior corr = {suffix}")
+    return figure, ax
+
+
+def plot_loading_deviation_correlations(
+    fit,
+    *,
+    factor: str | None = None,
+    channels=None,
+    summaries=("factor_projection", "final_change"),
+    baseline=None,
+    ax=None,
+):
+    """Compare loading--deviation posterior correlations across channels."""
+
+    import matplotlib.pyplot as plt
+
+    selected = list(fit.channel_names if channels is None else channels)
+    summaries = list(summaries)
+    values = np.asarray(
+        [
+            [
+                fit.loading_deviation_correlation(
+                    channel,
+                    factor,
+                    summary=summary,
+                    baseline=baseline,
+                )
+                for channel in selected
+            ]
+            for summary in summaries
+        ],
+        dtype=float,
+    )
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(max(7.0, 1.2 * len(selected)), 4.5))
+    else:
+        figure = ax.figure
+    positions = np.arange(len(selected), dtype=float)
+    width = 0.8 / max(len(summaries), 1)
+    for index, summary in enumerate(summaries):
+        offset = (index - 0.5 * (len(summaries) - 1)) * width
+        ax.bar(
+            positions + offset,
+            values[index],
+            width=width,
+            label=str(summary).replace("_", " "),
+        )
+    ax.axhline(0.0, color="0.4", linewidth=0.8)
+    ax.axhline(0.7, color="0.6", linewidth=0.7, linestyle="--")
+    ax.axhline(-0.7, color="0.6", linewidth=0.7, linestyle="--")
+    ax.set_xticks(positions, selected)
+    ax.set_ylim(-1.05, 1.05)
+    ax.set_ylabel("posterior correlation")
+    ax.set_title("Loading--idiosyncratic-deviation confounding")
+    ax.legend(fontsize=8)
+    figure.tight_layout()
+    return figure, ax
+
+
+def plot_idiosyncratic_innovations(
+    fit,
+    *,
+    channel: str,
+    factor: str | None = None,
+    credible_interval: float = 0.90,
+    truth=None,
+    ax=None,
+):
+    """Plot posterior channel-specific innovations ``Delta alpha[t]``."""
+
+    import matplotlib.pyplot as plt
+
+    values = fit.idiosyncratic_innovation_draws(channel, factor)
+    lower, median, upper = _interval(values, credible_interval)
+    x = _time(fit)[1:]
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(10, 4))
+    else:
+        figure = ax.figure
+    ax.fill_between(x, lower, upper, color="C1", alpha=0.18)
+    ax.plot(x, median, color="C1", label="posterior median innovation")
+    if truth is not None:
+        truth_values = np.asarray(truth, dtype=float).reshape(-1)
+        if truth_values.size == fit.n_time:
+            truth_values = np.diff(truth_values)
+        if truth_values.size != fit.n_time - 1:
+            raise ValueError("truth must have length n_time or n_time - 1.")
+        ax.plot(x, truth_values, color="black", linewidth=0.9, label="truth")
+    ax.axhline(0.0, color="0.4", linewidth=0.8)
+    ax.set_title(f"{channel}: idiosyncratic innovations")
+    ax.set_ylabel("Delta alpha")
+    ax.legend(fontsize=8)
+    return figure, ax
+
+
 def plot_level_slope(fit, *, credible_interval: float = 0.90, figsize=(9, 7)):
     import matplotlib.pyplot as plt
 
@@ -391,8 +702,22 @@ def plot_fit(fit, kind: str = "state", **kwargs):
             return plot_channel_predictor(fit, **kwargs)
         if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
             return plot_process_sds(fit, **kwargs)
+        if key in {"decomposition", "factor_decomposition"}:
+            return plot_factor_decomposition(fit, **kwargs)
+        if key in {"parameter_density", "parameter_densities", "densities"}:
+            return plot_parameter_densities(fit, **kwargs)
+        if key in {"trace", "traces", "process_sd_traces"}:
+            return plot_process_sd_traces(fit, **kwargs)
+        if key in {"loading_deviation", "loading_deviation_joint"}:
+            return plot_loading_deviation_joint(fit, **kwargs)
+        if key in {"identification", "loading_deviation_correlations"}:
+            return plot_loading_deviation_correlations(fit, **kwargs)
+        if key in {"idiosyncratic_innovations", "idio_innovations"}:
+            return plot_idiosyncratic_innovations(fit, **kwargs)
         raise ValueError(
-            "Factor-model kind must be channel, factor, or process_sd."
+            "Factor-model kind must be channel, factor, process_sd, "
+            "factor_decomposition, parameter_density, traces, "
+            "loading_deviation, identification, or idiosyncratic_innovations."
         )
     if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
         return plot_process_sds(fit, **kwargs)

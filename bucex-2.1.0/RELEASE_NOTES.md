@@ -1,8 +1,32 @@
-# bucex 2.1.2 release notes
+# bucex 2.1.4 release notes
 
-`bucex` 2.1.2 is a modular Bayesian structural time-series package for both
+`bucex` 2.1.4 is a modular Bayesian structural time-series package for both
 single-series models and shared-factor models with Gaussian and/or GEV
 observation channels.
+
+## What changed in 2.1.4
+
+- Gaussian, GEV, centered/disturbance, FS, and factor samplers now use one
+  progress vocabulary. Lines show chain, `it`, phase, saved draws, current
+  scientific parameters, elapsed time, and ETA. PGAS adds particle ESS,
+  ancestor diversity, and path change. `MCMC.progress_every` controls cadence.
+- Factor-prior profile names now tolerate whitespace, hyphens, UK spelling,
+  and documented aliases such as `horseshoe`, `pc`, and `normal`. Invalid
+  values report the received name and distinguish factor from univariate-only
+  profiles.
+- `identified_factor_priors()` declares smooth-factor, pure-reference, or
+  fixed-idiosyncratic sensitivity constraints without manual prior surgery.
+- `factor_identification_diagnostics()`, loading/deviation correlations, and
+  idiosyncratic-innovation draws expose the remaining dynamic identification
+  ridge. The release no longer implies that a sampler move alone identifies
+  `lambda[i] * f[t]` and `alpha[i,t]` separately.
+- The factor plotting API now covers decompositions with credible bands,
+  posterior densities with truth markers, chain-specific innovation-SD
+  traces, loading/deviation joint plots and correlations, and
+  idiosyncratic-innovation paths.
+- Numbered, configurable play scripts compare Gaussian versus GEV fits,
+  parameterizations, priors, Gaussian and mixed factors, independent
+  bulk/tail fits, and the six-channel Uccle model.
 
 ## Which API to use
 
@@ -20,7 +44,7 @@ kept separate from inference internals. New components and observation
 families can therefore be added without turning the user-facing API into a
 sampler-specific interface.
 
-## Identification and factor-loading changes
+## Identification and factor-loading behavior
 
 - `LocalLinearTrend(initial_slope_sd=0.0)` now fixes a factor's initial slope
   exactly instead of attempting a degenerate MCMC update.
@@ -32,6 +56,10 @@ sampler-specific interface.
 - `FitResult.normalized_factor(...)` provides an explicit baseline convention.
 - `FitResult.channel_decomposition(...)` separates baseline, shared factor,
   idiosyncratic deviation, seasonality, and reconstructed predictor draws.
+- `FitResult.factor_identification_diagnostics(...)` reports posterior
+  loading correlations with factor-like and endpoint summaries of each
+  persistent deviation. A ridge flag is an interpretation warning, not a
+  convergence diagnosis.
 
 Resolved loading kernels and fixed factor slopes are recorded in sampler
 diagnostics, making inference choices inspectable after a fit.
@@ -44,7 +72,7 @@ Python 3.10 or newer is required.
 
 ## Included checks
 
-The release contains 54 source tests plus fixed-seed univariate and mixed
+The release contains 63 source tests plus fixed-seed univariate and mixed
 factor validators. The mixed validator covers two Gaussian and four GEV
 channels, exact FS/centered predictor agreement, loading-kernel routing,
 archive round trips, and exact channel-decomposition reconstruction.

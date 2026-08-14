@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from ..components import DummySeasonal, LocalLinearTrend, Regression
+from ..components import DummySeasonal, LocalLevel, LocalLinearTrend, Regression
 from ..models.compiler import CompiledModel
 
 
@@ -140,6 +140,25 @@ def inference_plan(
             "Channel likelihoods are conditionally independent given shared and "
             "individual states; residual/copula dependence is not modeled."
         )
+        competing = []
+        for factor in compiled.model.factors:
+            for channel_name in factor.estimated_channels:
+                channel = compiled.model.channel(channel_name)
+                if any(
+                    isinstance(component, LocalLevel)
+                    and component.mode == "dynamic"
+                    for component in channel.components
+                ):
+                    competing.append(f"{factor.name}:{channel_name}")
+        if competing:
+            warnings.append(
+                "Estimated loadings coexist with persistent idiosyncratic local "
+                "levels for "
+                + ", ".join(competing)
+                + ". Their sum can be well identified while the shared/deviation "
+                "split remains prior-sensitive; inspect "
+                "fit.factor_identification_diagnostics()."
+            )
     state_update = {
         "ffbs": "exact Gaussian FFBS",
         "pgas": "conditional SMC with ancestor sampling",

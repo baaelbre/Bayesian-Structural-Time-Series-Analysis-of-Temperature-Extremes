@@ -17,6 +17,7 @@ bucex/
     plan.py         compatibility and exactness resolution
     state/           scalar/vector FFBS, iterated Laplace and PGAS kernels
     fit/             univariate/factor samplers and private FS kernels
+      factor_loading.py  collapsed/interwoven factor-loading blocks
   core/             FitResult and numerical primitives
   diagnostics/      chain, engine and predictive diagnostics
   datasets/         Uccle data workflow
@@ -102,6 +103,14 @@ independence is an explicit model assumption and is recorded in plan warnings.
 
 ASIS adds the complementary sweep but does not change the stored semantic
 state representation.
+
+The v2.1.2 factor FS strategy composes loading kernels by observation family.
+Gaussian estimated-loading channels use a small augmented DLM that integrates
+the intercept, loading, and channel random walk for scale proposals and draws
+them jointly with FFBS. GEV channels use a centered-scale transformation that
+changes the loading and deviation together while holding the predictor fixed.
+Both return an FS path and record their routing in sampler diagnostics; neither
+leaks a second public sampler or result type.
 
 All factor models support centered and disturbance strategies. The v2.1 FS
 strategy additionally accepts the identified one-factor layout: one shared

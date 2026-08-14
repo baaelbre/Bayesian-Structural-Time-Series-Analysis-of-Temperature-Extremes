@@ -71,6 +71,7 @@ common = bx.Factor(
             initial_level=0.0,
             initial_slope=0.0,
             initial_level_sd=0.0,
+            initial_slope_sd=0.0,
         ),
     ),
     loadings={
@@ -99,11 +100,39 @@ The transformation (f_t\mapsto a f_t),
 (\lambda_i\mapsto\lambda_i/a) leaves the predictor unchanged. A fixed
 non-zero loading removes scale and sign invariance. Fixing (f_0=0) removes
 the location invariance between the factor and the channel baselines (c_i).
+With `initial_slope_sd=0`, the initial factor rate is also a fixed initial
+condition rather than a static MCMC coefficient. Stochastic slope innovations
+still allow the rate to evolve immediately after time zero.
 
 Strongly regularized idiosyncratic innovations are also scientifically
 important. Without them, a flexible shared random trend and six equally
 flexible channel random trends can divide the same low-frequency signal in
 many weakly identified ways.
+
+Version 2.1.4 makes those restrictions explicit rather than hiding them in
+example-specific prior edits:
+
+```python
+compiled = bx.compile_model(model, data)
+priors = bx.identified_factor_priors(
+    compiled,
+    profile="regularized_horseshoe",
+    smooth_factor=True,          # fix the direct factor-level innovation
+    reference_channel="TXm",    # make TXm a pure low-frequency reference
+)
+```
+
+Alternatives include `fixed_idiosyncratic="all"` for a loading-only
+sensitivity fit, `reference_channel=None` for smooth-factor-only
+identification, and `smooth_factor=False` for an unrestricted stress test.
+These are different models. Agreement in the complete reconstructed
+predictors does not imply agreement in the shared/idiosyncratic allocation.
+
+After fitting, `factor_identification_diagnostics()` reports correlations
+between each estimated loading and both a factor-like projection and final
+change of its idiosyncratic path. Large absolute correlations and
+`ridge_flag=True` indicate posterior compensation. They are identification
+diagnostics, not substitutes for R-hat, ESS, or simulation recovery.
 
 ## Frühwirth--Schnatter non-centred representation
 
@@ -222,8 +251,19 @@ At every time and particle, the mixed log weight is
 
 One MCMC iteration updates the global latent path, static FS coefficients or
 disturbance scales, channel observation parameters, estimated loadings, and
-horseshoe hyperparameters. Non-Gaussian static blocks use exact
-Metropolis-within-Gibbs updates. PGAS is the exact-invariant state kernel;
+horseshoe hyperparameters. In v2.1.4, an estimated Gaussian-channel loading is
+not conditioned on the previous idiosyncratic path: a marginal Kalman update
+first moves its idiosyncratic scale and a three-state FFBS block then jointly
+draws `(c_i, lambda_i, alpha_i[0:T])`. For a GEV channel, the interweaving move
+
+\[
+\lambda_i'=\lambda_i+\delta,\qquad
+\alpha_{i,t}'=\alpha_{i,t}-\delta f_t
+\]
+
+leaves the observation predictor and GEV support exactly unchanged. A
+path-conditional loading proposal remains as the fallback when the channel
+deviation SD is fixed at zero. PGAS is the exact-invariant state kernel;
 Laplace is explicitly marked approximate.
 
 ## Results and interpretation
@@ -235,8 +275,24 @@ fit.factor_probabilities("common", start_year=1950, end_year=2022)
 fit.loading_draws("common", "TXx", original_scale=True)
 fit.loading_probability("common", "TXx", threshold=1.0)
 fit.reconstructed_state("TXx")
+fit.normalized_factor(slice(0, 30 * 12), "common")
+parts = fit.channel_decomposition(
+    "TXx", "common", baseline=slice(0, 30 * 12)
+)
+parts["baseline"], parts["shared"], parts["deviation"], parts["seasonal"]
+parts["predictor"]
 fit.channel_rate_draws("TXx", 1950, 2022)
 fit.return_level_draws(100, channel="TXx")
+fit.idiosyncratic_innovation_draws("TXx")
+fit.loading_deviation_correlation("TXx", summary="factor_projection")
+fit.factor_identification_diagnostics()
+
+fit.plot("factor_decomposition", baseline=slice(0, 30 * 12))
+fit.plot("parameter_density", parameters=["loading.common.TXx"])
+fit.plot("traces")
+fit.plot("loading_deviation", channel="TXx")
+fit.plot("identification")
+fit.plot("idiosyncratic_innovations", channel="TXx")
 ```
 
 A loading above one means that the `TXx` contribution associated with the
@@ -244,6 +300,14 @@ shared factor is more sensitive than the anchored `TXm` contribution. It is
 not by itself proof that the complete `TXx` trend is faster, because the
 idiosyncratic deviation may reinforce or offset it. Base total-channel claims
 on reconstructed-state or channel-rate draws.
+
+The semantic channel-level state is `c_i + alpha_i,t`, not `alpha_i,t` alone.
+`channel_decomposition()` performs the subtraction, applies lower-tail
+orientation when needed, compensates the intercept for baseline factor
+centering, and checks that all returned pieces reconstruct the predictor.
+The decomposition plot places credible bands on the predictor, shared, and
+idiosyncratic panels. Simulation truths can be overlaid on all new recovery
+plots.
 
 ## Scope
 

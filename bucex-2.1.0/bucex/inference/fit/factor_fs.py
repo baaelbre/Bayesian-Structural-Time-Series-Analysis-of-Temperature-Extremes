@@ -25,13 +25,26 @@ from ..state.laplace import (
 )
 from ..state.particle import pgas
 from .disturbance import _adapt, _prior_logpdf
-from ._progress import mcmc_progress_line
+from ._progress import (
+    factor_progress_parameters,
+    mcmc_progress_line,
+    progress_interval,
+    should_report_progress,
+)
 from .factor import _initial_parameters, _loading_sweep, _observation_sweep
 from .factor_horseshoe import (
     factor_horseshoe_coefficient_logpdf,
     factor_horseshoe_logpdf,
     initialise_factor_horseshoe,
     update_factor_horseshoe,
+)
+from .factor_loading import (
+    collapsed_gaussian_intercept_keys,
+    collapsed_gaussian_loading_keys,
+    collapsed_gaussian_loading_sweep,
+    collapsed_gaussian_processes,
+    collapsed_gaussian_scale_sweep,
+    loading_deviation_interweave_sweep,
 )
 from .fs_utils import (
     NCPLayout,
@@ -52,12 +65,15 @@ Array = np.ndarray
 class FactorFSBlock:
     kind: str
     name: str
+    compiled: Any
     centered_slice: slice
     ncp_slice: slice
     layout: NCPLayout
     process_by_component: Mapping[str, str]
     alpha0_key: str
     beta0_key: str | None
+    beta0_fixed: bool
+    beta0_value: float | None
     seasonal_keys: tuple[str, ...]
 
 
@@ -158,6 +174,20 @@ class CompiledFactorFS:
                 if block.kind == "factor" and layout.has_beta
                 else None
             )
+            beta0_fixed = bool(
+                block.kind == "factor"
+                and isinstance(trend, LocalLinearTrend)
+                and trend.trend_mode != "off"
+                and trend.initial_slope_sd is not None
+                and np.isclose(float(trend.initial_slope_sd), 0.0)
+            )
+            beta0_value = (
+                float(trend.initial_slope)
+                if block.kind == "factor"
+                and isinstance(trend, LocalLinearTrend)
+                and trend.trend_mode != "off"
+                else None
+            )
             seasonal_keys = tuple(
                 f"initial_seasonal.{block.name}[{index + 1}]"
                 for index in range(layout.season_dim)
@@ -166,12 +196,15 @@ class CompiledFactorFS:
                 FactorFSBlock(
                     kind=block.kind,
                     name=block.name,
+                    compiled=block.compiled,
                     centered_slice=block.state_slice,
                     ncp_slice=ncp_slice,
                     layout=layout,
                     process_by_component=process_by_component,
                     alpha0_key=alpha0_key,
                     beta0_key=beta0_key,
+                    beta0_fixed=beta0_fixed,
+                    beta0_value=beta0_value,
                     seasonal_keys=seasonal_keys,
                 )
             )
@@ -469,7 +502,9 @@ def _initial_fs_parameters(
             params[block.alpha0_key] = float(factor_trend.initial_level or 0.0)
             if block.beta0_key is not None:
                 params[block.beta0_key] = float(
-                    priors.factor_initial_slope[block.name].mean
+                    block.beta0_value
+                    if block.beta0_fixed
+                    else priors.factor_initial_slope[block.name].mean
                 )
         else:
             params[block.alpha0_key] = float(priors.intercept[block.name].mean)
@@ -493,6 +528,21 @@ def _initial_fs_parameters(
             if not np.isclose(float(value), 0.0):
                 raise ValueError("The shared factor initial level is fixed to zero.")
             continue
+        fixed_beta = next(
+            (
+                block
+                for block in fs.blocks
+                if block.beta0_key == name and block.beta0_fixed
+            ),
+            None,
+        )
+        if fixed_beta is not None:
+            if not np.isclose(float(value), float(fixed_beta.beta0_value)):
+                raise ValueError(
+                    f"{name} is fixed at {float(fixed_beta.beta0_value):g} "
+                    "by LocalLinearTrend.initial_slope_sd=0."
+                )
+            continue
         params[name] = float(value)
     for name in compiled.noise_names:
         signed_key = f"signed_sd.{name}"
@@ -513,7 +563,7 @@ def _mutable_fs_parameters(
     for block in fs.blocks:
         if block.kind == "channel":
             names.append(block.alpha0_key)
-        if block.beta0_key is not None:
+        if block.beta0_key is not None and not block.beta0_fixed:
             names.append(block.beta0_key)
         names.extend(block.seasonal_keys)
     # Fixed-process filtering is performed with the actual prior in the sweep;
@@ -574,9 +624,15 @@ def _fs_static_sweep(
         y, fs.eta(path, params=params), fs, params
     )
     accepted: dict[str, bool] = {}
+    blocked_intercepts = collapsed_gaussian_intercept_keys(compiled)
+    blocked_processes = collapsed_gaussian_processes(compiled, fs)
     for key in _mutable_fs_parameters(compiled, fs):
+        if key in blocked_intercepts:
+            continue
         if key.startswith("signed_sd."):
             process = key.removeprefix("signed_sd.")
+            if process in blocked_processes:
+                continue
             if isinstance(priors.process[process], FixedSD):
                 accepted[key] = False
                 continue
@@ -624,10 +680,13 @@ def _fs_asis_scale_sweep(
     *,
     adapt: bool,
     iteration: int,
+    skip_processes: frozenset[str] = frozenset(),
 ) -> tuple[Array, dict[str, bool], dict[str, float]]:
     centered = fs.to_centered(path, params)
     accepted: dict[str, bool] = {}
     for process in compiled.noise_names:
+        if process in skip_processes:
+            continue
         prior = priors.process[process]
         label = f"asis.signed_sd.{process}"
         if isinstance(prior, FixedSD):
@@ -808,15 +867,20 @@ def sample_factor_fs_posterior(
         for name in metric_names
     }
     mutable_static = _mutable_fs_parameters(compiled, fs)
+    collapsed_loading_keys = collapsed_gaussian_loading_keys(compiled)
+    collapsed_intercepts = collapsed_gaussian_intercept_keys(compiled)
+    collapsed_processes = collapsed_gaussian_processes(compiled, fs)
     acceptance_names = [
-        *mutable_static,
+        *(name for name in mutable_static if name not in collapsed_intercepts),
         *compiled.observation_parameter_names,
         *compiled.estimated_loading_names,
         *horseshoe_names,
     ]
     if plan.asis:
         acceptance_names.extend(
-            f"asis.signed_sd.{name}" for name in compiled.noise_names
+            f"asis.signed_sd.{name}"
+            for name in compiled.noise_names
+            if name not in collapsed_processes
         )
     acceptance_names = list(dict.fromkeys(acceptance_names))
     acceptance_by_chain = {name: [] for name in acceptance_names}
@@ -848,7 +912,7 @@ def sample_factor_fs_posterior(
                 steps[block.alpha0_key] = max(
                     0.02 * priors.intercept[block.name].sd, 1e-6
                 )
-            if block.beta0_key is not None:
+            if block.beta0_key is not None and not block.beta0_fixed:
                 steps[block.beta0_key] = max(
                     0.05 * priors.factor_initial_slope[block.name].sd, 1e-10
                 )
@@ -861,8 +925,12 @@ def sample_factor_fs_posterior(
                 reference = priors.horseshoe.coefficient_scale_for(name)
             else:
                 reference = max(float(priors.process[name].initial()), 1e-10)
-            steps[f"signed_sd.{name}"] = max(0.15 * reference, 1e-10)
-            if plan.asis:
+            steps[f"signed_sd.{name}"] = (
+                0.25
+                if name in collapsed_processes
+                else max(0.15 * reference, 1e-10)
+            )
+            if plan.asis and name not in collapsed_processes:
                 steps[f"asis.signed_sd.{name}"] = 0.20
         for channel in compiled.model.channels:
             steps[f"sigma.{channel.name}"] = 0.15
@@ -884,7 +952,9 @@ def sample_factor_fs_posterior(
         accepts = {name: 0 for name in acceptance_names}
         last_metrics = {name: np.nan for name in metric_names}
         saved = 0
-        progress_every = max(1, mcmc.iterations // 20)
+        progress_every = progress_interval(
+            mcmc.iterations, mcmc.progress_every
+        )
         chain_started = perf_counter()
 
         for iteration in range(mcmc.iterations):
@@ -954,6 +1024,7 @@ def sample_factor_fs_posterior(
                     rng,
                     adapt=adapting,
                     iteration=iteration,
+                    skip_processes=collapsed_processes,
                 )
                 for key, outcome in outcomes.items():
                     attempts[key] += 1
@@ -973,6 +1044,62 @@ def sample_factor_fs_posterior(
             for key, outcome in outcomes.items():
                 attempts[key] += 1
                 accepts[key] += int(outcome)
+
+            outcomes, steps = collapsed_gaussian_scale_sweep(
+                y,
+                path,
+                compiled,
+                fs,
+                params,
+                priors,
+                horseshoe_state,
+                steps,
+                rng,
+                adapt=adapting,
+                iteration=iteration,
+            )
+            for key, outcome in outcomes.items():
+                attempts[key] += 1
+                accepts[key] += int(outcome)
+
+            path, outcomes = collapsed_gaussian_loading_sweep(
+                y,
+                path,
+                compiled,
+                fs,
+                params,
+                priors,
+                rng,
+            )
+            for key, outcome in outcomes.items():
+                attempts[key] += 1
+                accepts[key] += int(outcome)
+
+            remaining_loading_keys = tuple(
+                key
+                for key in compiled.estimated_loading_names
+                if key not in collapsed_loading_keys
+            )
+            path, outcomes, steps, interwoven = (
+                loading_deviation_interweave_sweep(
+                    path,
+                    compiled,
+                    fs,
+                    params,
+                    steps,
+                    rng,
+                    keys=remaining_loading_keys,
+                    adapt=adapting,
+                    iteration=iteration,
+                )
+            )
+            for key, outcome in outcomes.items():
+                attempts[key] += 1
+                accepts[key] += int(outcome)
+
+            fallback_loading_keys = tuple(
+                key for key in remaining_loading_keys if key not in interwoven
+            )
             outcomes, steps = _loading_sweep(
                 y,
                 path,
@@ -982,6 +1109,7 @@ def sample_factor_fs_posterior(
                 rng,
                 adapt=adapting,
                 iteration=iteration,
+                keys=fallback_loading_keys,
             )
             for key, outcome in outcomes.items():
                 attempts[key] += 1
@@ -1039,10 +1167,12 @@ def sample_factor_fs_posterior(
                     draw_metrics[name][chain, saved] = value
                 saved += 1
 
-            if mcmc.progress and (
-                (iteration + 1) % progress_every == 0
-                or iteration + 1 == mcmc.warmup
-                or iteration + 1 == mcmc.iterations
+            completed = iteration + 1
+            if mcmc.progress and should_report_progress(
+                completed,
+                total=mcmc.iterations,
+                warmup=mcmc.warmup,
+                every=progress_every,
             ):
                 print(
                     mcmc_progress_line(
@@ -1050,12 +1180,17 @@ def sample_factor_fs_posterior(
                         engine=plan.engine,
                         chain=chain + 1,
                         chains=chains,
-                        completed=iteration + 1,
+                        completed=completed,
                         total=mcmc.iterations,
                         warmup=mcmc.warmup,
                         saved=saved,
                         draws=mcmc.draws,
                         elapsed=perf_counter() - chain_started,
+                        parameters=factor_progress_parameters(
+                            compiled,
+                            params,
+                            horseshoe_state=horseshoe_state,
+                        ),
                         metrics=last_metrics,
                         particles=particles.n if plan.engine == "pgas" else None,
                     ),
@@ -1081,6 +1216,15 @@ def sample_factor_fs_posterior(
         "laplace": asdict(laplace),
         "plan_warnings": list(plan.warnings),
         "fs_state_names": list(fs.state_names),
+        "loading_kernels": {
+            key: (
+                "collapsed_gaussian_ffbs"
+                if key in collapsed_loading_keys
+                else "predictor_preserving_interweave_with_path_fallback"
+            )
+            for key in compiled.estimated_loading_names
+        },
+        "collapsed_gaussian_processes": sorted(collapsed_processes),
     }
     return FitResult(
         model=compiled.model,
@@ -1120,6 +1264,20 @@ def sample_factor_fs_posterior(
             "factor_parameterization": "fruehwirth_schnatter",
             "unit_innovation_state": True,
             "signed_innovation_scales": True,
+            "fixed_initial_factor_slopes": {
+                block.name: float(block.beta0_value)
+                for block in fs.blocks
+                if block.kind == "factor" and block.beta0_fixed
+            },
+            "loading_kernels": {
+                key: (
+                    "collapsed_gaussian_ffbs"
+                    if key in collapsed_loading_keys
+                    else "predictor_preserving_interweave_with_path_fallback"
+                )
+                for key in compiled.estimated_loading_names
+            },
+            "collapsed_gaussian_processes": sorted(collapsed_processes),
             "regularized_horseshoe": priors.horseshoe is not None,
             "horseshoe_processes": list(priors.horseshoe_processes),
         },

@@ -32,6 +32,37 @@ The v2.1 factor FS layout requires:
 - at most one dynamic dummy-seasonal block per channel;
 - no channel regressions in the FS graph.
 
+For an identified smooth factor, declare both initial conditions explicitly:
+
+```python
+bx.LocalLinearTrend(
+    initial_level=0.0,
+    initial_level_sd=0.0,
+    initial_slope=0.0,
+    initial_slope_sd=0.0,
+)
+```
+
+The slope remains dynamically stochastic when its process SD is non-zero;
+only the initial coefficient is fixed.
+
+Factor scale/sign anchoring is necessary but not sufficient to distinguish an
+estimated loading times a persistent factor from an unrestricted persistent
+channel deviation. Use `identified_factor_priors()` to declare smooth-factor,
+pure-reference, or fixed-idiosyncratic restrictions, and inspect
+`factor_identification_diagnostics()` after every decomposition fit.
+
+## Factor loading kernels
+
+| Channel | Kernel | Path treatment |
+| --- | --- | --- |
+| Gaussian with estimated loading | Collapsed scale MH + exact augmented FFBS | Integrates and redraws intercept, loading, and idiosyncratic random walk |
+| GEV with non-zero idiosyncratic SD | Predictor-preserving interweaving | Changes loading and deviation jointly; likelihood/support unchanged |
+| GEV with fixed-zero idiosyncratic SD | Path-conditional Metropolis fallback | Loading changes the predictor directly |
+
+These kernels are internal strategy blocks. They do not introduce another fit
+function, result type, or parameterization.
+
 `parameterization="auto"` chooses FS when that layout is satisfied and
 disturbance otherwise. Aliases `fs`, `ncp`, `noncentered`, and `noncentred`
 select the FS construction explicitly.
@@ -63,3 +94,11 @@ For factors, `fit.plan.backend == "factor_state_space"`. The plan warning that
 channels are conditionally independent given the latent states is part of the
 model contract: the shared factor induces marginal dependence, but no residual
 copula is present.
+
+## Progress contract
+
+All sampler/parameterization combinations honor `MCMC(progress=True)` and
+`MCMC(progress_every=...)`. The common line reports chain, `it`, phase, saved
+draws, current parameters, elapsed time, and ETA. Factor parameters are grouped
+compactly by channel/process; PGAS adds particle ESS, distinct ancestors, and
+path-change fraction, while Laplace adds inner-iteration convergence fields.

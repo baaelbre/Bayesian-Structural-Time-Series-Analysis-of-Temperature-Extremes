@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,12 @@ from ..state.particle import pgas
 from ..plan import InferencePlan
 from ...priors.process import FixedSD, Priors, SpikeSlabSD
 from ...core.fit import FitResult
+from ._progress import (
+    mcmc_progress_line,
+    progress_interval,
+    should_report_progress,
+    univariate_progress_parameters,
+)
 
 
 Array = np.ndarray
@@ -408,7 +415,10 @@ def sample_posterior(
         accepts = {name: 0 for name in acceptance_by_chain}
         saved = 0
         last_metrics = {name: np.nan for name in metric_names}
-        progress_every = max(1, total_iterations // 20)
+        progress_every = progress_interval(
+            total_iterations, mcmc.progress_every
+        )
+        chain_started = perf_counter()
 
         for iteration in range(total_iterations):
             # State update.
@@ -555,16 +565,42 @@ def sample_posterior(
                     draw_metrics[name][chain, saved] = value
                 saved += 1
 
-            if mcmc.progress and (
-                (iteration + 1) % progress_every == 0 or iteration + 1 == total_iterations
+            completed = iteration + 1
+            if mcmc.progress and should_report_progress(
+                completed,
+                total=total_iterations,
+                warmup=mcmc.warmup,
+                every=progress_every,
             ):
-                message = (
-                    f"[chain {chain + 1}/{chains} iteration {iteration + 1}/{total_iterations}] "
-                    f"sigma={params['sigma']:.4g}"
+                state_parameters = {
+                    {
+                        "level": "q_level",
+                        "slope": "q_trend",
+                        "seasonal": "q_season",
+                    }.get(name, f"q_{name}"): float(params[f"sd.{name}"]) ** 2
+                    for name in compiled.noise_names
+                }
+                print(
+                    mcmc_progress_line(
+                        label="univariate",
+                        engine=plan.engine,
+                        chain=chain + 1,
+                        chains=chains,
+                        completed=completed,
+                        total=total_iterations,
+                        warmup=mcmc.warmup,
+                        saved=saved,
+                        draws=draws,
+                        elapsed=perf_counter() - chain_started,
+                        parameters=univariate_progress_parameters(
+                            state_parameters,
+                            params,
+                        ),
+                        metrics=last_metrics,
+                        particles=particles.n if plan.engine == "pgas" else None,
+                    ),
+                    flush=True,
                 )
-                if compiled.family == "gev":
-                    message += f" xi={params['xi']:.3f}"
-                print(message)
 
         for name in acceptance_by_chain:
             acceptance_by_chain[name].append(

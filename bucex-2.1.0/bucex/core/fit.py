@@ -345,6 +345,333 @@ class FitResult:
             original_scale=original_scale,
         )
 
+    def _baseline_index(self, baseline: slice | Array) -> Array:
+        if isinstance(baseline, slice):
+            index = np.arange(self.n_time)[baseline]
+        else:
+            supplied = np.asarray(baseline)
+            if supplied.dtype == bool:
+                if supplied.shape != (self.n_time,):
+                    raise ValueError(
+                        "A boolean baseline mask must have length n_time."
+                    )
+                index = np.flatnonzero(supplied)
+            else:
+                index = supplied.astype(int, copy=False).reshape(-1)
+        if index.size == 0:
+            raise ValueError("The factor baseline may not be empty.")
+        if np.any(index < 0) or np.any(index >= self.n_time):
+            raise IndexError("Factor baseline indices are outside the fitted period.")
+        return np.asarray(index, dtype=int)
+
+    def normalized_factor(
+        self,
+        baseline: slice | Array,
+        factor: str | None = None,
+        *,
+        return_shift: bool = False,
+    ) -> Array | tuple[Array, Array]:
+        """Center a shared factor draw-by-draw over a baseline period.
+
+        ``baseline`` is a slice, integer-index array, or boolean mask over the
+        fitted observations.  This is an interpretation-preserving location
+        normalization; channel baselines must be shifted by their loading when
+        decomposing a predictor.  Set ``return_shift=True`` to receive those
+        draw-specific shifts as the second return value.
+        """
+
+        values = self.factor(self._factor_name(factor))
+        index = self._baseline_index(baseline)
+        shift = np.mean(values[:, index], axis=1)
+        normalized = values - shift[:, None]
+        return (normalized, shift) if return_shift else normalized
+
+    def channel_decomposition(
+        self,
+        channel: str,
+        factor: str | None = None,
+        *,
+        baseline: slice | Array | None = None,
+        original_scale: bool = True,
+    ) -> dict[str, Any]:
+        """Return baseline, shared, deviation, and complete predictor draws.
+
+        For the identified one-factor/local-level model this separates
+
+        ``eta[channel,t] = baseline[channel] + loading[channel] * factor[t]
+        + deviation[channel,t] + seasonal[channel,t]``.
+
+        A supplied baseline centers the factor over that period and shifts the
+        static channel baseline by the exactly compensating amount.  The sum
+        is checked against :meth:`reconstructed_state` before returning.
+        """
+
+        resolved = self._factor_name(factor)
+        if channel not in self.channel_names:
+            raise KeyError(
+                f"Unknown channel '{channel}'. Available: {self.channel_names}"
+            )
+        state_name = f"channel.{channel}.level"
+        if state_name not in self.state_names:
+            raise ValueError(
+                "channel_decomposition requires a channel LocalLevel state."
+            )
+        intercept_key = f"intercept.{channel}"
+        if intercept_key not in self.parameter_draws:
+            raise ValueError(
+                "channel_decomposition requires an explicit FS channel intercept."
+            )
+
+        factor_values = self.factor(resolved)
+        factor_shift = np.zeros(self.n_draws, dtype=float)
+        if baseline is not None:
+            factor_values, factor_shift = self.normalized_factor(
+                baseline,
+                resolved,
+                return_shift=True,
+            )
+        loading_internal = self.loading_draws(
+            resolved, channel, original_scale=False
+        )
+        intercept_internal = self.parameter(intercept_key)
+        channel_level_internal = self.state(state_name)
+        channel_block = next(
+            block
+            for block in self.compiled.blocks
+            if block.kind == "channel" and block.name == channel
+        )
+        block_paths = self.state_draws[
+            :, :, 1:, channel_block.state_slice
+        ]
+        block_design = channel_block.compiled.design(self.n_time)
+        channel_total_internal = np.einsum(
+            "cdtm,tm->cdt", block_paths, block_design
+        ).reshape(self.n_draws, self.n_time)
+        sign = (
+            float(
+                np.asarray(self.transform_sign)[
+                    self.channel_names.index(channel)
+                ]
+            )
+            if original_scale
+            else 1.0
+        )
+        loading = sign * loading_internal
+        baseline_values = sign * (
+            intercept_internal + loading_internal * factor_shift
+        )
+        shared = loading[:, None] * factor_values
+        deviation = sign * (
+            channel_level_internal - intercept_internal[:, None]
+        )
+        seasonal = sign * (
+            channel_total_internal - channel_level_internal
+        )
+        predictor = self.reconstructed_state(
+            channel, original_scale=original_scale
+        )
+        reconstructed = (
+            baseline_values[:, None] + shared + deviation + seasonal
+        )
+        error = float(np.max(np.abs(reconstructed - predictor)))
+        tolerance = 1e-8 * (1.0 + float(np.max(np.abs(predictor))))
+        if error > tolerance:
+            raise FloatingPointError(
+                "The factor/channel decomposition does not reconstruct the predictor."
+            )
+        return {
+            "baseline": baseline_values,
+            "factor": factor_values,
+            "factor_shift": factor_shift,
+            "loading": loading,
+            "shared": shared,
+            "deviation": deviation,
+            "seasonal": seasonal,
+            "predictor": predictor,
+            "reconstruction_error": np.asarray(error),
+        }
+
+    def idiosyncratic_innovation_draws(
+        self,
+        channel: str,
+        factor: str | None = None,
+        *,
+        original_scale: bool = True,
+    ) -> Array:
+        """Posterior draws of ``Delta alpha[channel,t]``.
+
+        The accumulated idiosyncratic path can trade off against an estimated
+        loading. Its increments are often the more direct diagnostic of what
+        the channel-specific process is learning.
+        """
+
+        decomposition = self.channel_decomposition(
+            channel,
+            factor,
+            original_scale=original_scale,
+        )
+        return np.diff(decomposition["deviation"], axis=1)
+
+    def loading_deviation_draws(
+        self,
+        channel: str,
+        factor: str | None = None,
+        *,
+        summary: str = "final_change",
+        baseline: slice | Array | None = None,
+        original_scale: bool = True,
+    ) -> dict[str, Any]:
+        """Paired loading and idiosyncratic-summary draws.
+
+        ``factor_projection`` is the draw-wise least-squares projection of the
+        idiosyncratic path on the common factor. A strong negative correlation
+        between this projection and the loading is direct evidence of the
+        loading/deviation ridge.
+        """
+
+        decomposition = self.channel_decomposition(
+            channel,
+            factor,
+            baseline=baseline,
+            original_scale=original_scale,
+        )
+        deviation = np.asarray(decomposition["deviation"], dtype=float)
+        factor_values = np.asarray(decomposition["factor"], dtype=float)
+        key = str(summary).lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "net_change": "final_change",
+            "cumulative_change": "final_change",
+            "total_variation": "cumulative_absolute_change",
+            "projection": "factor_projection",
+        }
+        key = aliases.get(key, key)
+        if key == "final_change":
+            values = deviation[:, -1] - deviation[:, 0]
+        elif key == "cumulative_absolute_change":
+            values = np.sum(np.abs(np.diff(deviation, axis=1)), axis=1)
+        elif key == "final_level":
+            values = deviation[:, -1]
+        elif key == "mean":
+            values = np.mean(deviation, axis=1)
+        elif key == "factor_projection":
+            centered_factor = factor_values - np.mean(
+                factor_values, axis=1, keepdims=True
+            )
+            centered_deviation = deviation - np.mean(
+                deviation, axis=1, keepdims=True
+            )
+            denominator = np.sum(centered_factor**2, axis=1)
+            values = np.divide(
+                np.sum(centered_factor * centered_deviation, axis=1),
+                denominator,
+                out=np.zeros_like(denominator),
+                where=denominator > 1e-14,
+            )
+        else:
+            raise ValueError(
+                "summary must be final_change, cumulative_absolute_change, "
+                "final_level, mean, or factor_projection."
+            )
+        return {
+            "loading": np.asarray(decomposition["loading"], dtype=float),
+            "deviation_summary": np.asarray(values, dtype=float),
+            "summary": key,
+        }
+
+    def loading_deviation_correlation(
+        self,
+        channel: str,
+        factor: str | None = None,
+        *,
+        summary: str = "factor_projection",
+        baseline: slice | Array | None = None,
+        original_scale: bool = True,
+    ) -> float:
+        """Posterior correlation between a loading and deviation summary."""
+
+        paired = self.loading_deviation_draws(
+            channel,
+            factor,
+            summary=summary,
+            baseline=baseline,
+            original_scale=original_scale,
+        )
+        loading = paired["loading"]
+        deviation = paired["deviation_summary"]
+        if np.std(loading) <= 1e-14 or np.std(deviation) <= 1e-14:
+            return float("nan")
+        return float(np.corrcoef(loading, deviation)[0, 1])
+
+    def factor_identification_diagnostics(
+        self,
+        factor: str | None = None,
+        *,
+        baseline: slice | Array | None = None,
+        threshold: float = 0.70,
+    ):
+        """Diagnose posterior loading--persistent-deviation confounding.
+
+        The method reports correlations for both the final idiosyncratic change
+        and the factor-like projection of that path. Values near ``-1`` or
+        ``+1`` indicate that the complete predictor is better identified than
+        its shared and idiosyncratic decomposition.
+        """
+
+        resolved = self._factor_name(factor)
+        rows = []
+        for channel in self.channel_names:
+            specification = self.model.factor(resolved).loading_for(channel)
+            loading = self.loading_draws(
+                resolved, channel, original_scale=True
+            )
+            projection = self.loading_deviation_draws(
+                channel,
+                resolved,
+                summary="factor_projection",
+                baseline=baseline,
+            )["deviation_summary"]
+            final_change = self.loading_deviation_draws(
+                channel,
+                resolved,
+                summary="final_change",
+                baseline=baseline,
+            )["deviation_summary"]
+
+            def correlation(values: Array) -> float:
+                if np.std(loading) <= 1e-14 or np.std(values) <= 1e-14:
+                    return float("nan")
+                return float(np.corrcoef(loading, values)[0, 1])
+
+            corr_projection = correlation(projection)
+            corr_final = correlation(final_change)
+            finite = [
+                abs(value)
+                for value in (corr_projection, corr_final)
+                if np.isfinite(value)
+            ]
+            rows.append(
+                {
+                    "channel": channel,
+                    "loading_fixed": bool(specification.fixed),
+                    "loading_median": float(np.median(loading)),
+                    "loading_sd": float(np.std(loading, ddof=1)),
+                    "corr_loading_factor_projection": corr_projection,
+                    "corr_loading_final_deviation": corr_final,
+                    "effective_loading_sd": float(
+                        np.std(loading + projection, ddof=1)
+                    ),
+                    "ridge_flag": bool(
+                        finite and max(finite) >= float(threshold)
+                    ),
+                }
+            )
+        try:
+            import pandas as pd
+
+            return pd.DataFrame(rows).set_index("channel")
+        except ImportError:
+            return rows
+
     # Compatibility with the earlier PosteriorBundle API.
     def mu_draws(self, *, original_scale: bool = True) -> Array:
         return self.eta_draws(combine_chains=True, original_scale=original_scale)

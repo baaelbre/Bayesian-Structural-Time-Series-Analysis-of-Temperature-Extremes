@@ -14,6 +14,7 @@ class MCMC:
     chains: int = 4
     seed: int | None = None
     progress: bool = False
+    progress_every: int | None = None
     adapt: bool = True
 
     def __post_init__(self) -> None:
@@ -21,6 +22,8 @@ class MCMC:
             raise ValueError("draws and thin must be positive; warmup must be non-negative.")
         if int(self.chains) < 1:
             raise ValueError("chains must be positive.")
+        if self.progress_every is not None and int(self.progress_every) < 1:
+            raise ValueError("progress_every must be positive when supplied.")
 
     @property
     def iterations(self) -> int:
@@ -34,10 +37,6 @@ class MCMC:
     @property
     def burn(self) -> int:
         return int(self.warmup)
-
-    @property
-    def progress_every(self) -> int | None:
-        return None
 
 
 @dataclass(frozen=True)
@@ -65,6 +64,7 @@ class GibbsConfig:
             chains=int(chains),
             seed=self.seed,
             progress=bool(self.progress),
+            progress_every=self.progress_every,
         )
 
 

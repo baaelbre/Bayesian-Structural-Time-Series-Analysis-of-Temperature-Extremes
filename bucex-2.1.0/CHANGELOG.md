@@ -1,5 +1,53 @@
 # Changelog
 
+## 2.1.4
+
+- Unified MCMC progress output across Gaussian, GEV, generic state-space, FS,
+  and factor samplers. Progress now consistently reports chain, `it`, phase,
+  saved draws, current model parameters, elapsed time, and ETA, with PGAS and
+  Laplace diagnostics where relevant. Added `MCMC.progress_every`.
+- Normalized factor-prior aliases and improved invalid-profile errors. Added
+  `identified_factor_priors()` for smooth-factor, pure-reference, and
+  fixed-idiosyncratic sensitivity specifications.
+- Added posterior loading/deviation diagnostics and idiosyncratic-innovation
+  extraction to `FitResult`. Inference plans now warn when estimated loadings
+  coexist with persistent channel deviations.
+- Added factor decomposition bands, truth-marked parameter densities,
+  chain-specific innovation-SD traces, loading/deviation joint and correlation
+  plots, and idiosyncratic-innovation plots through `fit.plot(...)`.
+- Replaced the large monolithic demonstrations with configurable play scripts
+  for Gaussian, GEV, parameterization, prior, factor, mixed, combined
+  bulk/tail, and Uccle analyses. Every fit example enables progress by default.
+- Added regression and end-to-end plotting tests for the v2.1.4 APIs.
+
+## 2.1.2
+
+- Made `LocalLinearTrend(initial_slope_sd=0.0)` a true fixed initial factor
+  slope in factor FS inference. The coefficient remains stored as a constant
+  draw but is no longer proposed or reported as a failed MCMC update.
+- Added an exact all-Gaussian loading block. Conditional on the shared factor
+  and seasonal path, each eligible channel jointly draws its intercept,
+  loading, and complete idiosyncratic random walk by FFBS. The loading is
+  therefore sampled marginally rather than conditional on a compensating
+  deviation path.
+- Added a collapsed Kalman-likelihood update for the corresponding Gaussian
+  idiosyncratic innovation SD before drawing the loading/deviation block back.
+  This directly targets the loading--variance ridge.
+- Added a predictor-preserving loading/deviation interweaving move for GEV
+  channels. The move leaves the likelihood and GEV support unchanged and is
+  followed by a path-conditional fallback when the deviation SD is fixed at
+  zero.
+- Added `FitResult.normalized_factor()` and
+  `FitResult.channel_decomposition()` so baseline, shared, idiosyncratic, and
+  complete predictor draws are separated without relabeling an intercept as
+  dynamic deviation.
+- Updated the Uccle one-factor helper and factor examples to use fixed initial
+  slopes, smooth/pure-reference identification examples, and the new
+  decomposition API.
+- Added v2.1.2 regression tests for fixed coefficients, collapsed Gaussian
+  coefficient recovery, loading-kernel routing, exact decomposition, and
+  GEV predictor preservation.
+
 ## 2.1.1
 
 - Added an all-Gaussian one-factor channel tutorial using exact FFBS, with a
