@@ -277,12 +277,16 @@ if RUN_FIT:
         "ess_bulk",
         "acceptance",
     ]]
+    
+    all_scalar_parameters = pd.DataFrame.from_dict(
+        fit.static_summary(),
+        orient="index",
+    )
 
     print(
         "\nALL STORED SCALAR PARAMETERS\n",
-        fit.static_summary().round(5).to_string(),
+        all_scalar_parameters.round(5).to_string(),
     )
-
     # Scientific parameters only: the signed FS coefficients and horseshoe
     # hyperparameters remain available through fit.static_summary(), but are
     # excluded here to keep the first Gaussian lesson readable.
