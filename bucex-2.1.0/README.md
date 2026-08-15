@@ -1,4 +1,4 @@
-# bucex 2.1.4
+# bucex 2.1.5
 
 `bucex` fits Bayesian structural time-series models to Gaussian bulk data and
 dynamic-location GEV extremes. Version 2.1 adds the manuscript's single shared
@@ -29,7 +29,13 @@ model = bx.make_uccle_factor_model()
 compiled = bx.compile_model(model, data)
 priors = bx.identified_factor_priors(
     compiled,
-    profile="regularized_horseshoe",
+    profile="regularized_triple_gamma",
+    triple_gamma_options={
+        "spike_shape": 0.10,
+        "tail_shape": 0.10,
+        "learn_global": True,
+        "learn_shapes": False,
+    },
     smooth_factor=True,
     reference_channel="TXm",
 )
@@ -140,7 +146,7 @@ default guided proposal works in unit-disturbance coordinates and retains the
 exact prior/proposal correction. `engine="laplace"` is available as an
 explicitly labelled approximation.
 
-Version 2.1.4 samples the loading/deviation ridge more effectively but does not
+Version 2.1.5 samples the loading/deviation ridge more effectively but does not
 claim that an unrestricted persistent decomposition is identified by the
 likelihood. For Gaussian channels, the intercept, estimated loading,
 idiosyncratic innovation SD, and complete deviation path are updated through
@@ -168,6 +174,54 @@ sd.channel.TXx.level
 ```
 
 Use `priors="regularized"` for calibrated PC priors without the horseshoe.
+
+## Triple gamma, regularized triple gamma, and SSVS
+
+The triple-gamma option implements the normal--gamma--gamma representation of
+Cadonna, Frühwirth-Schnatter, and Knaus (2020). For a standardized signed
+innovation scale (u_j),
+
+\[
+u_j\mid r_j,d_j,\phi\sim N(0,\phi r_j/d_j),\qquad
+r_j\sim\operatorname{Gamma}(a,1),\quad
+d_j\sim\operatorname{Gamma}(c,1).
+\]
+
+The stored shrinkage factor
+(\rho_j=1/(1+\phi r_j/d_j)) is close to one when the structural innovation is
+strongly suppressed and close to zero when it is effectively unshrunk.
+`a=c=0.5` is the horseshoe member; Bayesian-lasso, double-gamma,
+folded/half-t, and Gaussian members arise through the shapes or limits
+described in the paper. The calibrated PC prior remains a separate
+exponential-on-SD construction and is retained as its own profile.
+
+```python
+# Ready-made univariate profiles.
+fit = bx.fit(y, family="gaussian", priors="triple_gamma",
+             parameterization="fruehwirth_schnatter")
+fit_regularized = bx.fit(
+    y,
+    family="gaussian",
+    priors="regularized_triple_gamma",
+    parameterization="fruehwirth_schnatter",
+)
+
+# Direct control of a, c, global-scale learning, and the optional slab.
+priors = bx.triple_gamma_gaussian_priors(
+    spike_shape=0.5,
+    tail_shape=0.5,
+    learn_global=False,
+    global_scale=1.0,
+)
+```
+
+The same `triple_gamma` and `regularized_triple_gamma` profile names work in
+factor models; there they target namespaced idiosyncratic local-level
+innovations. `ssvs` is different: it assigns literal posterior mass to
+zero/fixed/dynamic structures and is currently a univariate structural
+profile. Inspect `component_probabilities()` and
+`component_transition_summary()` rather than treating a constant indicator as
+an ordinary continuous MCMC parameter.
 
 ## Interpreting loadings and rates
 
@@ -222,6 +276,9 @@ fit.plot("level_slope")                    # structural level and latent slope
 fit.plot("process_sd", truths=truth)       # prior, posterior, and optional truth
 fit.plot("parameter_density", parameters=["sigma", "xi"])
 fit.plot("traces")                         # every innovation SD, by chain
+fit.plot("acf")                            # ACF computed within each chain
+fit.plot("predictor", save="figures/predictor.png")
+fit.plot("process_sd", save={"path": "figures/prior.png", "dpi": 300})
 ```
 
 Factor fits add the plots needed for decomposition recovery and identification
@@ -234,11 +291,15 @@ fit.plot("traces")                         # every innovation SD, by chain
 fit.plot("loading_deviation", channel="TXx")
 fit.plot("identification")
 fit.plot("idiosyncratic_innovations", channel="TXx")
+fit.plot("acf", save="figures/factor_acf.png")
 ```
 
 `factor_decomposition` includes posterior bands for the complete predictor,
 shared contribution, and idiosyncratic path. Simulation truth can be supplied
 to the decomposition, density, trace, joint, and innovation plots.
+Analytic prior curves are used in process-SD plots whenever a closed form is
+available; genuinely integrated hierarchies are labelled as smooth Monte Carlo
+curves.
 
 ## Uniform progress output
 

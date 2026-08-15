@@ -104,7 +104,7 @@ independence is an explicit model assumption and is recorded in plan warnings.
 ASIS adds the complementary sweep but does not change the stored semantic
 state representation.
 
-The v2.1.2 factor FS strategy composes loading kernels by observation family.
+The v2.1.5 factor FS strategy composes loading kernels by observation family.
 Gaussian estimated-loading channels use a small augmented DLM that integrates
 the intercept, loading, and channel random walk for scale proposals and draws
 them jointly with FFBS. GEV channels use a centered-scale transformation that

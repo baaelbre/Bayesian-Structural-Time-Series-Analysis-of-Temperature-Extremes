@@ -1,11 +1,12 @@
 # Release validation
 
-The v2.1.2 release check has four layers:
+The v2.1.5 release check has four layers:
 
 1. retained univariate compatibility and general factor source tests;
-2. v2.1.2 tests for graph eligibility, FS algebra, fixed initial coefficients,
-   collapsed/interwoven loading blocks, horseshoe scope, mixed PGAS, result
-   helpers, and schema 2.1 archives;
+2. v2.1.5 tests for graph eligibility, FS algebra, fixed initial coefficients,
+   collapsed/interwoven loading blocks, horseshoe and triple-gamma scope,
+   mixed PGAS, analytic plotting, ACF/save dispatch, SSVS constant diagnostics,
+   result helpers, and schema 2.1 archives;
 3. `validation/run_factor_validation_v2_1.py` for fixed-seed numerical checks;
 4. wheel/sdist/source-bundle builds plus an isolated installed-wheel smoke test.
 
@@ -20,7 +21,7 @@ python -m build
 
 ## v2.1 factor validator
 
-The validator writes `validation/factor_validation_2.1.2.json` and requires:
+The validator writes `validation/factor_validation_2.1.5.json` and requires:
 
 - the Uccle helper to compile one factor, 74 centered states, and 14 structural
   innovations for 12-month dummy seasonality;
@@ -31,7 +32,7 @@ The validator writes `validation/factor_validation_2.1.2.json` and requires:
   coefficient is set to `1e-14`;
 - the six-channel particle log weight to equal the explicit sum of two
   Gaussian and four GEV log densities;
-- finite FS/PGAS and disturbance/FFBS fits with the regularized horseshoe
+- finite FS/PGAS and disturbance/FFBS fits with hierarchical shrinkage
   restricted to channel local-level innovations;
 - the factor initial slope to remain exactly fixed, Gaussian estimated
   loadings to route through collapsed FFBS, and GEV loadings to route through
@@ -44,7 +45,17 @@ The validator writes `validation/factor_validation_2.1.2.json` and requires:
 
 ## Recorded fixed-seed result
 
-The 2026-08-14 v2.1.2 run passed every section and all 54 source tests. The FS
+The 2026-08-15 v2.1.5 release pass executed 74 source-test cases successfully
+and passed every section of `run_factor_validation_v2_1.py`. The retained
+algebraic errors remained `3.55e-15` for the FS/centered predictor and
+`5.73e-14` for the centered/NCP path round-trip. All explicit mixed-channel
+weights and archive/decomposition checks passed. The intentionally small
+64-particle six-channel chain changed its path in two of three retained draws,
+while its minimum particle ESS was still one; it is a software stress test,
+not a recommended scientific configuration.
+
+The historical 2026-08-14 v2.1.2 run passed every section and all 54 source
+tests. The FS
 and centered predictors agreed
 to `3.55e-15`; the NCP path round-trip error was `5.73e-14`. All nine explicit
 six-channel particle weights matched exactly, with the expected family count
@@ -52,8 +63,8 @@ of two Gaussian and four GEV terms. The baseline/seasonal channel decomposition
 reconstructed the predictor to `3.55e-15`. Semantic and NCP archive round-trip
 errors were zero.
 
-The 24-month, 24-particle Uccle smoke chain changed its conditioned path on two
-of three retained draws and remained finite. Its minimum ESS reached one. That is
+The 24-month, 64-particle Uccle smoke chain is required to change its
+conditioned path and remain finite. Its minimum ESS can still reach one. That is
 useful as a release stress signal, not acceptable evidence for a scientific
 fit: the full 1,572-month record needs substantially more particles, several
 long chains, and inspection of ESS and ancestor diversity over time.

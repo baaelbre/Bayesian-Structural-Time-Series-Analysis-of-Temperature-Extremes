@@ -6,6 +6,8 @@ channels may deviate persistently from the common factor.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -19,6 +21,14 @@ WARMUP = 1_500
 CHAINS = 4
 SEED = 601
 BASELINE = slice(0, 60)
+PRIOR = "triple_gamma"  # try regularized_triple_gamma or regularized_horseshoe
+TRIPLE_GAMMA_OPTIONS = {
+    "spike_shape": 0.10,
+    "tail_shape": 0.10,
+    "learn_global": True,
+    "learn_shapes": False,
+}
+FIGURE_DIR = Path("figures/06_factor_gaussian")
 
 
 def make_model() -> bx.FactorModel:
@@ -85,7 +95,10 @@ def main() -> None:
     compiled = bx.compile_model(model, data)
     priors = bx.identified_factor_priors(
         compiled,
-        profile="regularized_horseshoe",
+        profile=PRIOR,
+        triple_gamma_options=(
+            TRIPLE_GAMMA_OPTIONS if "triple_gamma" in PRIOR else None
+        ),
         smooth_factor=True,                 # no direct common-level shock
         reference_channel="reference",     # no reference idiosyncratic shock
     )
@@ -113,6 +126,17 @@ def main() -> None:
         "\nLOADING--DEVIATION IDENTIFICATION\n",
         fit.factor_identification_diagnostics(baseline=BASELINE).round(3),
     )
+    if fit.priors.triple_gamma is not None:
+        rho = [
+            name for name in fit.parameter_draws
+            if name.startswith("triple_gamma.rho.")
+        ]
+        print(
+            "\nTRIPLE-GAMMA SHRINKAGE FACTORS\n",
+            fit.diagnostics()["parameters"].loc[rho].round(3),
+        )
+
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
 
     state_index = {
         name: index for index, name in enumerate(compiled.state_names)
@@ -147,6 +171,7 @@ def main() -> None:
             },
             "deviation": true_deviation,
         },
+        save=FIGURE_DIR / "decomposition.png",
     )
     fit.plot(
         "parameter_density",
@@ -158,8 +183,10 @@ def main() -> None:
             "loading.common.damped",
         ),
         truths=truth,
+        save=FIGURE_DIR / "densities.png",
     )
-    fit.plot("traces", truths=truth)
+    fit.plot("traces", truths=truth, save=FIGURE_DIR / "traces.png")
+    fit.plot("acf", max_lag=50, save=FIGURE_DIR / "acf.png")
 
     for channel in ("amplified", "damped"):
         alpha = true_deviation[channel]
@@ -169,13 +196,18 @@ def main() -> None:
             summary="final_change",
             baseline=BASELINE,
             truth=(loadings[channel], alpha[-1] - alpha[0]),
+            save=FIGURE_DIR / f"{channel}_loading_deviation.png",
         )
-        fit.plot("idiosyncratic_innovations", channel=channel, truth=alpha)
+        fit.plot(
+            "idiosyncratic_innovations", channel=channel, truth=alpha,
+            save=FIGURE_DIR / f"{channel}_innovations.png",
+        )
 
     fit.plot(
         "identification",
         baseline=BASELINE,
         summaries=("factor_projection", "final_change"),
+        save=FIGURE_DIR / "identification.png",
     )
     plt.show()
 

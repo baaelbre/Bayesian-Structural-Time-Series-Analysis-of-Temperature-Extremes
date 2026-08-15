@@ -88,6 +88,7 @@ def univariate_progress_parameters(
     params_observation: Mapping[str, Any],
     *,
     horseshoe_state: Mapping[str, Any] | None = None,
+    triple_gamma_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Current scientific parameters in the same order for Gaussian and GEV."""
 
@@ -108,6 +109,14 @@ def univariate_progress_parameters(
             output["hs_global"] = horseshoe_state["global"]
         if horseshoe_state.get("slab2") is not None:
             output["hs_slab"] = np.sqrt(float(horseshoe_state["slab2"]))
+    if triple_gamma_state:
+        output["tg_phi"] = triple_gamma_state.get("global")
+        output["tg_a"] = triple_gamma_state.get("a")
+        output["tg_c"] = triple_gamma_state.get("c")
+        if triple_gamma_state.get("slab2") is not None:
+            output["tg_slab"] = np.sqrt(
+                float(triple_gamma_state["slab2"])
+            )
     return output
 
 
@@ -116,6 +125,7 @@ def factor_progress_parameters(
     params: Mapping[str, Any],
     *,
     horseshoe_state: Mapping[str, Any] | None = None,
+    triple_gamma_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compact current-parameter groups for potentially large factor models."""
 
@@ -172,6 +182,14 @@ def factor_progress_parameters(
             output["hs_global"] = horseshoe_state["global"]
         if horseshoe_state.get("slab2") is not None:
             output["hs_slab"] = np.sqrt(float(horseshoe_state["slab2"]))
+    if triple_gamma_state:
+        output["tg_phi"] = triple_gamma_state.get("global")
+        output["tg_a"] = triple_gamma_state.get("a")
+        output["tg_c"] = triple_gamma_state.get("c")
+        if triple_gamma_state.get("slab2") is not None:
+            output["tg_slab"] = np.sqrt(
+                float(triple_gamma_state["slab2"])
+            )
     return output
 
 

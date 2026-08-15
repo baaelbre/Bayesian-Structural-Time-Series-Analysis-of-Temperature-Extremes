@@ -19,7 +19,12 @@ from .process import (
     sd_prior_from_dict,
     shape_prior_from_dict,
 )
-from .structural import DiagonalNormalPrior, NormalPrior, RegularizedHorseshoePrior
+from .structural import (
+    DiagonalNormalPrior,
+    NormalPrior,
+    RegularizedHorseshoePrior,
+    TripleGammaPrior,
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,8 @@ class FactorPriors:
     seasonal_initial: Mapping[str, DiagonalNormalPrior] = field(default_factory=dict)
     horseshoe: RegularizedHorseshoePrior | None = None
     horseshoe_processes: tuple[str, ...] = ()
+    triple_gamma: TripleGammaPrior | None = None
+    triple_gamma_processes: tuple[str, ...] = ()
     profile: str = "custom"
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -73,6 +80,27 @@ class FactorPriors:
                 }
             ),
             "horseshoe_processes": list(self.horseshoe_processes),
+            "triple_gamma": (
+                None
+                if self.triple_gamma is None
+                else {
+                    "coefficient_scale": dict(self.triple_gamma.coefficient_scale),
+                    "spike_shape": float(self.triple_gamma.spike_shape),
+                    "tail_shape": float(self.triple_gamma.tail_shape),
+                    "global_scale": float(self.triple_gamma.global_scale),
+                    "learn_global": bool(self.triple_gamma.learn_global),
+                    "learn_shapes": bool(self.triple_gamma.learn_shapes),
+                    "spike_shape_prior": list(self.triple_gamma.spike_shape_prior),
+                    "tail_shape_prior": list(self.triple_gamma.tail_shape_prior),
+                    "regularized": bool(self.triple_gamma.regularized),
+                    "slab_scale": float(self.triple_gamma.slab_scale),
+                    "slab_df": float(self.triple_gamma.slab_df),
+                    "initial_numerator": float(self.triple_gamma.initial_numerator),
+                    "initial_denominator": float(self.triple_gamma.initial_denominator),
+                    "initial_slab2": self.triple_gamma.initial_slab2,
+                }
+            ),
+            "triple_gamma_processes": list(self.triple_gamma_processes),
             "profile": self.profile,
             "metadata": dict(self.metadata),
         }
@@ -110,6 +138,14 @@ class FactorPriors:
                 else RegularizedHorseshoePrior(**value["horseshoe"])
             ),
             horseshoe_processes=tuple(value.get("horseshoe_processes", ())),
+            triple_gamma=(
+                None
+                if value.get("triple_gamma") is None
+                else TripleGammaPrior(**value["triple_gamma"])
+            ),
+            triple_gamma_processes=tuple(
+                value.get("triple_gamma_processes", ())
+            ),
             profile=value.get("profile", "custom"),
             metadata=value.get("metadata", {}),
         )
@@ -125,6 +161,9 @@ def normalize_factor_prior_profile(profile: str | None) -> str:
         "default": "regularized_horseshoe",
         "rh": "regularized_horseshoe",
         "horseshoe": "regularized_horseshoe",
+        "tg": "triple_gamma",
+        "triplegamma": "triple_gamma",
+        "regularized_tg": "regularized_triple_gamma",
         "pc": "regularized",
         "normal": "half_normal",
     }
@@ -134,12 +173,23 @@ def normalize_factor_prior_profile(profile: str | None) -> str:
 def default_factor_priors(
     compiled: CompiledFactorModel,
     profile: str = "regularized_horseshoe",
+    *,
+    triple_gamma_options: Mapping[str, Any] | None = None,
 ) -> FactorPriors:
-    """Data-scaled defaults that do not depend on record length."""
+    """Data-scaled defaults that do not depend on record length.
+
+    ``triple_gamma_options`` is forwarded to :class:`TripleGammaPrior` after
+    the namespaced, data-scaled coefficient scales have been constructed. It
+    provides a concise factor-model API for changing ``a``, ``c``,
+    global/shape learning, or the optional slab without rebuilding the full
+    :class:`FactorPriors` object.
+    """
 
     key = normalize_factor_prior_profile(profile)
     if key not in {
         "regularized_horseshoe",
+        "triple_gamma",
+        "regularized_triple_gamma",
         "regularized",
         "half_normal",
         "weak",
@@ -148,8 +198,16 @@ def default_factor_priors(
         raise ValueError(
             f"Unknown factor prior profile {profile!r}. Choose "
             "regularized_horseshoe (or horseshoe), regularized (or pc), "
+            "triple_gamma (or tg), regularized_triple_gamma, "
             "half_normal (or normal), weak, or strong. Univariate-only "
             "profiles such as manuscript_lasso are not factor priors."
+        )
+    if triple_gamma_options is not None and key not in {
+        "triple_gamma", "regularized_triple_gamma"
+    }:
+        raise ValueError(
+            "triple_gamma_options requires profile='triple_gamma' or "
+            "'regularized_triple_gamma'."
         )
     multiplier = {"weak": 2.0, "strong": 0.5}.get(key, 1.0)
     process: dict[str, SDPrior] = {}
@@ -196,6 +254,29 @@ def default_factor_priors(
             slab_scale=2.0,
             slab_df=4.0,
         )
+    triple_gamma = None
+    if key in {"triple_gamma", "regularized_triple_gamma"} and idiosyncratic_processes:
+        options: dict[str, Any] = {
+            "coefficient_scale": {
+                name: max(upper_by_process[name], float(compiled.y_scale) * 1e-10)
+                for name in idiosyncratic_processes
+            },
+            "spike_shape": 0.10,
+            "tail_shape": 0.10,
+            "global_scale": 1.0,
+            "learn_global": True,
+            "learn_shapes": False,
+            "regularized": key == "regularized_triple_gamma",
+            "slab_scale": 2.0,
+            "slab_df": 4.0,
+        }
+        options.update({} if triple_gamma_options is None else triple_gamma_options)
+        if bool(options["regularized"]) != (key == "regularized_triple_gamma"):
+            raise ValueError(
+                "The triple-gamma regularized option must agree with the "
+                "selected factor prior profile."
+            )
+        triple_gamma = TripleGammaPrior(**options)
 
     observation_sd: dict[str, SDPrior] = {}
     shape: dict[str, ShapePrior] = {}
@@ -269,6 +350,10 @@ def default_factor_priors(
         seasonal_initial=seasonal_initial,
         horseshoe=horseshoe,
         horseshoe_processes=tuple(idiosyncratic_processes if horseshoe is not None else ()),
+        triple_gamma=triple_gamma,
+        triple_gamma_processes=tuple(
+            idiosyncratic_processes if triple_gamma is not None else ()
+        ),
         profile=key,
         metadata={
             "channel_observation_scale": dict(compiled.channel_observation_scale),
@@ -285,6 +370,11 @@ def default_factor_priors(
             "horseshoe_scope": (
                 "independent channel local-level innovations only"
                 if horseshoe is not None
+                else None
+            ),
+            "triple_gamma_scope": (
+                "independent channel local-level innovations only"
+                if triple_gamma is not None
                 else None
             ),
         },
@@ -373,6 +463,26 @@ def resolve_factor_priors(
             raise ValueError(
                 f"Unknown factor horseshoe processes: {sorted(selected - expected_process)}."
             )
+    if resolved.triple_gamma is None and resolved.triple_gamma_processes:
+        raise ValueError(
+            "triple_gamma_processes requires a triple-gamma prior."
+        )
+    if resolved.triple_gamma is not None:
+        selected = set(resolved.triple_gamma_processes)
+        if selected != set(resolved.triple_gamma.coefficient_scale):
+            raise ValueError(
+                "triple_gamma_processes must match "
+                "triple_gamma.coefficient_scale keys."
+            )
+        if not selected <= expected_process:
+            raise ValueError(
+                "Unknown factor triple-gamma processes: "
+                f"{sorted(selected - expected_process)}."
+            )
+    if resolved.horseshoe is not None and resolved.triple_gamma is not None:
+        raise ValueError(
+            "Choose either factor horseshoe or factor triple gamma, not both."
+        )
     metadata = dict(resolved.metadata)
     metadata.update(
         resolved_initial_mean=compiled.initial_mean.tolist(),
@@ -385,6 +495,7 @@ def identified_factor_priors(
     compiled: CompiledFactorModel,
     profile: str = "regularized_horseshoe",
     *,
+    triple_gamma_options: Mapping[str, Any] | None = None,
     smooth_factor: bool = True,
     reference_channel: str | None = None,
     fixed_idiosyncratic: str | Iterable[str] = (),
@@ -402,7 +513,11 @@ def identified_factor_priors(
     idiosyncratic random walk are separately identified by the likelihood.
     """
 
-    priors = default_factor_priors(compiled, profile)
+    priors = default_factor_priors(
+        compiled,
+        profile,
+        triple_gamma_options=triple_gamma_options,
+    )
     known_channels = set(compiled.channel_names)
     if isinstance(fixed_idiosyncratic, str):
         fixed_channels = (
@@ -460,6 +575,24 @@ def identified_factor_priors(
             else None
         )
 
+    triple_gamma_selected = tuple(
+        name
+        for name in priors.triple_gamma_processes
+        if name not in fixed_processes
+    )
+    triple_gamma = priors.triple_gamma
+    if triple_gamma is not None:
+        coefficient_scale = {
+            name: scale
+            for name, scale in triple_gamma.coefficient_scale.items()
+            if name in triple_gamma_selected
+        }
+        triple_gamma = (
+            replace(triple_gamma, coefficient_scale=coefficient_scale)
+            if coefficient_scale
+            else None
+        )
+
     metadata = dict(priors.metadata)
     metadata.update(
         identification_strategy="explicit_constraints",
@@ -473,6 +606,8 @@ def identified_factor_priors(
         process=process,
         horseshoe=horseshoe,
         horseshoe_processes=selected,
+        triple_gamma=triple_gamma,
+        triple_gamma_processes=triple_gamma_selected,
         profile=f"identified_{priors.profile}",
         metadata=metadata,
     )

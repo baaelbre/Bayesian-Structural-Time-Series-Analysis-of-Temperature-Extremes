@@ -74,6 +74,8 @@ select the FS construction explicitly.
 | `manuscript_lasso` | Yes | No | No | Original shared Bayesian lasso |
 | `regularized_lasso` | Yes | No | No | Componentwise Bayesian lasso |
 | `regularized_horseshoe` | Yes | No | Yes | Univariate hierarchy, or factor idiosyncratic hierarchy |
+| `triple_gamma` | Yes | No | Yes | Normal--gamma--gamma continuous shrinkage with stored shrinkage factors |
+| `regularized_triple_gamma` | Yes | No | Yes | Triple gamma with an optional finite-variance slab cap |
 | `pc` / factor `regularized` | Yes | Yes | Yes | Calibrated PC process-scale prior |
 | `normal` | Yes | Yes | Yes | Signed normal or half-normal process scale |
 | `ssvs` | Yes | Yes | No | FS exact states or general continuous spike/slab |
@@ -82,6 +84,12 @@ For factor models, `regularized_horseshoe` is also supported by centered and
 disturbance parameterizations. It is restricted to namespaced dynamic channel
 local-level innovations. Shared-factor and seasonal scales keep the process
 priors in `FactorPriors.process`.
+
+The two triple-gamma factor profiles have the same scope and are supported by
+centered, disturbance, and eligible FS factor inference. Univariate
+triple-gamma hierarchies require FS because their priors act on signed
+innovation-scale coefficients. PC is a separate calibrated exponential prior,
+not a finite triple-gamma member.
 
 ## Exactness and ASIS
 

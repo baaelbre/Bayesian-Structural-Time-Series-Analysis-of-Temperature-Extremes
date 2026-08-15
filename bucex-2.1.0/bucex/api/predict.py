@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -204,6 +205,7 @@ class Forecast:
         channel: str | None = None,
         ax=None,
         color: str = "C0",
+        save=None,
     ):
         import matplotlib.pyplot as plt
 
@@ -224,6 +226,22 @@ class Forecast:
             else "Posterior predictive forecast"
         )
         ax.legend()
+        if save is not None:
+            options = {}
+            if isinstance(save, dict):
+                options = dict(save)
+                try:
+                    path = options.pop("path")
+                except KeyError as exc:
+                    raise ValueError(
+                        "A save mapping requires a 'path' entry."
+                    ) from exc
+            else:
+                path = save
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            options.setdefault("bbox_inches", "tight")
+            ax.figure.savefig(path, **options)
         return ax
 
 

@@ -6,6 +6,8 @@ tail should share a latent warming factor.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -19,9 +21,11 @@ WARMUP = 750
 CHAINS = 4
 N_PARTICLES = 256
 SEED = 801
+FIGURE_DIR = Path("figures/08_bulk_tail")
 
 
 def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(SEED)
     time = np.arange(N_TIME)
     common = 8.0 + 0.012 * time + 0.7 * np.sin(2.0 * np.pi * time / 12.0)
@@ -70,15 +74,18 @@ def main() -> None:
     print("\nGEV PARTICLE DIAGNOSTICS\n", pair.tail.diagnostics()["engine"])
     print("\nGEV RESTORED FRACTION\n", pair.tail.metadata.get("restored_fraction", 0.0))
 
-    pair.plot()
-    pair.bulk.plot("predictor")
-    pair.tail.plot("predictor")
-    pair.bulk.plot("traces")
+    pair.plot(save=FIGURE_DIR / "bulk_tail_levels.png")
+    pair.bulk.plot("predictor", save=FIGURE_DIR / "bulk_predictor.png")
+    pair.tail.plot("predictor", save=FIGURE_DIR / "tail_predictor.png")
+    pair.bulk.plot("traces", save=FIGURE_DIR / "bulk_traces.png")
+    pair.bulk.plot("acf", save=FIGURE_DIR / "bulk_acf.png")
     pair.tail.plot(
         "traces",
         parameters=("sd.level", "sd.slope", "sd.seasonal", "sigma", "xi"),
+        save=FIGURE_DIR / "tail_traces.png",
     )
-    pair.tail.plot("endpoint")
+    pair.tail.plot("acf", save=FIGURE_DIR / "tail_acf.png")
+    pair.tail.plot("endpoint", save=FIGURE_DIR / "tail_endpoint.png")
     plt.show()
 
 

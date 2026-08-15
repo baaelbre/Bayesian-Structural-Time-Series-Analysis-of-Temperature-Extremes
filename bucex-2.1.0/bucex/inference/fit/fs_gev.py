@@ -22,6 +22,7 @@ from .fs_utils import (
     build_ncp_system,
     canonicalize_ncp_params,
     copy_horseshoe_state,
+    copy_triple_gamma_state,
     copy_lasso_lambda2,
     design_matrix_ncp,
     elliptical_slice_gaussian_prior,
@@ -29,6 +30,7 @@ from .fs_utils import (
     gev_theta_update,
     infer_ncp_layout,
     initialise_horseshoe,
+    initialise_triple_gamma,
     initialise_lasso,
     iterated_laplace_ncp,
     map_ncp_to_centered,
@@ -37,6 +39,7 @@ from .fs_utils import (
     random_sign_switches,
     theta_vector_from_params,
     update_horseshoe_scales,
+    update_triple_gamma_scales,
     update_lasso_scales,
     update_pc_scales,
 )
@@ -242,6 +245,7 @@ class FSGEVKernel:
             raise KeyError("init_params_obs must contain both 'sigma' and 'xi'.")
         tau, lambda2 = initialise_lasso(self.priors, self.layout)
         horseshoe_state = initialise_horseshoe(self.priors, self.layout)
+        triple_gamma_state = initialise_triple_gamma(self.priors, self.layout)
         model_state = initial_structural_state(params_state, self.layout)
         model_candidates = enumerate_structural_models(self.layout)
         model_index = (
@@ -292,6 +296,16 @@ class FSGEVKernel:
             draws_static["horseshoe_slab2"] = np.zeros(n_keep)
             for block in horseshoe_state["local"]:
                 draws_static[f"horseshoe_local_{block}"] = np.zeros(n_keep)
+        if self.priors.triple_gamma is not None:
+            draws_static["triple_gamma_global"] = np.zeros(n_keep)
+            draws_static["triple_gamma_a"] = np.zeros(n_keep)
+            draws_static["triple_gamma_c"] = np.zeros(n_keep)
+            if self.priors.triple_gamma.regularized:
+                draws_static["triple_gamma_slab2"] = np.zeros(n_keep)
+            for block in triple_gamma_state["numerator"]:
+                draws_static[f"triple_gamma_numerator_{block}"] = np.zeros(n_keep)
+                draws_static[f"triple_gamma_denominator_{block}"] = np.zeros(n_keep)
+                draws_static[f"triple_gamma_rho_{block}"] = np.zeros(n_keep)
         if self.priors.pc is not None:
             for block in tau:
                 draws_static[f"pc_tau_{block}"] = np.zeros(n_keep)
@@ -321,6 +335,7 @@ class FSGEVKernel:
             self.priors.lasso.variance_scale(None) if self.priors.lasso is not None else 1.0
         )
         horseshoe_accepts: Counter[str] = Counter()
+        triple_gamma_moves: Counter[str] = Counter()
         asis_accepts: Counter[str] = Counter()
         engine_diagnostics: dict[str, list[float]] = {
             "laplace_iterations": [],
@@ -339,6 +354,7 @@ class FSGEVKernel:
             last_good = (
                 z_path.copy(), dict(params_state), dict(params_obs), dict(tau),
                 copy_lasso_lambda2(lambda2), copy_horseshoe_state(horseshoe_state),
+                copy_triple_gamma_state(triple_gamma_state),
                 model_state, int(model_index)
             )
             iteration_ok = False
@@ -348,6 +364,7 @@ class FSGEVKernel:
             successful_pgas_result = None
             successful_fs_slice_steps = np.nan
             successful_horseshoe_outcomes: dict[str, bool] = {}
+            successful_triple_gamma_outcomes: dict[str, bool] = {}
             successful_asis_outcomes: dict[str, bool] = {}
 
             for attempt in range(max_state_tries):
@@ -432,6 +449,7 @@ class FSGEVKernel:
                                 tau=tau or None,
                                 lasso_variance_scale=lasso_var,
                                 horseshoe_state=horseshoe_state or None,
+                                triple_gamma_state=triple_gamma_state or None,
                             )
                         )
                     else:
@@ -446,6 +464,7 @@ class FSGEVKernel:
                             tau=tau or None,
                             lasso_variance_scale=lasso_var,
                             horseshoe_state=horseshoe_state or None,
+                            triple_gamma_state=triple_gamma_state or None,
                         )
                         current_theta = theta_vector_from_params(
                             work_state,
@@ -489,6 +508,7 @@ class FSGEVKernel:
                                 tau=tau or None,
                                 lasso_variance_scale=lasso_var,
                                 horseshoe_state=horseshoe_state or None,
+                                triple_gamma_state=triple_gamma_state or None,
                                 proposal_step=float(state_kwargs.get("asis_step", 0.20)),
                             )
                         )
@@ -511,6 +531,10 @@ class FSGEVKernel:
                     cand_tau, cand_lambda2 = tau, lambda2
                     cand_horseshoe = copy_horseshoe_state(horseshoe_state)
                     cand_horseshoe_outcomes: dict[str, bool] = {}
+                    cand_triple_gamma = copy_triple_gamma_state(
+                        triple_gamma_state
+                    )
+                    cand_triple_gamma_outcomes: dict[str, bool] = {}
                     if self.priors.lasso is not None:
                         cand_tau, cand_lambda2 = update_lasso_scales(
                             cand_state,
@@ -540,6 +564,36 @@ class FSGEVKernel:
                                 ),
                             )
                         )
+                    if self.priors.triple_gamma is not None:
+                        cand_triple_gamma, cand_triple_gamma_outcomes = (
+                            update_triple_gamma_scales(
+                                cand_state,
+                                triple_gamma_state,
+                                self.priors,
+                                self.layout,
+                                rng=self.rng,
+                                width_local=float(
+                                    state_kwargs.get(
+                                        "triple_gamma_width_local", 1.0
+                                    )
+                                ),
+                                width_global=float(
+                                    state_kwargs.get(
+                                        "triple_gamma_width_global", 1.0
+                                    )
+                                ),
+                                width_shape=float(
+                                    state_kwargs.get(
+                                        "triple_gamma_width_shape", 0.8
+                                    )
+                                ),
+                                width_slab=float(
+                                    state_kwargs.get(
+                                        "triple_gamma_width_slab", 0.8
+                                    )
+                                ),
+                            )
+                        )
                     if self.priors.pc is not None:
                         cand_tau = update_pc_scales(
                             cand_state,
@@ -564,6 +618,9 @@ class FSGEVKernel:
                     z_path, params_state, params_obs = cand_z, cand_state, cand_obs
                     tau, lambda2 = dict(cand_tau), copy_lasso_lambda2(cand_lambda2)
                     horseshoe_state = copy_horseshoe_state(cand_horseshoe)
+                    triple_gamma_state = copy_triple_gamma_state(
+                        cand_triple_gamma
+                    )
                     model_state, model_index = cand_model_state, int(cand_model_index)
                     accept_sigma += int(acc_s)
                     accept_xi += int(acc_x)
@@ -571,9 +628,14 @@ class FSGEVKernel:
                     successful_pgas_result = pgas_result
                     successful_fs_slice_steps = float(fs_slice_steps)
                     successful_horseshoe_outcomes = cand_horseshoe_outcomes
+                    successful_triple_gamma_outcomes = (
+                        cand_triple_gamma_outcomes
+                    )
                     successful_asis_outcomes = cand_asis_outcomes
                     for key, accepted in successful_horseshoe_outcomes.items():
                         horseshoe_accepts[key] += int(accepted)
+                    for key, moved in successful_triple_gamma_outcomes.items():
+                        triple_gamma_moves[key] += int(moved)
                     for key, accepted in successful_asis_outcomes.items():
                         asis_accepts[key] += int(accepted)
                     iteration_ok = True
@@ -594,7 +656,7 @@ class FSGEVKernel:
             if not iteration_ok:
                 (
                     z_path, params_state, params_obs, tau, lambda2,
-                    horseshoe_state, model_state, model_index
+                    horseshoe_state, triple_gamma_state, model_state, model_index
                 ) = last_good
                 restored_iterations += 1
                 window_restored += 1
@@ -682,6 +744,42 @@ class FSGEVKernel:
                     )
                     for block, value in horseshoe_state["local"].items():
                         draws_static[f"horseshoe_local_{block}"][keep_idx] = float(value)
+                if self.priors.triple_gamma is not None:
+                    tg = self.priors.triple_gamma
+                    draws_static["triple_gamma_global"][keep_idx] = float(
+                        triple_gamma_state["global"]
+                    )
+                    draws_static["triple_gamma_a"][keep_idx] = float(
+                        triple_gamma_state["a"]
+                    )
+                    draws_static["triple_gamma_c"][keep_idx] = float(
+                        triple_gamma_state["c"]
+                    )
+                    if tg.regularized:
+                        draws_static["triple_gamma_slab2"][keep_idx] = float(
+                            triple_gamma_state["slab2"]
+                        )
+                    for block in triple_gamma_state["numerator"]:
+                        numerator = float(
+                            triple_gamma_state["numerator"][block]
+                        )
+                        denominator = float(
+                            triple_gamma_state["denominator"][block]
+                        )
+                        global_scale = float(triple_gamma_state["global"])
+                        draws_static[
+                            f"triple_gamma_numerator_{block}"
+                        ][keep_idx] = numerator
+                        draws_static[
+                            f"triple_gamma_denominator_{block}"
+                        ][keep_idx] = denominator
+                        draws_static[f"triple_gamma_rho_{block}"][keep_idx] = (
+                            tg.shrinkage_factor(
+                                numerator=numerator,
+                                denominator=denominator,
+                                global_scale=global_scale,
+                            )
+                        )
                 if self.priors.pc is not None:
                     for block, value in tau.items():
                         draws_static[f"pc_tau_{block}"][keep_idx] = float(value)
@@ -767,6 +865,7 @@ class FSGEVKernel:
                             },
                             params_obs,
                             horseshoe_state=horseshoe_state,
+                            triple_gamma_state=triple_gamma_state,
                         ),
                         metrics=current_metrics,
                         particles=(
@@ -797,6 +896,10 @@ class FSGEVKernel:
                     key: value / max(n_iter, 1)
                     for key, value in asis_accepts.items()
                 },
+                **{
+                    key: value / max(n_iter, 1)
+                    for key, value in triple_gamma_moves.items()
+                },
             },
             meta={
                 "sampler": (
@@ -809,9 +912,13 @@ class FSGEVKernel:
                             f"fruehwirth_schnatter_gev_{state_method}_horseshoe_gibbs"
                             if self.priors.horseshoe is not None
                             else (
-                                f"fruehwirth_schnatter_gev_{state_method}_pc_gibbs"
-                                if self.priors.pc is not None
-                                else f"fruehwirth_schnatter_gev_{state_method}_normal_gibbs"
+                                f"fruehwirth_schnatter_gev_{state_method}_triple_gamma_slice"
+                                if self.priors.triple_gamma is not None
+                                else (
+                                    f"fruehwirth_schnatter_gev_{state_method}_pc_gibbs"
+                                    if self.priors.pc is not None
+                                    else f"fruehwirth_schnatter_gev_{state_method}_normal_gibbs"
+                                )
                             )
                         )
                     )
@@ -829,6 +936,17 @@ class FSGEVKernel:
                 "step_xi": self.step_xi,
                 "bayesian_lasso": self.priors.lasso is not None,
                 "regularized_horseshoe": self.priors.horseshoe is not None,
+                "triple_gamma": self.priors.triple_gamma is not None,
+                "regularized_triple_gamma": bool(
+                    self.priors.triple_gamma is not None
+                    and self.priors.triple_gamma.regularized
+                ),
+                "shrinkage_update": (
+                    "slice"
+                    if self.priors.horseshoe is not None
+                    or self.priors.triple_gamma is not None
+                    else None
+                ),
                 "pc_innovation_prior": self.priors.pc is not None,
                 "componentwise_lasso": bool(
                     self.priors.lasso is not None

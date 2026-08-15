@@ -7,6 +7,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from ...priors.factor import FactorPriors
+from .fs_utils import _slice_sample_real
 
 
 def initialise_factor_horseshoe(priors: FactorPriors) -> dict[str, Any]:
@@ -133,13 +134,13 @@ def update_factor_horseshoe(
     step_global: float = 0.25,
     step_slab: float = 0.20,
 ) -> tuple[dict[str, Any], dict[str, bool]]:
-    """Exact log-scale MH updates for the factor horseshoe hierarchy."""
+    """Exact stepping-out slice updates for the factor horseshoe hierarchy."""
 
     hp = priors.horseshoe
     if hp is None:
         return copy_factor_horseshoe(state), {}
     out = copy_factor_horseshoe(state)
-    accepted: dict[str, bool] = {}
+    moved: dict[str, bool] = {}
     proposal_steps = {} if steps is None else steps
 
     def coefficient_density(
@@ -166,76 +167,71 @@ def update_factor_horseshoe(
             proposal_steps.get(f"horseshoe.local.{name}", step_local)
         )
         current = float(out["local"][name])
-        proposal = float(np.exp(np.log(current) + step * rng.normal()))
-        candidate = copy_factor_horseshoe(out)
-        candidate["local"][name] = proposal
-        current_target = (
-            coefficient_density(out, (name,))
-            + _half_cauchy_logpdf(current, 1.0)
-            + np.log(current)
+        current_log = np.log(current)
+
+        def target(log_value):
+            candidate = copy_factor_horseshoe(out)
+            value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+            candidate["local"][name] = value
+            return (
+                coefficient_density(candidate, (name,))
+                + _half_cauchy_logpdf(value, 1.0)
+                + log_value
+            )
+
+        proposed_log, _ = _slice_sample_real(
+            current_log, target, rng, width=step
         )
-        proposal_target = (
-            coefficient_density(candidate, (name,))
-            + _half_cauchy_logpdf(proposal, 1.0)
-            + np.log(proposal)
+        out["local"][name] = float(np.exp(proposed_log))
+        moved[f"horseshoe.local.{name}"] = not np.isclose(
+            proposed_log, current_log
         )
-        take = bool(np.log(rng.random()) < proposal_target - current_target)
-        if take:
-            out = candidate
-        accepted[f"horseshoe.local.{name}"] = take
 
     current = float(out["global"])
-    proposal = float(
-        np.exp(
-            np.log(current)
-            + float(proposal_steps.get("horseshoe.global", step_global))
-            * rng.normal()
+    current_log = np.log(current)
+
+    def global_target(log_value):
+        candidate = copy_factor_horseshoe(out)
+        value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+        candidate["global"] = value
+        return (
+            coefficient_density(candidate)
+            + _half_cauchy_logpdf(value, hp.global_scale)
+            + log_value
         )
+
+    proposed_log, _ = _slice_sample_real(
+        current_log,
+        global_target,
+        rng,
+        width=float(proposal_steps.get("horseshoe.global", step_global)),
     )
-    candidate = copy_factor_horseshoe(out)
-    candidate["global"] = proposal
-    current_target = (
-        coefficient_density(out)
-        + _half_cauchy_logpdf(current, hp.global_scale)
-        + np.log(current)
-    )
-    proposal_target = (
-        coefficient_density(candidate)
-        + _half_cauchy_logpdf(proposal, hp.global_scale)
-        + np.log(proposal)
-    )
-    take = bool(np.log(rng.random()) < proposal_target - current_target)
-    if take:
-        out = candidate
-    accepted["horseshoe.global"] = take
+    out["global"] = float(np.exp(proposed_log))
+    moved["horseshoe.global"] = not np.isclose(proposed_log, current_log)
 
     current = float(out["slab2"])
-    proposal = float(
-        np.exp(
-            np.log(current)
-            + float(proposal_steps.get("horseshoe.slab2", step_slab))
-            * rng.normal()
-        )
-    )
-    candidate = copy_factor_horseshoe(out)
-    candidate["slab2"] = proposal
+    current_log = np.log(current)
     shape = 0.5 * hp.slab_df
     scale = 0.5 * hp.slab_df * hp.slab_scale**2
-    current_target = (
-        coefficient_density(out)
-        + _inverse_gamma_logpdf(current, shape, scale)
-        + np.log(current)
+    def slab_target(log_value):
+        candidate = copy_factor_horseshoe(out)
+        value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+        candidate["slab2"] = value
+        return (
+            coefficient_density(candidate)
+            + _inverse_gamma_logpdf(value, shape, scale)
+            + log_value
+        )
+
+    proposed_log, _ = _slice_sample_real(
+        current_log,
+        slab_target,
+        rng,
+        width=float(proposal_steps.get("horseshoe.slab2", step_slab)),
     )
-    proposal_target = (
-        coefficient_density(candidate)
-        + _inverse_gamma_logpdf(proposal, shape, scale)
-        + np.log(proposal)
-    )
-    take = bool(np.log(rng.random()) < proposal_target - current_target)
-    if take:
-        out = candidate
-    accepted["horseshoe.slab2"] = take
-    return out, accepted
+    out["slab2"] = float(np.exp(proposed_log))
+    moved["horseshoe.slab2"] = not np.isclose(proposed_log, current_log)
+    return out, moved
 
 
 __all__ = [

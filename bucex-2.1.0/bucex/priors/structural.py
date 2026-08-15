@@ -328,6 +328,165 @@ class RegularizedHorseshoePrior:
 
 
 @dataclass(frozen=True)
+class TripleGammaPrior:
+    """Triple-gamma prior for signed innovation-scale coefficients.
+
+    This is the normal-gamma-gamma representation in Cadonna,
+    Frühwirth-Schnatter and Knaus (2020).  For the standardized signed scale
+    ``u_k = s_k / coefficient_scale[k]`` it uses
+
+    ``u_k | r_k, d_k, phi ~ N(0, phi * r_k / d_k)``,
+
+    ``r_k ~ Gamma(a, 1)`` and ``d_k ~ Gamma(c, 1)``.
+
+    Consequently ``r_k / d_k`` is beta-prime distributed.  When
+    ``learn_global=True``, the paper's model-size calibration is used,
+    ``phi ~ BetaPrime(c, a)``.  The local shrinkage factor is
+    ``rho_k = 1 / (1 + phi * r_k / d_k)``: values near one suppress a process
+    innovation, while values near zero leave it dynamic.
+
+    ``a=c=1/2`` gives the horseshoe member of the family.  The Bayesian lasso,
+    double gamma, normal-gamma, folded-t/half-t and Gaussian limits follow from
+    the limiting cases described in the paper.  Those identities concern the
+    *unregularized* hierarchy; setting ``regularized=True`` adds the optional
+    finite-variance slab
+
+    ``v_reg = slab2 * v / (slab2 + v)``, ``v = phi * r_k / d_k``.
+
+    Shape learning is deliberately optional.  With only three structural
+    innovations, fixed scientifically chosen ``a`` and ``c`` are usually more
+    stable.  If enabled, ``2a`` and ``2c`` receive independent beta priors and
+    are therefore restricted to ``(0, 1)``, exactly as in the paper.
+    """
+
+    coefficient_scale: Mapping[str, float] = field(
+        default_factory=lambda: {
+            "level": 0.03,
+            "trend": 0.0002,
+            "season": 0.03,
+        }
+    )
+    spike_shape: float = 0.10
+    tail_shape: float = 0.10
+    global_scale: float = 1.0
+    learn_global: bool = True
+    learn_shapes: bool = False
+    spike_shape_prior: Sequence[float] = (6.0, 6.0)
+    tail_shape_prior: Sequence[float] = (6.0, 6.0)
+    regularized: bool = False
+    slab_scale: float = 2.0
+    slab_df: float = 4.0
+    initial_numerator: float = 1.0
+    initial_denominator: float = 1.0
+    initial_slab2: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        names = tuple(str(name) for name in self.coefficient_scale)
+        if not names:
+            raise ValueError("coefficient_scale must contain at least one component.")
+        if any(float(self.coefficient_scale[key]) <= 0.0 for key in names):
+            raise ValueError("All triple-gamma coefficient scales must be positive.")
+        for name, value in (
+            ("spike_shape", self.spike_shape),
+            ("tail_shape", self.tail_shape),
+            ("global_scale", self.global_scale),
+            ("slab_scale", self.slab_scale),
+            ("slab_df", self.slab_df),
+            ("initial_numerator", self.initial_numerator),
+            ("initial_denominator", self.initial_denominator),
+        ):
+            if float(value) <= 0.0:
+                raise ValueError(f"TripleGammaPrior.{name} must be positive.")
+        if self.learn_shapes and (
+            float(self.spike_shape) >= 0.5 or float(self.tail_shape) >= 0.5
+        ):
+            raise ValueError(
+                "learn_shapes=True requires initial spike_shape and tail_shape in (0, 0.5)."
+            )
+        for name, values in (
+            ("spike_shape_prior", self.spike_shape_prior),
+            ("tail_shape_prior", self.tail_shape_prior),
+        ):
+            values = np.asarray(values, dtype=float)
+            if values.shape != (2,) or np.any(values <= 0.0):
+                raise ValueError(f"{name} must contain two positive beta shapes.")
+        if self.initial_slab2 is not None and float(self.initial_slab2) <= 0.0:
+            raise ValueError("initial_slab2 must be positive when supplied.")
+
+    @property
+    def a(self) -> float:
+        return float(self.spike_shape)
+
+    @property
+    def c(self) -> float:
+        return float(self.tail_shape)
+
+    def coefficient_scale_for(self, component: str) -> float:
+        return float(self.coefficient_scale[component])
+
+    def initial_slab2_value(self) -> float:
+        return float(
+            self.slab_scale**2
+            if self.initial_slab2 is None
+            else self.initial_slab2
+        )
+
+    def standardized_variance(
+        self,
+        *,
+        numerator: float,
+        denominator: float,
+        global_scale: float,
+        slab2: Optional[float] = None,
+    ) -> float:
+        variance = (
+            max(float(global_scale), 1e-24)
+            * max(float(numerator), 1e-24)
+            / max(float(denominator), 1e-24)
+        )
+        if self.regularized:
+            if slab2 is None:
+                raise ValueError("A slab2 value is required by regularized triple gamma.")
+            slab2 = max(float(slab2), 1e-24)
+            variance = slab2 * variance / (slab2 + variance)
+        return float(variance)
+
+    def conditional_variance(
+        self,
+        component: str,
+        *,
+        numerator: float,
+        denominator: float,
+        global_scale: float,
+        slab2: Optional[float] = None,
+    ) -> float:
+        scale = self.coefficient_scale_for(component)
+        return float(
+            scale**2
+            * self.standardized_variance(
+                numerator=numerator,
+                denominator=denominator,
+                global_scale=global_scale,
+                slab2=slab2,
+            )
+        )
+
+    def shrinkage_factor(
+        self,
+        *,
+        numerator: float,
+        denominator: float,
+        global_scale: float,
+    ) -> float:
+        base_variance = (
+            max(float(global_scale), 1e-24)
+            * max(float(numerator), 1e-24)
+            / max(float(denominator), 1e-24)
+        )
+        return float(1.0 / (1.0 + base_variance))
+
+
+@dataclass(frozen=True)
 class PCInnovationPrior:
     """PC prior on structural innovation standard deviations.
 
@@ -433,6 +592,7 @@ class FSGaussianPriors:
     s_season: Optional[NormalPrior] = None
     lasso: Optional[Union[BayesianLassoPrior, ComponentwiseBayesianLassoPrior]] = None
     horseshoe: Optional[RegularizedHorseshoePrior] = None
+    triple_gamma: Optional[TripleGammaPrior] = None
     pc: Optional[PCInnovationPrior] = None
     ssvs: Optional[SSVSPrior] = None
 
@@ -440,6 +600,7 @@ class FSGaussianPriors:
         strategies = (
             int(self.lasso is not None)
             + int(self.horseshoe is not None)
+            + int(self.triple_gamma is not None)
             + int(self.pc is not None)
             + int(self.ssvs is not None)
             + int(self.s_level is not None)
@@ -447,7 +608,7 @@ class FSGaussianPriors:
         if strategies != 1:
             raise ValueError(
                 "Choose exactly one innovation prior: normal, Bayesian lasso, "
-                "regularized horseshoe, PC prior, or SSVS."
+                "regularized horseshoe, triple gamma, PC prior, or SSVS."
             )
         if self.horseshoe is not None:
             missing = {"level", "trend", "season"} - set(
@@ -458,6 +619,15 @@ class FSGaussianPriors:
                     "A univariate FS regularized horseshoe requires coefficient "
                     f"scales for level, trend, and season; missing={sorted(missing)}."
                 )
+        if self.triple_gamma is not None:
+            missing = {"level", "trend", "season"} - set(
+                self.triple_gamma.coefficient_scale
+            )
+            if missing:
+                raise ValueError(
+                    "A univariate FS triple gamma requires coefficient scales "
+                    f"for level, trend, and season; missing={sorted(missing)}."
+                )
 
     @property
     def profile(self) -> str:
@@ -465,6 +635,12 @@ class FSGaussianPriors:
             return "regularized_lasso" if self.lasso.componentwise else "manuscript_lasso"
         if self.horseshoe is not None:
             return "regularized_horseshoe"
+        if self.triple_gamma is not None:
+            return (
+                "regularized_triple_gamma"
+                if self.triple_gamma.regularized
+                else "triple_gamma"
+            )
         if self.pc is not None:
             return "pc"
         if self.ssvs is not None:
@@ -494,6 +670,7 @@ class FSGEVPriors:
     s_season: Optional[NormalPrior] = None
     lasso: Optional[Union[BayesianLassoPrior, ComponentwiseBayesianLassoPrior]] = None
     horseshoe: Optional[RegularizedHorseshoePrior] = None
+    triple_gamma: Optional[TripleGammaPrior] = None
     pc: Optional[PCInnovationPrior] = None
     ssvs: Optional[SSVSPrior] = None
     xi_max_abs: float = 0.5
@@ -506,6 +683,7 @@ class FSGEVPriors:
         strategies = (
             int(self.lasso is not None)
             + int(self.horseshoe is not None)
+            + int(self.triple_gamma is not None)
             + int(self.pc is not None)
             + int(self.ssvs is not None)
             + int(self.s_level is not None)
@@ -513,7 +691,7 @@ class FSGEVPriors:
         if strategies != 1:
             raise ValueError(
                 "Choose exactly one innovation prior: normal, Bayesian lasso, "
-                "regularized horseshoe, PC prior, or SSVS."
+                "regularized horseshoe, triple gamma, PC prior, or SSVS."
             )
         if self.horseshoe is not None:
             missing = {"level", "trend", "season"} - set(
@@ -524,6 +702,15 @@ class FSGEVPriors:
                     "A univariate FS regularized horseshoe requires coefficient "
                     f"scales for level, trend, and season; missing={sorted(missing)}."
                 )
+        if self.triple_gamma is not None:
+            missing = {"level", "trend", "season"} - set(
+                self.triple_gamma.coefficient_scale
+            )
+            if missing:
+                raise ValueError(
+                    "A univariate FS triple gamma requires coefficient scales "
+                    f"for level, trend, and season; missing={sorted(missing)}."
+                )
 
     @property
     def profile(self) -> str:
@@ -531,6 +718,12 @@ class FSGEVPriors:
             return "regularized_lasso" if self.lasso.componentwise else "manuscript_lasso"
         if self.horseshoe is not None:
             return "regularized_horseshoe"
+        if self.triple_gamma is not None:
+            return (
+                "regularized_triple_gamma"
+                if self.triple_gamma.regularized
+                else "triple_gamma"
+            )
         if self.pc is not None:
             return "pc"
         if self.ssvs is not None:
@@ -842,6 +1035,118 @@ def regularized_horseshoe_gev_priors(
             slab_df=slab_df,
         ),
     )
+
+
+def triple_gamma_gaussian_priors(
+    period: int = 12,
+    *,
+    alpha_mean: float = 0.0,
+    beta_mean: float = 0.0,
+    beta_sd: float = 0.005,
+    coefficient_scale: Optional[Mapping[str, float]] = None,
+    spike_shape: float = 0.10,
+    tail_shape: float = 0.10,
+    global_scale: float = 1.0,
+    learn_global: bool = True,
+    learn_shapes: bool = False,
+    regularized: bool = False,
+    slab_scale: float = 2.0,
+    slab_df: float = 4.0,
+) -> FSGaussianPriors:
+    """Paper-calibrated triple-gamma prior for a Gaussian FS model.
+
+    Set ``regularized=True`` to cap the standardized local variance with a
+    finite inverse-gamma slab.  Shape learning is off by default because a
+    univariate structural model has only three innovation scales.
+    """
+
+    k = period - 1
+    scales = (
+        {"level": 0.03, "trend": 0.0002, "season": 0.03}
+        if coefficient_scale is None
+        else dict(coefficient_scale)
+    )
+    return FSGaussianPriors(
+        sigma2=InverseGammaPrior(a=2.0, b=1.0),
+        alpha0=NormalPrior(alpha_mean, np.sqrt(10.0)),
+        beta0=NormalPrior(beta_mean, beta_sd),
+        gamma0_season=DiagonalNormalPrior(
+            mean=np.zeros(k), sd=np.full(k, np.sqrt(5.0))
+        ),
+        triple_gamma=TripleGammaPrior(
+            coefficient_scale=scales,
+            spike_shape=spike_shape,
+            tail_shape=tail_shape,
+            global_scale=global_scale,
+            learn_global=learn_global,
+            learn_shapes=learn_shapes,
+            regularized=regularized,
+            slab_scale=slab_scale,
+            slab_df=slab_df,
+        ),
+    )
+
+
+def triple_gamma_gev_priors(
+    period: int = 12,
+    *,
+    alpha_mean: float = 0.0,
+    beta_mean: float = 0.0,
+    beta_sd: float = 0.005,
+    coefficient_scale: Optional[Mapping[str, float]] = None,
+    spike_shape: float = 0.10,
+    tail_shape: float = 0.10,
+    global_scale: float = 1.0,
+    learn_global: bool = True,
+    learn_shapes: bool = False,
+    regularized: bool = False,
+    slab_scale: float = 2.0,
+    slab_df: float = 4.0,
+) -> FSGEVPriors:
+    """Paper-calibrated triple-gamma prior for a DGEV FS model."""
+
+    k = period - 1
+    scales = (
+        {"level": 0.03, "trend": 0.0002, "season": 0.03}
+        if coefficient_scale is None
+        else dict(coefficient_scale)
+    )
+    return FSGEVPriors(
+        sigma2=InverseGammaPrior(a=2.0, b=2.0),
+        xi=UniformPrior(-0.5, 0.5),
+        alpha0=NormalPrior(alpha_mean, np.sqrt(10.0)),
+        beta0=NormalPrior(beta_mean, beta_sd),
+        gamma0_season=DiagonalNormalPrior(
+            mean=np.zeros(k), sd=np.full(k, np.sqrt(5.0))
+        ),
+        triple_gamma=TripleGammaPrior(
+            coefficient_scale=scales,
+            spike_shape=spike_shape,
+            tail_shape=tail_shape,
+            global_scale=global_scale,
+            learn_global=learn_global,
+            learn_shapes=learn_shapes,
+            regularized=regularized,
+            slab_scale=slab_scale,
+            slab_df=slab_df,
+        ),
+    )
+
+
+def regularized_triple_gamma_gaussian_priors(
+    period: int = 12, **kwargs
+) -> FSGaussianPriors:
+    """Triple gamma with the optional finite-variance regularizing slab."""
+
+    return triple_gamma_gaussian_priors(period=period, regularized=True, **kwargs)
+
+
+def regularized_triple_gamma_gev_priors(
+    period: int = 12, **kwargs
+) -> FSGEVPriors:
+    """DGEV triple gamma with the optional finite-variance slab."""
+
+    return triple_gamma_gev_priors(period=period, regularized=True, **kwargs)
 
 
 def pc_gaussian_priors(

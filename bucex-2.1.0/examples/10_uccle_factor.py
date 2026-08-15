@@ -16,16 +16,27 @@ import bucex as bx
 START = "1980-01-01"
 END = None
 REFERENCE = "TXm"
-PRIOR = "regularized_horseshoe"
+PRIOR = "regularized_triple_gamma"  # try triple_gamma or regularized_horseshoe
+# Used only when PRIOR contains "triple_gamma". Fixed shapes are a stable
+# starting point; learn_shapes=True is best treated as a sensitivity run.
+TRIPLE_GAMMA_OPTIONS = {
+    "spike_shape": 0.10,
+    "tail_shape": 0.10,
+    "learn_global": True,
+    "learn_shapes": False,
+    "slab_scale": 2.0,
+}
 DRAWS = 500
 WARMUP = 750
 CHAINS = 4
 N_PARTICLES = 512
 SEED = 1_001
 SAVE_FIT = False
+FIGURE_DIR = Path("figures/10_uccle_factor")
 
 
 def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     model = bx.make_uccle_factor_model(
         structure="estimated",
         individual="local_level",
@@ -39,6 +50,9 @@ def main() -> None:
     priors = bx.identified_factor_priors(
         compiled,
         profile=PRIOR,
+        triple_gamma_options=(
+            TRIPLE_GAMMA_OPTIONS if "triple_gamma" in PRIOR else None
+        ),
         smooth_factor=True,
         reference_channel=REFERENCE,
     )
@@ -67,6 +81,15 @@ def main() -> None:
         "\nIDENTIFICATION DIAGNOSTICS\n",
         fit.factor_identification_diagnostics(baseline=baseline).round(3),
     )
+    if fit.priors.triple_gamma is not None:
+        rho_names = [
+            name for name in fit.parameter_draws
+            if name.startswith("triple_gamma.rho.")
+        ]
+        print(
+            "\nTRIPLE-GAMMA SHRINKAGE FACTORS (rho near 1 = strong shrinkage)\n",
+            fit.diagnostics()["parameters"].loc[rho_names].round(3),
+        )
 
     start_year = int(data.index[0].year)
     end_year = int(data.index[-1].year)
@@ -81,11 +104,15 @@ def main() -> None:
         fit.save(output)
         print(f"\nSaved {output}")
 
-    fit.plot("factor", factor="common")
+    fit.plot(
+        "factor", factor="common",
+        save=FIGURE_DIR / "common_factor.png",
+    )
     fit.plot(
         "factor_decomposition",
         channels=("TXm", "TNm", "TXx", "TNn"),
         baseline=baseline,
+        save=FIGURE_DIR / "decomposition.png",
     )
     fit.plot(
         "parameter_density",
@@ -98,12 +125,23 @@ def main() -> None:
             "xi.TXx",
             "xi.TNn",
         ),
+        save=FIGURE_DIR / "densities.png",
     )
-    fit.plot("traces")
-    fit.plot("identification", baseline=baseline)
+    fit.plot("traces", save=FIGURE_DIR / "traces.png")
+    fit.plot("acf", max_lag=50, save=FIGURE_DIR / "acf.png")
+    fit.plot(
+        "identification", baseline=baseline,
+        save=FIGURE_DIR / "identification.png",
+    )
     for channel in ("TXx", "TNn"):
-        fit.plot("loading_deviation", channel=channel, baseline=baseline)
-        fit.plot("idiosyncratic_innovations", channel=channel)
+        fit.plot(
+            "loading_deviation", channel=channel, baseline=baseline,
+            save=FIGURE_DIR / f"{channel}_loading_deviation.png",
+        )
+        fit.plot(
+            "idiosyncratic_innovations", channel=channel,
+            save=FIGURE_DIR / f"{channel}_innovations.png",
+        )
     plt.show()
 
 

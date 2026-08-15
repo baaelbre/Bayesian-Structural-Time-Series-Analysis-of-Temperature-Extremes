@@ -7,6 +7,7 @@ particle diagnostics, R-hat, ESS, and runtime.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from time import perf_counter
 
 import matplotlib.pyplot as plt
@@ -21,6 +22,7 @@ DRAWS = 300
 WARMUP = 300
 CHAINS = 2
 SEED = 301
+FIGURE_DIR = Path("figures/03_diagnose_gev_pgas")
 
 RUNS = (
     {"label": "FS, 96 particles", "parameterization": "fruehwirth_schnatter", "particles": 96},
@@ -30,6 +32,7 @@ RUNS = (
 
 
 def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     model = bx.Model(
         bx.GEV(),
         (bx.LocalLinearTrend(), bx.DummySeasonal(12)),
@@ -134,6 +137,14 @@ def main() -> None:
         )
         figure.suptitle(label, y=0.995)
         figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+        safe_label = label.lower().replace(", ", "_").replace(" ", "_")
+        figure.savefig(FIGURE_DIR / f"{safe_label}_traces.png", bbox_inches="tight")
+        fits[label].plot(
+            "acf",
+            parameters=scientific,
+            max_lag=50,
+            save=FIGURE_DIR / f"{safe_label}_acf.png",
+        )
     plt.show()
 
 

@@ -18,8 +18,12 @@ from .structural import (
     regularized_gev_priors,
     regularized_horseshoe_gaussian_priors,
     regularized_horseshoe_gev_priors,
+    regularized_triple_gamma_gaussian_priors,
+    regularized_triple_gamma_gev_priors,
     ssvs_gaussian_priors,
     ssvs_gev_priors,
+    triple_gamma_gaussian_priors,
+    triple_gamma_gev_priors,
 )
 
 
@@ -27,6 +31,8 @@ STRUCTURAL_PRIORS = {
     "manuscript_lasso",
     "regularized_lasso",
     "regularized_horseshoe",
+    "triple_gamma",
+    "regularized_triple_gamma",
     "pc",
     "normal",
     "ssvs",
@@ -41,6 +47,10 @@ def normalize_prior_profile(value: str | None) -> str:
         "lasso": "regularized_lasso",
         "regularized": "regularized_lasso",
         "horseshoe": "regularized_horseshoe",
+        "tg": "triple_gamma",
+        "triplegamma": "triple_gamma",
+        "regularized_tg": "regularized_triple_gamma",
+        "regularised_triple_gamma": "regularized_triple_gamma",
         "half_normal": "normal",
         "spike_slab": "ssvs",
     }
@@ -68,6 +78,10 @@ def resolve_structural_priors(
         ("gev", "regularized_lasso"): regularized_gev_priors,
         ("gaussian", "regularized_horseshoe"): regularized_horseshoe_gaussian_priors,
         ("gev", "regularized_horseshoe"): regularized_horseshoe_gev_priors,
+        ("gaussian", "triple_gamma"): triple_gamma_gaussian_priors,
+        ("gev", "triple_gamma"): triple_gamma_gev_priors,
+        ("gaussian", "regularized_triple_gamma"): regularized_triple_gamma_gaussian_priors,
+        ("gev", "regularized_triple_gamma"): regularized_triple_gamma_gev_priors,
         ("gaussian", "pc"): pc_gaussian_priors,
         ("gev", "pc"): pc_gev_priors,
         ("gaussian", "normal"): normal_gaussian_priors,
@@ -80,7 +94,8 @@ def resolve_structural_priors(
     except KeyError as exc:
         raise ValueError(
             "FS prior must be manuscript_lasso, regularized_lasso, "
-            "regularized_horseshoe, pc, normal, or ssvs."
+            "regularized_horseshoe, triple_gamma, regularized_triple_gamma, "
+            "pc, normal, or ssvs."
         ) from exc
     return builder(period=int(compiled.model.period or 1))
 
@@ -112,7 +127,10 @@ def resolve_prior_spec(
             "normal": "half_normal",
             "ssvs": "spike_slab",
         }
-        if normalized in {"manuscript_lasso", "regularized_lasso", "regularized_horseshoe"}:
+        if normalized in {
+            "manuscript_lasso", "regularized_lasso", "regularized_horseshoe",
+            "triple_gamma", "regularized_triple_gamma",
+        }:
             raise ValueError(
                 f"Prior '{normalized}' is a signed-scale hierarchy and requires "
                 "parameterization='fruehwirth_schnatter'."

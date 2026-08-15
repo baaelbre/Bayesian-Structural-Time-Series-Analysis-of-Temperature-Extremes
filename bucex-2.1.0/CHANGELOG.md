@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.1.5
+
+- Added the Cadonna--Frühwirth-Schnatter--Knaus triple-gamma prior for
+  signed structural innovation scales. The paper's normal--gamma--gamma
+  hierarchy, optional global beta-prime update, optional shape learning, and
+  interpretable shrinkage factors are retained in posterior output.
+- Added `regularized_triple_gamma`, which applies an optional inverse-gamma
+  slab cap to the triple-gamma local variance. Both triple-gamma profiles are
+  supported by univariate Gaussian/GEV FS models and by centered,
+  disturbance, and FS factor models.
+- Replaced random-walk updates for the regularized-horseshoe hierarchy with
+  exact stepping-out slice updates. This addresses the avoidable
+  local/global/slab mixing bottleneck exposed by `04_compare_priors.py`.
+- Added chain-specific ACF plots through `fit.plot("acf")`. Every fit,
+  forecast, collection, and bulk/tail plot now accepts `save=`, including a
+  path or a `{"path": ..., "dpi": ...}` mapping.
+- Made prior/posterior process-SD plots analytic where possible: PC,
+  folded-normal, SSVS slab, ordinary process priors, and fixed-global
+  unregularized triple gamma. Integrated hierarchical priors use a smooth,
+  explicitly labelled Monte Carlo KDE instead of a jagged histogram.
+- Corrected constant-chain diagnostics. R-hat and ESS are now `NaN` for a
+  constant SSVS allocation and carry an explicit diagnostic/status message;
+  the former mechanical `R-hat=1, ESS=all draws` is no longer presented as
+  evidence of mixing.
+- Reworked all ten examples as standalone, sequential scripts. Example 4
+  compares normal, PC, regularized horseshoe, triple gamma, regularized triple
+  gamma, and SSVS; Example 9 reports six separate Uccle SSVS analyses; Example
+  10 uses regularized triple gamma in the full six-summary factor model.
+
 ## 2.1.4
 
 - Unified MCMC progress output across Gaussian, GEV, generic state-space, FS,

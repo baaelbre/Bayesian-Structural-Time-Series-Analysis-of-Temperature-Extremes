@@ -1,4 +1,4 @@
-# bucex 2.1.4 examples
+# bucex 2.1.5 examples
 
 The examples form one sequential workflow. Each file is standalone: it
 imports only normal Python packages and `bucex`, contains its own settings at
@@ -17,13 +17,13 @@ Uccle series, edit the clearly labelled constants near the top of the script.
 | 1 | `01_gaussian_local_trend.py` | Complete univariate Gaussian workflow with exact FFBS |
 | 2 | `02_gev_local_trend.py` | Complete univariate GEV workflow with exact PGAS and support checks |
 | 3 | `03_diagnose_gev_pgas.py` | Separate short-chain, low-particle, restoration, and parameterization problems |
-| 4 | `04_compare_priors.py` | Compare normal, PC, regularized-horseshoe, and exact SSVS priors on the same data |
+| 4 | `04_compare_priors.py` | Compare normal, PC, regularized horseshoe, triple gamma, regularized triple gamma, and exact SSVS on the same data |
 | 5 | `05_compare_parameterizations.py` | Compare centered, disturbance, and FS sampling under matched scientific priors |
-| 6 | `06_factor_gaussian.py` | Shared Gaussian warming factor plus channel-specific deviations |
+| 6 | `06_factor_gaussian.py` | Shared Gaussian warming factor with triple-gamma idiosyncratic shrinkage |
 | 7 | `07_factor_mixed_gaussian_gev.py` | Joint Gaussian/GEV factor model for a mean and an extreme |
 | 8 | `08_bulk_tail_independent.py` | Parallel but independent Gaussian bulk and GEV tail analyses |
-| 9 | `09_uccle_univariate.py` | Fit one of the six bundled Uccle summaries |
-| 10 | `10_uccle_factor.py` | Fit the proposed six-summary Uccle factor model |
+| 9 | `09_uccle_univariate.py` | Run six separate SSVS analyses (or choose another prior) and compare their results |
+| 10 | `10_uccle_factor.py` | Fit the proposed six-summary Uccle factor model with a regularized triple gamma |
 
 ## What to check after every fit
 
@@ -33,11 +33,12 @@ Do not interpret posterior paths or forecasts before checking:
 2. Bulk ESS for every scientific innovation SD, observation parameter, and
    estimated loading.
 3. Chain-specific traces rather than only pooled posterior densities.
-4. For PGAS, particle ESS, ancestor diversity, path-change rate, and changed
+4. Chain-specific ACFs (`fit.plot("acf")`) for persistent parameters.
+5. For PGAS, particle ESS, ancestor diversity, path-change rate, and changed
    fraction.
-5. For GEV FS fits, `restored_iterations`, failure counts, and the minimum GEV
+6. For GEV FS fits, `restored_iterations`, failure counts, and the minimum GEV
    support margin.
-6. For factor fits, loading--deviation correlations and whether the complete
+7. For factor fits, loading--deviation correlations and whether the complete
    predictor is more stable than its shared/idiosyncratic decomposition.
 
 The run lengths in these files are development-scale starting points. They
@@ -59,10 +60,32 @@ truth far into every prior's tail.
 - `pc` gives the innovation SD an exponential prior calibrated through
   `P(SD > upper) = alpha`.
 - `regularized_horseshoe` combines strong shrinkage near zero with a heavy tail
-  and a regularizing slab.
+  and a regularizing slab. In v2.1.5 its coupled hierarchy is slice-updated;
+  this fixes the avoidable random-walk bottleneck in v2.1.4.
+- `triple_gamma` uses the normal-gamma-gamma representation. The stored
+  shrinkage factor `rho` is close to one for a strongly suppressed innovation
+  and close to zero for an effectively unshrunk innovation.
+- `regularized_triple_gamma` adds an optional inverse-gamma slab that caps the
+  local variance while preserving the triple-gamma spike/tail parameters.
 - `ssvs` assigns exact posterior probabilities to zero, fixed, and dynamic
   structures. Its point mass at zero must be inspected with component
   probabilities, not only a smoothed density.
+
+The process-prior plot uses analytic densities for PC, folded-normal, SSVS
+slabs, ordinary process priors, and fixed-global unregularized triple gamma.
+Hierarchies whose hyperparameters are integrated out are shown with a smooth
+Monte Carlo KDE, explicitly labelled as such. Every plot can be saved directly:
+
+```python
+fit.plot("acf", save="figures/acf.png")
+fit.plot("process_sd", save={"path": "figures/prior.png", "dpi": 300})
+forecast.plot(save="figures/forecast.png")
+```
+
+For a constant SSVS allocation, R-hat and ESS are undefined and are now shown
+as `NaN` with the status `constant posterior allocation`. A value of one and an
+ESS equal to all draws in older output was a mechanical zero-variance result,
+not proof of excellent mixing.
 
 Prior-sensitivity conclusions are meaningful only when every compared fit has
 converged. A difference between two unconverged posterior curves is a sampler

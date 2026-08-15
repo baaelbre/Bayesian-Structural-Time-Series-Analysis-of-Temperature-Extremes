@@ -6,6 +6,8 @@ iteration restoration, and the GEV support margin.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -20,6 +22,7 @@ WARMUP = 750
 CHAINS = 4
 N_PARTICLES = 256
 SEED = 201
+FIGURE_DIR = Path("figures/02_gev_local_trend")
 
 
 def main() -> None:
@@ -132,14 +135,29 @@ def main() -> None:
         fit.forecast(12, draws=1_000, seed=SEED + 2).summary().round(3),
     )
 
-    _, predictor_axis = fit.plot("predictor")
+    predictor_figure, predictor_axis = fit.plot("predictor")
     predictor_axis.plot(dates, simulation.eta, color="black", label="true predictor")
     predictor_axis.legend()
-    fit.plot("level_slope")
-    fit.plot("process_sd", truths=truth, title="PC prior: GEV model")
-    fit.plot("traces", parameters=parameters, truths=truth)
-    fit.plot("parameter_density", parameters=parameters, truths=truth)
-    fit.plot("endpoint")
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    predictor_figure.savefig(FIGURE_DIR / "predictor.png", bbox_inches="tight")
+    fit.plot("level_slope", save=FIGURE_DIR / "level_slope.png")
+    fit.plot(
+        "process_sd", truths=truth, title="PC prior: GEV model",
+        save=FIGURE_DIR / "prior_posterior_sd.png",
+    )
+    fit.plot(
+        "traces", parameters=parameters, truths=truth,
+        save=FIGURE_DIR / "traces.png",
+    )
+    fit.plot(
+        "acf", parameters=parameters, max_lag=50,
+        save=FIGURE_DIR / "acf.png",
+    )
+    fit.plot(
+        "parameter_density", parameters=parameters, truths=truth,
+        save=FIGURE_DIR / "densities.png",
+    )
+    fit.plot("endpoint", save=FIGURE_DIR / "endpoint.png")
     plt.show()
 
 

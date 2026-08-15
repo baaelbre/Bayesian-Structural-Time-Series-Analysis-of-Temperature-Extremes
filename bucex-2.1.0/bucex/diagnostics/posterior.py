@@ -8,6 +8,18 @@ from scipy.stats import norm, rankdata
 Array = np.ndarray
 
 
+def _finite_mean(values: Array) -> float:
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return float(np.mean(finite)) if finite.size else np.nan
+
+
+def _finite_median(values: Array) -> float:
+    values = np.asarray(values, dtype=float)
+    finite = values[np.isfinite(values)]
+    return float(np.median(finite)) if finite.size else np.nan
+
+
 def _split_chains(values: Array) -> Array:
     values = np.asarray(values, dtype=float)
     if values.ndim != 2:
@@ -40,6 +52,11 @@ def _basic_rhat(values: Array) -> float:
 def rhat(values: Array) -> float:
     """Rank-normalized split R-hat with the folded-tail diagnostic."""
 
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or np.all(values == values.reshape(-1)[0]):
+        # R-hat compares within- and between-chain variation.  It is not one
+        # when both are zero; it is mathematically undefined.
+        return np.nan
     split = _split_chains(values)
     if split.shape[0] < 2 or split.shape[1] < 2:
         return np.nan
@@ -62,6 +79,11 @@ def _autocovariance(values: Array) -> Array:
 def ess_bulk(values: Array) -> float:
     """Rank-normalized split-chain bulk effective sample size."""
 
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or np.all(values == values.reshape(-1)[0]):
+        # A constant sampled indicator may represent posterior structural
+        # certainty, but it supplies no autocorrelation information.
+        return np.nan
     values = _rank_normalize(_split_chains(values))
     chains, draws = values.shape
     if draws < 3:
@@ -124,13 +146,22 @@ def fit_diagnostics(fit):
     for name, values in fit.parameter_draws.items():
         if values.ndim != 2:
             continue
+        constant = bool(
+            values.size > 0 and np.all(values == values.reshape(-1)[0])
+        )
         row = {
             "parameter": name,
             "mean": float(np.mean(values)),
             "sd": float(np.std(values, ddof=1)) if values.size > 1 else 0.0,
             "rhat": rhat(values),
             "ess_bulk": ess_bulk(values),
-            "acceptance": float(np.nanmean(acceptance[name])) if name in acceptance else np.nan,
+            "acceptance": _finite_mean(acceptance[name]) if name in acceptance else np.nan,
+            "constant": constant,
+            "diagnostic": (
+                "constant draw; R-hat and ESS undefined"
+                if constant
+                else "sampled"
+            ),
         }
         rows.append(row)
     try:
@@ -143,17 +174,29 @@ def fit_diagnostics(fit):
     engine: dict[str, float] = {}
     if fit.plan.engine == "laplace":
         engine = {
-            "convergence_rate": float(np.nanmean(metrics["laplace_converged"])),
-            "median_iterations": float(np.nanmedian(metrics["laplace_iterations"])),
-            "median_relative_change": float(np.nanmedian(metrics["laplace_relative_change"])),
-            "mean_support_rejections": float(np.nanmean(metrics["laplace_support_rejections"])),
+            "convergence_rate": _finite_mean(metrics["laplace_converged"]),
+            "median_iterations": _finite_median(metrics["laplace_iterations"]),
+            "median_relative_change": _finite_median(
+                metrics["laplace_relative_change"]
+            ),
+            "mean_support_rejections": _finite_mean(
+                metrics["laplace_support_rejections"]
+            ),
         }
     elif fit.plan.engine == "pgas":
         engine = {
-            "median_min_particle_ess": float(np.nanmedian(metrics["particle_min_ess"])),
-            "mean_unique_ancestors": float(np.nanmean(metrics["particle_mean_unique_ancestors"])),
-            "path_change_rate": float(np.nanmean(metrics["particle_path_changed"])),
-            "mean_changed_fraction": float(np.nanmean(metrics["particle_changed_fraction"])),
+            "median_min_particle_ess": _finite_median(
+                metrics["particle_min_ess"]
+            ),
+            "mean_unique_ancestors": _finite_mean(
+                metrics["particle_mean_unique_ancestors"]
+            ),
+            "path_change_rate": _finite_mean(
+                metrics["particle_path_changed"]
+            ),
+            "mean_changed_fraction": _finite_mean(
+                metrics["particle_changed_fraction"]
+            ),
         }
     return {
         "parameters": table,

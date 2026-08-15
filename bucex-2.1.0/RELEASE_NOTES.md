@@ -1,10 +1,39 @@
-# bucex 2.1.4 release notes
+# bucex 2.1.5 release notes
 
-`bucex` 2.1.4 is a modular Bayesian structural time-series package for both
+`bucex` 2.1.5 is a modular Bayesian structural time-series package for both
 single-series models and shared-factor models with Gaussian and/or GEV
 observation channels.
 
-## What changed in 2.1.4
+## What changed in 2.1.5
+
+- `triple_gamma` implements the normal--gamma--gamma variance-selection prior
+  of Cadonna, Frühwirth-Schnatter, and Knaus (2020), including optional global
+  beta-prime learning, optional beta shape learning, and stored shrinkage
+  factors `rho`. It works for univariate Gaussian/GEV FS fits and for the full
+  centered, disturbance, or FS factor model.
+- `regularized_triple_gamma` adds an inverse-gamma slab cap while retaining the
+  triple-gamma spike and tail shapes. `triple_gamma_options={...}` exposes the
+  shape/global/slab choices directly in `identified_factor_priors()`.
+- The regularized horseshoe now uses exact stepping-out slice updates for its
+  local, global, and slab hierarchy. This replaces the slow random-walk block
+  that caused low ESS in the old prior-comparison example.
+- `fit.plot("acf")` plots chain-specific ACFs. Every plot dispatcher accepts
+  `save=`, either as a path or a mapping such as
+  `{"path": "figure.png", "dpi": 300}`.
+- Prior/posterior process-SD plots use analytic PC, folded-normal, SSVS-slab,
+  ordinary process, and fixed-global triple-gamma densities when available.
+  Integrated hierarchies use a smooth labelled KDE; heavy tails are displayed
+  on a bounded scientifically useful range without altering the density.
+- Constant SSVS allocations now report undefined (`NaN`) R-hat and ESS plus a
+  clear status. The old mechanical `R-hat=1, ESS=all draws` was not a valid
+  convergence conclusion.
+- Examples 1--10 are standalone sequential scripts. Example 4 performs the
+  full prior comparison, Example 9 reports separate SSVS analyses for all six
+  Uccle summaries, and Example 10 runs regularized triple gamma in the joint
+  six-summary factor model.
+
+The progress, identification, and decomposition improvements introduced in
+2.1.4 remain part of the release:
 
 - Gaussian, GEV, centered/disturbance, FS, and factor samplers now use one
   progress vocabulary. Lines show chain, `it`, phase, saved draws, current
@@ -72,10 +101,12 @@ Python 3.10 or newer is required.
 
 ## Included checks
 
-The release contains 63 source tests plus fixed-seed univariate and mixed
+The release contains 74 source-test cases plus fixed-seed univariate and mixed
 factor validators. The mixed validator covers two Gaussian and four GEV
 channels, exact FS/centered predictor agreement, loading-kernel routing,
-archive round trips, and exact channel-decomposition reconstruction.
+archive round trips, and exact channel-decomposition reconstruction. New tests
+cover both triple-gamma variants, all factor parameterizations, analytic prior
+plots, ACF/save behavior, and constant SSVS diagnostics.
 
 These short deterministic runs are release checks, not evidence of scientific
 convergence. Applied analyses should still use multiple long chains,

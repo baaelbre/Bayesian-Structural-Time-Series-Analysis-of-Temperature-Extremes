@@ -446,6 +446,7 @@ def _signed_scale_prior_logpdf(
     tau: Optional[dict[str, float]],
     lasso_variance_scale: float,
     horseshoe_state: Optional[dict[str, Any]],
+    triple_gamma_state: Optional[dict[str, Any]],
 ) -> float:
     if getattr(priors, "lasso", None) is not None:
         if tau is None or component not in tau:
@@ -471,6 +472,15 @@ def _signed_scale_prior_logpdf(
             value,
             horseshoe_conditional_variance(priors, horseshoe_state, component),
         )
+    if getattr(priors, "triple_gamma", None) is not None:
+        if triple_gamma_state is None:
+            raise ValueError("Missing triple-gamma state.")
+        return _normal_zero_logpdf(
+            value,
+            triple_gamma_conditional_variance(
+                priors, triple_gamma_state, component
+            ),
+        )
     key = {"level": "s_level", "trend": "s_trend", "season": "s_season"}[component]
     prior = getattr(priors, key)
     if prior is None:
@@ -491,6 +501,7 @@ def asis_centered_scale_update(
     tau: Optional[dict[str, float]] = None,
     lasso_variance_scale: float = 1.0,
     horseshoe_state: Optional[dict[str, Any]] = None,
+    triple_gamma_state: Optional[dict[str, Any]] = None,
     proposal_step: float = 0.20,
 ) -> tuple[Array, ParamDict, dict[str, bool]]:
     """ASIS update of signed scales while holding the centred path fixed."""
@@ -521,6 +532,7 @@ def asis_centered_scale_update(
                 tau=tau,
                 lasso_variance_scale=lasso_variance_scale,
                 horseshoe_state=horseshoe_state,
+                triple_gamma_state=triple_gamma_state,
             )
             return float(transition + prior_value + np.log(magnitude))
 
@@ -883,6 +895,69 @@ def copy_horseshoe_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def initialise_triple_gamma(priors: Any, layout: NCPLayout) -> dict[str, Any]:
+    """Initialise the paper's normal-gamma-gamma hierarchy."""
+
+    prior = getattr(priors, "triple_gamma", None)
+    if prior is None:
+        return {}
+    names = _active_scale_names(layout)
+    return {
+        "numerator": {
+            name: float(prior.initial_numerator) for name in names
+        },
+        "denominator": {
+            name: float(prior.initial_denominator) for name in names
+        },
+        "global": float(prior.global_scale),
+        "a": float(prior.spike_shape),
+        "c": float(prior.tail_shape),
+        "slab2": (
+            float(prior.initial_slab2_value()) if prior.regularized else None
+        ),
+    }
+
+
+def copy_triple_gamma_state(state: dict[str, Any]) -> dict[str, Any]:
+    if not state:
+        return {}
+    return {
+        "numerator": {
+            key: float(value) for key, value in state["numerator"].items()
+        },
+        "denominator": {
+            key: float(value) for key, value in state["denominator"].items()
+        },
+        "global": float(state["global"]),
+        "a": float(state["a"]),
+        "c": float(state["c"]),
+        "slab2": (
+            None if state.get("slab2") is None else float(state["slab2"])
+        ),
+    }
+
+
+def triple_gamma_conditional_variance(
+    priors: Any,
+    state: dict[str, Any],
+    component: str,
+) -> float:
+    prior = getattr(priors, "triple_gamma", None)
+    if prior is None:
+        raise ValueError("A triple-gamma prior is not active.")
+    if not state or component not in state.get("numerator", {}):
+        raise ValueError(f"Missing triple-gamma state for {component}.")
+    return float(
+        prior.conditional_variance(
+            component,
+            numerator=float(state["numerator"][component]),
+            denominator=float(state["denominator"][component]),
+            global_scale=float(state["global"]),
+            slab2=state.get("slab2"),
+        )
+    )
+
+
 def horseshoe_conditional_variance(
     priors: Any,
     state: dict[str, Any],
@@ -930,6 +1005,240 @@ def _inverse_gamma_logpdf(value: float, shape: float, scale: float) -> float:
     )
 
 
+def _gamma_logpdf(value: float, shape: float, rate: float = 1.0) -> float:
+    value = float(value)
+    shape = float(shape)
+    rate = float(rate)
+    if value <= 0.0 or shape <= 0.0 or rate <= 0.0:
+        return -np.inf
+    return float(
+        shape * np.log(rate)
+        - lgamma(shape)
+        + (shape - 1.0) * np.log(value)
+        - rate * value
+    )
+
+
+def _beta_prime_logpdf(value: float, first: float, second: float) -> float:
+    value = float(value)
+    first = float(first)
+    second = float(second)
+    if value <= 0.0 or first <= 0.0 or second <= 0.0:
+        return -np.inf
+    log_beta = lgamma(first) + lgamma(second) - lgamma(first + second)
+    return float(
+        (first - 1.0) * np.log(value)
+        - (first + second) * np.log1p(value)
+        - log_beta
+    )
+
+
+def _beta_logpdf(value: float, first: float, second: float) -> float:
+    value = float(value)
+    if not 0.0 < value < 1.0 or first <= 0.0 or second <= 0.0:
+        return -np.inf
+    log_beta = lgamma(first) + lgamma(second) - lgamma(first + second)
+    return float(
+        (first - 1.0) * np.log(value)
+        + (second - 1.0) * np.log1p(-value)
+        - log_beta
+    )
+
+
+def _slice_sample_real(
+    current: float,
+    log_density,
+    rng: np.random.Generator,
+    *,
+    width: float = 1.0,
+    max_steps_out: int = 50,
+    max_shrink: int = 500,
+) -> tuple[float, int]:
+    """Univariate stepping-out slice sampler on the real line.
+
+    The routine is used on log-scales (and on logit shape coordinates), so all
+    positivity constraints are respected without rejected random-walk moves.
+    It leaves the exact conditional invariant; the returned count is the
+    number of target evaluations, useful for future performance diagnostics.
+    """
+
+    current = float(current)
+    width = max(float(width), 1e-6)
+    current_density = float(log_density(current))
+    if not np.isfinite(current_density):
+        raise FloatingPointError("Slice sampler started outside finite support.")
+    log_height = current_density + np.log(max(float(rng.random()), 1e-300))
+    left = current - width * float(rng.random())
+    right = left + width
+    evaluations = 1
+    left_steps = int(rng.integers(max_steps_out + 1))
+    right_steps = max_steps_out - left_steps
+    while left_steps > 0:
+        value = float(log_density(left))
+        evaluations += 1
+        if not np.isfinite(value) or value <= log_height:
+            break
+        left -= width
+        left_steps -= 1
+    while right_steps > 0:
+        value = float(log_density(right))
+        evaluations += 1
+        if not np.isfinite(value) or value <= log_height:
+            break
+        right += width
+        right_steps -= 1
+    for _ in range(max_shrink):
+        proposal = float(rng.uniform(left, right))
+        value = float(log_density(proposal))
+        evaluations += 1
+        if np.isfinite(value) and value >= log_height:
+            return proposal, evaluations
+        if proposal < current:
+            left = proposal
+        else:
+            right = proposal
+    raise RuntimeError("Slice sampler failed to find a point on the slice.")
+
+
+def update_triple_gamma_scales(
+    params_state: ParamDict,
+    state: dict[str, Any],
+    priors: Any,
+    layout: NCPLayout,
+    *,
+    rng: np.random.Generator,
+    width_local: float = 1.0,
+    width_global: float = 1.0,
+    width_shape: float = 0.8,
+    width_slab: float = 0.8,
+) -> tuple[dict[str, Any], dict[str, bool]]:
+    """Exact slice updates for a (regularized) triple-gamma hierarchy."""
+
+    prior = getattr(priors, "triple_gamma", None)
+    if prior is None:
+        return state, {}
+    out = copy_triple_gamma_state(state)
+    names = _active_scale_names(layout)
+    scale_keys = {"level": "s_level", "trend": "s_trend", "season": "s_season"}
+    moved: dict[str, bool] = {}
+
+    def coefficient_log_density(candidate: dict[str, Any], selected=None) -> float:
+        total = 0.0
+        for component in names if selected is None else selected:
+            variance = prior.conditional_variance(
+                component,
+                numerator=candidate["numerator"][component],
+                denominator=candidate["denominator"][component],
+                global_scale=candidate["global"],
+                slab2=candidate.get("slab2"),
+            )
+            total += _normal_zero_logpdf(
+                float(params_state.get(scale_keys[component], 0.0)), variance
+            )
+        return float(total)
+
+    for component in names:
+        for field_name, shape_name in (
+            ("numerator", "a"),
+            ("denominator", "c"),
+        ):
+            current_log = np.log(max(float(out[field_name][component]), 1e-300))
+
+            def target(log_value, *, field_name=field_name, shape_name=shape_name):
+                candidate = copy_triple_gamma_state(out)
+                value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+                candidate[field_name][component] = value
+                return (
+                    coefficient_log_density(candidate, [component])
+                    + _gamma_logpdf(value, candidate[shape_name], 1.0)
+                    + log_value
+                )
+
+            proposed_log, _ = _slice_sample_real(
+                current_log, target, rng, width=width_local
+            )
+            out[field_name][component] = float(np.exp(proposed_log))
+            key = f"triple_gamma_{field_name}_{component}"
+            moved[key] = not np.isclose(proposed_log, current_log)
+
+    if prior.learn_global:
+        current_log = np.log(max(float(out["global"]), 1e-300))
+
+        def global_target(log_value):
+            candidate = copy_triple_gamma_state(out)
+            value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+            candidate["global"] = value
+            return (
+                coefficient_log_density(candidate)
+                + _beta_prime_logpdf(value, candidate["c"], candidate["a"])
+                + log_value
+            )
+
+        proposed_log, _ = _slice_sample_real(
+            current_log, global_target, rng, width=width_global
+        )
+        out["global"] = float(np.exp(proposed_log))
+        moved["triple_gamma_global"] = not np.isclose(proposed_log, current_log)
+
+    if prior.learn_shapes:
+        for shape_name, hyperprior, local_field in (
+            ("a", prior.spike_shape_prior, "numerator"),
+            ("c", prior.tail_shape_prior, "denominator"),
+        ):
+            current_shape = float(out[shape_name])
+            current_logit = np.log(current_shape / (0.5 - current_shape))
+
+            def shape_target(logit_value, *, shape_name=shape_name,
+                             hyperprior=hyperprior, local_field=local_field):
+                probability = 1.0 / (1.0 + np.exp(-np.clip(logit_value, -700.0, 700.0)))
+                shape = 0.5 * probability
+                candidate = copy_triple_gamma_state(out)
+                candidate[shape_name] = shape
+                total = sum(
+                    _gamma_logpdf(candidate[local_field][component], shape, 1.0)
+                    for component in names
+                )
+                if prior.learn_global:
+                    total += _beta_prime_logpdf(
+                        candidate["global"], candidate["c"], candidate["a"]
+                    )
+                total += _beta_logpdf(probability, *hyperprior)
+                total += np.log(max(probability * (1.0 - probability), 1e-300))
+                return float(total)
+
+            proposed_logit, _ = _slice_sample_real(
+                current_logit, shape_target, rng, width=width_shape
+            )
+            probability = 1.0 / (1.0 + np.exp(-proposed_logit))
+            out[shape_name] = float(0.5 * probability)
+            moved[f"triple_gamma_{shape_name}"] = not np.isclose(
+                proposed_logit, current_logit
+            )
+
+    if prior.regularized:
+        current_log = np.log(max(float(out["slab2"]), 1e-300))
+        shape = 0.5 * float(prior.slab_df)
+        scale = 0.5 * float(prior.slab_df) * float(prior.slab_scale) ** 2
+
+        def slab_target(log_value):
+            candidate = copy_triple_gamma_state(out)
+            value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+            candidate["slab2"] = value
+            return (
+                coefficient_log_density(candidate)
+                + _inverse_gamma_logpdf(value, shape, scale)
+                + log_value
+            )
+
+        proposed_log, _ = _slice_sample_real(
+            current_log, slab_target, rng, width=width_slab
+        )
+        out["slab2"] = float(np.exp(proposed_log))
+        moved["triple_gamma_slab2"] = not np.isclose(proposed_log, current_log)
+
+    return out, moved
+
+
 def update_horseshoe_scales(
     params_state: ParamDict,
     state: dict[str, Any],
@@ -941,10 +1250,14 @@ def update_horseshoe_scales(
     step_global: float = 0.25,
     step_slab: float = 0.20,
 ) -> tuple[dict[str, Any], dict[str, bool]]:
-    """Exact log-scale MH update for regularized-horseshoe hyperparameters.
+    """Exact slice updates for regularized-horseshoe hyperparameters.
 
-    Only the Gaussian prior density of the currently sampled signed innovation
-    scales enters this conditional.  The observation likelihood is unchanged.
+    v2.1.4 used one-step log random walks for the local, global and slab
+    scales.  In the three-component structural comparison that hierarchy forms
+    a pronounced ridge, producing low ESS even when the signed innovation
+    coefficients mix.  Stepping-out slice updates target the same exact
+    conditional without tuning an acceptance rate and traverse that ridge much
+    more reliably.  The ``step_*`` arguments now act as slice widths.
     """
     hp = getattr(priors, "horseshoe", None)
     if hp is None:
@@ -952,7 +1265,7 @@ def update_horseshoe_scales(
     out = copy_horseshoe_state(state)
     names = _active_scale_names(layout)
     scale_keys = {"level": "s_level", "trend": "s_trend", "season": "s_season"}
-    accepted: dict[str, bool] = {}
+    moved: dict[str, bool] = {}
 
     def q_log_density(candidate: dict[str, Any], subset: Optional[list[str]] = None) -> float:
         total = 0.0
@@ -970,64 +1283,66 @@ def update_horseshoe_scales(
 
     for component in names:
         current = float(out["local"][component])
-        proposal = float(np.exp(np.log(current) + step_local * rng.normal()))
-        candidate = copy_horseshoe_state(out)
-        candidate["local"][component] = proposal
-        current_target = (
-            q_log_density(out, [component])
-            + _half_cauchy_logpdf(current, 1.0)
-            + np.log(current)
+        current_log = np.log(current)
+
+        def local_target(log_value):
+            candidate = copy_horseshoe_state(out)
+            value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+            candidate["local"][component] = value
+            return (
+                q_log_density(candidate, [component])
+                + _half_cauchy_logpdf(value, 1.0)
+                + log_value
+            )
+
+        proposed_log, _ = _slice_sample_real(
+            current_log, local_target, rng, width=step_local
         )
-        proposal_target = (
-            q_log_density(candidate, [component])
-            + _half_cauchy_logpdf(proposal, 1.0)
-            + np.log(proposal)
+        out["local"][component] = float(np.exp(proposed_log))
+        moved[f"horseshoe_local_{component}"] = not np.isclose(
+            proposed_log, current_log
         )
-        take = bool(np.log(rng.random()) < proposal_target - current_target)
-        if take:
-            out = candidate
-        accepted[f"horseshoe_local_{component}"] = take
 
     current = float(out["global"])
-    proposal = float(np.exp(np.log(current) + step_global * rng.normal()))
-    candidate = copy_horseshoe_state(out)
-    candidate["global"] = proposal
-    current_target = (
-        q_log_density(out)
-        + _half_cauchy_logpdf(current, float(hp.global_scale))
-        + np.log(current)
+    current_log = np.log(current)
+
+    def global_target(log_value):
+        candidate = copy_horseshoe_state(out)
+        value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+        candidate["global"] = value
+        return (
+            q_log_density(candidate)
+            + _half_cauchy_logpdf(value, float(hp.global_scale))
+            + log_value
+        )
+
+    proposed_log, _ = _slice_sample_real(
+        current_log, global_target, rng, width=step_global
     )
-    proposal_target = (
-        q_log_density(candidate)
-        + _half_cauchy_logpdf(proposal, float(hp.global_scale))
-        + np.log(proposal)
-    )
-    take = bool(np.log(rng.random()) < proposal_target - current_target)
-    if take:
-        out = candidate
-    accepted["horseshoe_global"] = take
+    out["global"] = float(np.exp(proposed_log))
+    moved["horseshoe_global"] = not np.isclose(proposed_log, current_log)
 
     current = float(out["slab2"])
-    proposal = float(np.exp(np.log(current) + step_slab * rng.normal()))
-    candidate = copy_horseshoe_state(out)
-    candidate["slab2"] = proposal
+    current_log = np.log(current)
     shape = 0.5 * float(hp.slab_df)
     scale = 0.5 * float(hp.slab_df) * float(hp.slab_scale) ** 2
-    current_target = (
-        q_log_density(out)
-        + _inverse_gamma_logpdf(current, shape, scale)
-        + np.log(current)
+
+    def slab_target(log_value):
+        candidate = copy_horseshoe_state(out)
+        value = float(np.exp(np.clip(log_value, -700.0, 700.0)))
+        candidate["slab2"] = value
+        return (
+            q_log_density(candidate)
+            + _inverse_gamma_logpdf(value, shape, scale)
+            + log_value
+        )
+
+    proposed_log, _ = _slice_sample_real(
+        current_log, slab_target, rng, width=step_slab
     )
-    proposal_target = (
-        q_log_density(candidate)
-        + _inverse_gamma_logpdf(proposal, shape, scale)
-        + np.log(proposal)
-    )
-    take = bool(np.log(rng.random()) < proposal_target - current_target)
-    if take:
-        out = candidate
-    accepted["horseshoe_slab2"] = take
-    return out, accepted
+    out["slab2"] = float(np.exp(proposed_log))
+    moved["horseshoe_slab2"] = not np.isclose(proposed_log, current_log)
+    return out, moved
 
 
 def _rand_invgauss(mu: float, lam: float, rng: np.random.Generator) -> float:
@@ -1137,6 +1452,7 @@ def _theta_prior_mean_precision(
     tau: Optional[dict[str, float]],
     lasso_variance_scale: float,
     horseshoe_state: Optional[dict[str, Any]] = None,
+    triple_gamma_state: Optional[dict[str, Any]] = None,
 ) -> tuple[Array, Array]:
     d = len(theta_names)
     mean = np.zeros(d, dtype=float)
@@ -1203,6 +1519,13 @@ def _theta_prior_mean_precision(
                 priors, horseshoe_state, block_name
             )
             precision[i, i] = 1.0 / max(prior_variance, 1e-16)
+        elif getattr(priors, "triple_gamma", None) is not None:
+            if triple_gamma_state is None:
+                raise ValueError("Missing triple-gamma latent scales.")
+            prior_variance = triple_gamma_conditional_variance(
+                priors, triple_gamma_state, block_name
+            )
+            precision[i, i] = 1.0 / max(prior_variance, 1e-16)
         else:
             prior = getattr(priors, theta_name)
             if prior is None:
@@ -1257,6 +1580,7 @@ def gaussian_theta_update(
     tau: Optional[dict[str, float]] = None,
     lasso_variance_scale: Optional[float] = None,
     horseshoe_state: Optional[dict[str, Any]] = None,
+    triple_gamma_state: Optional[dict[str, Any]] = None,
 ) -> ParamDict:
     X, names, tbar = design_matrix_ncp(z_path, layout, center_time=True)
     if lasso_variance_scale is None:
@@ -1269,6 +1593,7 @@ def gaussian_theta_update(
         tau=tau,
         lasso_variance_scale=float(lasso_variance_scale),
         horseshoe_state=horseshoe_state,
+        triple_gamma_state=triple_gamma_state,
     )
     theta = _posterior_gaussian_precision(X, y, float(sigma2), pm, pp, rng)
     return apply_theta_draw({}, theta, names, layout, tbar=tbar)
@@ -1285,6 +1610,7 @@ def gev_theta_update(
     tau: Optional[dict[str, float]] = None,
     lasso_variance_scale: float = 1.0,
     horseshoe_state: Optional[dict[str, Any]] = None,
+    triple_gamma_state: Optional[dict[str, Any]] = None,
 ) -> ParamDict:
     X, names, tbar = design_matrix_ncp(z_path, layout, center_time=True)
     pm, pp = _theta_prior_mean_precision(
@@ -1295,6 +1621,7 @@ def gev_theta_update(
         tau=tau,
         lasso_variance_scale=float(lasso_variance_scale),
         horseshoe_state=horseshoe_state,
+        triple_gamma_state=triple_gamma_state,
     )
     theta = _posterior_gaussian_precision(X, z_pseudo, R_t, pm, pp, rng)
     return apply_theta_draw({}, theta, names, layout, tbar=tbar)
@@ -1337,6 +1664,7 @@ def fs_theta_prior(
     tau: Optional[dict[str, float]] = None,
     lasso_variance_scale: float = 1.0,
     horseshoe_state: Optional[dict[str, Any]] = None,
+    triple_gamma_state: Optional[dict[str, Any]] = None,
 ) -> tuple[Array, Array]:
     """Return the conditional Gaussian mean/covariance of the FS block."""
     mean, precision = _theta_prior_mean_precision(
@@ -1347,6 +1675,7 @@ def fs_theta_prior(
         tau=tau,
         lasso_variance_scale=lasso_variance_scale,
         horseshoe_state=horseshoe_state,
+        triple_gamma_state=triple_gamma_state,
     )
     covariance = _symmetrize(spd_solve(precision, np.eye(precision.shape[0])))
     return mean, covariance

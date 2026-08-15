@@ -334,6 +334,11 @@ def _stack_fs_chains(
             "bayesian_lasso": bool(outputs[0].meta.get("bayesian_lasso", False)),
             "componentwise_lasso": bool(outputs[0].meta.get("componentwise_lasso", False)),
             "regularized_horseshoe": bool(outputs[0].meta.get("regularized_horseshoe", False)),
+            "triple_gamma": bool(outputs[0].meta.get("triple_gamma", False)),
+            "regularized_triple_gamma": bool(
+                outputs[0].meta.get("regularized_triple_gamma", False)
+            ),
+            "shrinkage_update": outputs[0].meta.get("shrinkage_update"),
             "pc_innovation_prior": bool(outputs[0].meta.get("pc_innovation_prior", False)),
             "structural_ssvs": bool(outputs[0].meta.get("structural_ssvs", False)),
             "model_selection_exact": outputs[0].meta.get("model_selection_exact"),

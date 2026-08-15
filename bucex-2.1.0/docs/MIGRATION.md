@@ -1,5 +1,23 @@
 # Migrating to bucex 2.1
 
+## From 2.1.4 to 2.1.5
+
+Existing fit/result calls remain source compatible. The new
+`triple_gamma` and `regularized_triple_gamma` profiles are additive. They are
+available to univariate FS models and to the full factor model. The latter
+stores namespaced shrinkage factors such as
+`triple_gamma.rho.channel.TXx.level`.
+
+Regularized-horseshoe hyperparameters now use exact stepping-out slice updates
+instead of one-step random-walk proposals. This does not change the posterior
+target, but old proposal-step settings now act as slice widths.
+
+All plot dispatchers accept `save=` and `fit.plot("acf")` adds chain-specific
+autocorrelation plots. Process-SD prior curves are analytic when possible.
+For constant SSVS indicators, R-hat and ESS now return `NaN` plus an explicit
+constant-allocation status; old `1`/total-draw values were undefined
+zero-variance arithmetic, not convergence evidence.
+
 ## From 2.1.2 to 2.1.4
 
 Existing model and fit calls remain source compatible. Progress output is now
@@ -167,7 +185,7 @@ Use `fit.state("level")`, `fit.parameter("sd.level")`, and
 
 ### Priors
 
-FS fits accept the six named profiles documented in the inference matrix.
+FS fits accept the named profiles documented in the inference matrix.
 Centered and disturbance fits use the general `Priors` object and the `pc`,
 `normal`, or `ssvs` shorthands. Signed hierarchical lasso and horseshoe priors
 are rejected outside FS rather than silently approximated.

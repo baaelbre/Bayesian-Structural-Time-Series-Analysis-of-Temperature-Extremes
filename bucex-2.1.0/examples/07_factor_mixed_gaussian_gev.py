@@ -6,6 +6,8 @@ factor and their channel-specific states.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -20,6 +22,7 @@ CHAINS = 4
 N_PARTICLES = 256
 SEED = 701
 BASELINE = slice(0, 36)
+FIGURE_DIR = Path("figures/07_factor_mixed")
 
 
 def make_model() -> bx.FactorModel:
@@ -58,6 +61,7 @@ def make_model() -> bx.FactorModel:
 
 
 def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     model = make_model()
     truth = {
         "sd.factor.climate.level": 0.0,
@@ -151,6 +155,7 @@ def main() -> None:
             },
             "deviation": deviations,
         },
+        save=FIGURE_DIR / "decomposition.png",
     )
     fit.plot(
         "parameter_density",
@@ -163,19 +168,26 @@ def main() -> None:
             "xi.maximum",
         ),
         truths=truth,
+        save=FIGURE_DIR / "densities.png",
     )
-    fit.plot("traces", truths=truth)
+    fit.plot("traces", truths=truth, save=FIGURE_DIR / "traces.png")
+    fit.plot("acf", max_lag=50, save=FIGURE_DIR / "acf.png")
     fit.plot(
         "loading_deviation",
         channel="maximum",
         summary="factor_projection",
         baseline=BASELINE,
+        save=FIGURE_DIR / "maximum_loading_deviation.png",
     )
-    fit.plot("identification", baseline=BASELINE)
+    fit.plot(
+        "identification", baseline=BASELINE,
+        save=FIGURE_DIR / "identification.png",
+    )
     fit.plot(
         "idiosyncratic_innovations",
         channel="maximum",
         truth=deviations["maximum"],
+        save=FIGURE_DIR / "maximum_innovations.png",
     )
     plt.show()
 

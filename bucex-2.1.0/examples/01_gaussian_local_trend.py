@@ -3,22 +3,15 @@
 This is the simplest complete bucex workflow: define a model, simulate data,
 fit it, check convergence, inspect recovery, forecast, and plot.  All settings
 are visible below; change them here when experimenting.
-
-Main result: variance allocation (sigma2 was slightly overestimated whereas slope and seasonal sd were too small).
-Good stuff:
-All 2values are essentially 1.
-ESS values of 980–2450 are excellent.
-All four chains overlap without visible drift or sticking.
-The posterior predictor closely follows the true predictor.
-Its credible interval covers nearly the complete true path.
-The positive latent slope is recovered, and the forecast behaves coherently.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from dataclasses import replace
+
 import bucex as bx
 
 
@@ -31,6 +24,7 @@ DRAWS = 1_000
 WARMUP = 1_000
 CHAINS = 4
 SEED = 101
+FIGURE_DIR = Path("figures/01_gaussian_local_trend")
 
 
 def main() -> None:
@@ -68,21 +62,12 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 3. Fit the model
     # -----------------------------------------------------------------------
-    priors = bx.pc_gaussian_priors(period=PERIOD)
-    priors = replace(
-        priors,
-        sigma2=bx.InverseGammaPrior(
-            a=2.0,
-            b=truth["sigma"] ** 2,
-        ),
-    )
-
     fit = bx.fit(
         data,
         model,
         parameterization="fruehwirth_schnatter",
         engine="ffbs",                    # exact for Gaussian observations
-        priors=priors,                      # interpretable shrinkage toward zero
+        priors="pc",                      # interpretable shrinkage toward zero
         asis=True,
         mcmc=bx.MCMC(
             draws=DRAWS,
@@ -125,13 +110,30 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 5. Plot the fit and the MCMC diagnostics
     # -----------------------------------------------------------------------
-    _, predictor_axis = fit.plot("predictor")
+    predictor_figure, predictor_axis = fit.plot("predictor")
     predictor_axis.plot(dates, simulation.eta, color="black", label="true predictor")
     predictor_axis.legend()
-    fit.plot("level_slope")
-    fit.plot("process_sd", truths=truth, title="PC prior: Gaussian model")
-    fit.plot("traces", parameters=parameters, truths=truth)
-    fit.plot("parameter_density", parameters=parameters, truths=truth)
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    predictor_figure.savefig(FIGURE_DIR / "predictor.png", bbox_inches="tight")
+    fit.plot("level_slope", save=FIGURE_DIR / "level_slope.png")
+    fit.plot(
+        "process_sd",
+        truths=truth,
+        title="PC prior: Gaussian model",
+        save=FIGURE_DIR / "prior_posterior_sd.png",
+    )
+    fit.plot(
+        "traces", parameters=parameters, truths=truth,
+        save=FIGURE_DIR / "traces.png",
+    )
+    fit.plot(
+        "acf", parameters=parameters, max_lag=50,
+        save=FIGURE_DIR / "acf.png",
+    )
+    fit.plot(
+        "parameter_density", parameters=parameters, truths=truth,
+        save=FIGURE_DIR / "densities.png",
+    )
     plt.show()
 
 

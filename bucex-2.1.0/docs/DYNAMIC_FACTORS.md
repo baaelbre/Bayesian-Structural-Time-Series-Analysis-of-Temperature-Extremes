@@ -109,14 +109,14 @@ important. Without them, a flexible shared random trend and six equally
 flexible channel random trends can divide the same low-frequency signal in
 many weakly identified ways.
 
-Version 2.1.4 makes those restrictions explicit rather than hiding them in
+Version 2.1.5 makes those restrictions explicit rather than hiding them in
 example-specific prior edits:
 
 ```python
 compiled = bx.compile_model(model, data)
 priors = bx.identified_factor_priors(
     compiled,
-    profile="regularized_horseshoe",
+    profile="regularized_triple_gamma",
     smooth_factor=True,          # fix the direct factor-level innovation
     reference_channel="TXm",    # make TXm a pure low-frequency reference
 )
@@ -237,6 +237,41 @@ zero, but it does not assign a literal posterior probability to
 (q_{\alpha,i}=0). Report posterior scale intervals and prior/posterior
 overlays rather than calling it exact variable selection.
 
+## Idiosyncratic triple gamma
+
+The full factor model also accepts `triple_gamma` and
+`regularized_triple_gamma`. For each selected namespaced idiosyncratic scale,
+the standardized signed coefficient follows
+
+\[
+u_i\mid r_i,d_i,\phi\sim N(0,\phi r_i/d_i),\quad
+r_i\sim\operatorname{Gamma}(a,1),\quad
+d_i\sim\operatorname{Gamma}(c,1).
+\]
+
+The hierarchy is restricted to `channel.<name>.level` processes, exactly like
+the factor horseshoe; common-factor and seasonal process priors are unchanged.
+Posterior output stores `triple_gamma.rho.<process>`, where values near one
+mean strong shrinkage and values near zero mean little shrinkage. The
+regularized profile replaces variance (v) by
+(c_0^2v/(c_0^2+v)) and learns (c_0^2) under the configured inverse-gamma slab.
+
+```python
+priors = bx.identified_factor_priors(
+    compiled,
+    profile="regularized_triple_gamma",
+    triple_gamma_options={"spike_shape": 0.1, "tail_shape": 0.1},
+    smooth_factor=True,
+    reference_channel="TXm",
+)
+```
+
+Triple gamma is continuous shrinkage, not exact model selection. The
+horseshoe, Bayesian-lasso, double-gamma, folded/half-t, and Gaussian cases are
+members or limits of the unregularized family; the PC prior is kept separate
+because its direct exponential-on-SD calibration is not the same finite
+hierarchy.
+
 ## Likelihood and sampler blocks
 
 At every time and particle, the mixed log weight is
@@ -251,7 +286,8 @@ At every time and particle, the mixed log weight is
 
 One MCMC iteration updates the global latent path, static FS coefficients or
 disturbance scales, channel observation parameters, estimated loadings, and
-horseshoe hyperparameters. In v2.1.4, an estimated Gaussian-channel loading is
+horseshoe or triple-gamma hyperparameters. In v2.1.5, an estimated
+Gaussian-channel loading is
 not conditioned on the previous idiosyncratic path: a marginal Kalman update
 first moves its idiosyncratic scale and a three-state FFBS block then jointly
 draws `(c_i, lambda_i, alpha_i[0:T])`. For a GEV channel, the interweaving move
@@ -290,9 +326,11 @@ fit.factor_identification_diagnostics()
 fit.plot("factor_decomposition", baseline=slice(0, 30 * 12))
 fit.plot("parameter_density", parameters=["loading.common.TXx"])
 fit.plot("traces")
+fit.plot("acf")
 fit.plot("loading_deviation", channel="TXx")
 fit.plot("identification")
 fit.plot("idiosyncratic_innovations", channel="TXx")
+fit.plot("factor_decomposition", save="figures/decomposition.png")
 ```
 
 A loading above one means that the `TXx` contribution associated with the

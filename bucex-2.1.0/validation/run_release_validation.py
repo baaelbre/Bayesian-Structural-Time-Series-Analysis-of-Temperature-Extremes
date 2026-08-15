@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-seed univariate compatibility validation for bucex 2.1.2."""
+"""Fixed-seed univariate compatibility validation for bucex 2.1.5."""
 from __future__ import annotations
 
 import argparse
@@ -25,6 +25,8 @@ PROFILES = (
     "manuscript_lasso",
     "regularized_lasso",
     "regularized_horseshoe",
+    "triple_gamma",
+    "regularized_triple_gamma",
     "pc",
     "normal",
     "ssvs",
@@ -62,8 +64,8 @@ def run(data_dir: str | Path, particles: int) -> dict[str, object]:
         "platform": platform.platform(),
         "single_result_type": bx.PosteriorBundle is bx.FitResult,
     }
-    if bx.__version__ != "2.1.2":
-        raise RuntimeError(f"Expected bucex 2.1.2, found {bx.__version__}.")
+    if bx.__version__ != "2.1.5":
+        raise RuntimeError(f"Expected bucex 2.1.5, found {bx.__version__}.")
 
     data_table = bx.validate_uccle_data(data_dir, check_daily=True)
     record["uccle_data"] = data_table.reset_index().to_dict(orient="records")
@@ -211,7 +213,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("validation/univariate_validation_2.1.2.json"),
+        default=Path("validation/univariate_validation_2.1.5.json"),
     )
     args = parser.parse_args()
     result = run(args.data_dir, args.particles)

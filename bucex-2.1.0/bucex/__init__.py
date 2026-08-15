@@ -110,6 +110,7 @@ from .priors import (
     PCSD,
     Priors,
     RegularizedHorseshoePrior,
+    TripleGammaPrior,
     SDUniformPrior,
     SSVSPrior,
     SpikeSlabSD,
@@ -128,8 +129,12 @@ from .priors import (
     regularized_gev_priors,
     regularized_horseshoe_gaussian_priors,
     regularized_horseshoe_gev_priors,
+    regularized_triple_gamma_gaussian_priors,
+    regularized_triple_gamma_gev_priors,
     ssvs_gaussian_priors,
     ssvs_gev_priors,
+    triple_gamma_gaussian_priors,
+    triple_gamma_gev_priors,
 )
 from .simulate import Simulation, simulate
 
@@ -182,6 +187,7 @@ __all__ = [
     "TruncatedNormalPrior", "default_priors", "InverseGammaPrior", "GammaPrior",
     "UniformPrior", "NormalPrior", "DiagonalNormalPrior", "BayesianLassoPrior",
     "ComponentwiseBayesianLassoPrior", "RegularizedHorseshoePrior",
+    "TripleGammaPrior",
     "PCInnovationPrior", "SSVSPrior", "FSGaussianPriors",
     "FSGEVPriors", "ComponentState", "StructuralModelState",
     "manuscript_gaussian_priors",
@@ -189,6 +195,9 @@ __all__ = [
     "regularized_gaussian_priors", "regularized_gev_priors",
     "regularized_horseshoe_gaussian_priors",
     "regularized_horseshoe_gev_priors", "pc_gaussian_priors", "pc_gev_priors",
+    "triple_gamma_gaussian_priors", "triple_gamma_gev_priors",
+    "regularized_triple_gamma_gaussian_priors",
+    "regularized_triple_gamma_gev_priors",
     "ssvs_gaussian_priors", "ssvs_gev_priors",
     # Prediction, diagnostics and simulation.
     "Forecast", "posterior_predict", "forecast", "plot", "score",

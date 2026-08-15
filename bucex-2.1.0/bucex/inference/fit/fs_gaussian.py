@@ -32,7 +32,9 @@ from .fs_utils import (
     copy_lasso_lambda2,
     lasso_coefficient_scale,
     initialise_horseshoe,
+    initialise_triple_gamma,
     update_horseshoe_scales,
+    update_triple_gamma_scales,
     update_pc_scales,
     asis_centered_scale_update,
 )
@@ -131,6 +133,7 @@ class FSGaussianKernel:
 
         tau, lambda2 = initialise_lasso(self.priors, self.layout)
         horseshoe_state = initialise_horseshoe(self.priors, self.layout)
+        triple_gamma_state = initialise_triple_gamma(self.priors, self.layout)
         model_state = initial_structural_state(params_state, self.layout)
         use_asis = bool(state_kwargs.get("asis", False))
 
@@ -173,6 +176,16 @@ class FSGaussianKernel:
             draws_static["horseshoe_slab2"] = np.zeros(n_keep)
             for block in horseshoe_state["local"]:
                 draws_static[f"horseshoe_local_{block}"] = np.zeros(n_keep)
+        if self.priors.triple_gamma is not None:
+            draws_static["triple_gamma_global"] = np.zeros(n_keep)
+            draws_static["triple_gamma_a"] = np.zeros(n_keep)
+            draws_static["triple_gamma_c"] = np.zeros(n_keep)
+            if self.priors.triple_gamma.regularized:
+                draws_static["triple_gamma_slab2"] = np.zeros(n_keep)
+            for block in triple_gamma_state["numerator"]:
+                draws_static[f"triple_gamma_numerator_{block}"] = np.zeros(n_keep)
+                draws_static[f"triple_gamma_denominator_{block}"] = np.zeros(n_keep)
+                draws_static[f"triple_gamma_rho_{block}"] = np.zeros(n_keep)
         if self.priors.pc is not None:
             for block in tau:
                 draws_static[f"pc_tau_{block}"] = np.zeros(n_keep)
@@ -192,6 +205,7 @@ class FSGaussianKernel:
         progress_chains = int(state_kwargs.get("_progress_chains", 1))
         progress_label = str(state_kwargs.get("_progress_label", "univariate"))
         horseshoe_accepts: dict[str, int] = {}
+        triple_gamma_moves: dict[str, int] = {}
         asis_accepts: dict[str, int] = {}
 
         for it in range(n_iter):
@@ -245,6 +259,7 @@ class FSGaussianKernel:
                     tau=tau or None,
                     lasso_variance_scale=lasso_var,
                     horseshoe_state=horseshoe_state or None,
+                    triple_gamma_state=triple_gamma_state or None,
                 )
                 params_state.update(theta_draw)
 
@@ -258,6 +273,7 @@ class FSGaussianKernel:
                     tau=tau or None,
                     lasso_variance_scale=lasso_var,
                     horseshoe_state=horseshoe_state or None,
+                    triple_gamma_state=triple_gamma_state or None,
                     proposal_step=float(state_kwargs.get("asis_step", 0.20)),
                 )
                 for key, accepted in outcomes.items():
@@ -290,6 +306,30 @@ class FSGaussianKernel:
                 )
                 for key, accepted in outcomes.items():
                     horseshoe_accepts[key] = horseshoe_accepts.get(key, 0) + int(accepted)
+            if self.priors.triple_gamma is not None:
+                triple_gamma_state, outcomes = update_triple_gamma_scales(
+                    params_state,
+                    triple_gamma_state,
+                    self.priors,
+                    self.layout,
+                    rng=self.rng,
+                    width_local=float(
+                        state_kwargs.get("triple_gamma_width_local", 1.0)
+                    ),
+                    width_global=float(
+                        state_kwargs.get("triple_gamma_width_global", 1.0)
+                    ),
+                    width_shape=float(
+                        state_kwargs.get("triple_gamma_width_shape", 0.8)
+                    ),
+                    width_slab=float(
+                        state_kwargs.get("triple_gamma_width_slab", 0.8)
+                    ),
+                )
+                for key, moved in outcomes.items():
+                    triple_gamma_moves[key] = (
+                        triple_gamma_moves.get(key, 0) + int(moved)
+                    )
             if self.priors.pc is not None:
                 tau = update_pc_scales(
                     params_state,
@@ -348,6 +388,42 @@ class FSGaussianKernel:
                     )
                     for block, value in horseshoe_state["local"].items():
                         draws_static[f"horseshoe_local_{block}"][keep_idx] = float(value)
+                if self.priors.triple_gamma is not None:
+                    tg = self.priors.triple_gamma
+                    draws_static["triple_gamma_global"][keep_idx] = float(
+                        triple_gamma_state["global"]
+                    )
+                    draws_static["triple_gamma_a"][keep_idx] = float(
+                        triple_gamma_state["a"]
+                    )
+                    draws_static["triple_gamma_c"][keep_idx] = float(
+                        triple_gamma_state["c"]
+                    )
+                    if tg.regularized:
+                        draws_static["triple_gamma_slab2"][keep_idx] = float(
+                            triple_gamma_state["slab2"]
+                        )
+                    for block in triple_gamma_state["numerator"]:
+                        numerator = float(
+                            triple_gamma_state["numerator"][block]
+                        )
+                        denominator = float(
+                            triple_gamma_state["denominator"][block]
+                        )
+                        global_scale = float(triple_gamma_state["global"])
+                        draws_static[
+                            f"triple_gamma_numerator_{block}"
+                        ][keep_idx] = numerator
+                        draws_static[
+                            f"triple_gamma_denominator_{block}"
+                        ][keep_idx] = denominator
+                        draws_static[f"triple_gamma_rho_{block}"][keep_idx] = (
+                            tg.shrinkage_factor(
+                                numerator=numerator,
+                                denominator=denominator,
+                                global_scale=global_scale,
+                            )
+                        )
                 if self.priors.pc is not None:
                     for block, value in tau.items():
                         draws_static[f"pc_tau_{block}"][keep_idx] = float(value)
@@ -419,6 +495,7 @@ class FSGaussianKernel:
                             },
                             params_obs,
                             horseshoe_state=horseshoe_state,
+                            triple_gamma_state=triple_gamma_state,
                         ),
                         details=tuple(details),
                     ),
@@ -438,6 +515,10 @@ class FSGaussianKernel:
                     key: value / max(n_iter, 1)
                     for key, value in asis_accepts.items()
                 },
+                **{
+                    key: value / max(n_iter, 1)
+                    for key, value in triple_gamma_moves.items()
+                },
             },
             meta={
                 "sampler": (
@@ -450,9 +531,13 @@ class FSGaussianKernel:
                             "fs_gaussian_horseshoe_gibbs"
                             if self.priors.horseshoe is not None
                             else (
-                                "fs_gaussian_pc_gibbs"
-                                if self.priors.pc is not None
-                                else "fs_gaussian_normal_gibbs"
+                                "fs_gaussian_triple_gamma_slice"
+                                if self.priors.triple_gamma is not None
+                                else (
+                                    "fs_gaussian_pc_gibbs"
+                                    if self.priors.pc is not None
+                                    else "fs_gaussian_normal_gibbs"
+                                )
                             )
                         )
                     )
@@ -468,6 +553,17 @@ class FSGaussianKernel:
                 "draws_states_ncp": z_draws,
                 "bayesian_lasso": self.priors.lasso is not None,
                 "regularized_horseshoe": self.priors.horseshoe is not None,
+                "triple_gamma": self.priors.triple_gamma is not None,
+                "regularized_triple_gamma": bool(
+                    self.priors.triple_gamma is not None
+                    and self.priors.triple_gamma.regularized
+                ),
+                "shrinkage_update": (
+                    "slice"
+                    if self.priors.horseshoe is not None
+                    or self.priors.triple_gamma is not None
+                    else None
+                ),
                 "pc_innovation_prior": self.priors.pc is not None,
                 "componentwise_lasso": bool(
                     self.priors.lasso is not None

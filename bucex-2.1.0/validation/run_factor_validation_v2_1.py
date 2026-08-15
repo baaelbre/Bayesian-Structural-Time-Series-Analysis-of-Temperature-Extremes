@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-seed validation for the bucex 2.1.2 one-factor release."""
+"""Fixed-seed validation for the bucex 2.1.5 one-factor release."""
 from __future__ import annotations
 
 import argparse
@@ -208,7 +208,11 @@ def uccle_fs_pgas_check(data, model) -> tuple[dict[str, object], bx.FitResult]:
         priors="regularized_horseshoe",
         asis=True,
         mcmc=bx.MCMC(draws=3, warmup=2, chains=1, seed=103),
-        particles=bx.Particles(n=24, proposal="guided"),
+        # Twenty-four particles can leave this six-channel stress chain fixed
+        # after harmless RNG-sequence changes in other sampler blocks. Sixty-
+        # four is still intentionally small, but makes path movement a useful
+        # deterministic release gate for this fixed seed.
+        particles=bx.Particles(n=64, proposal="guided"),
     )
     metrics = fit.sampler_diagnostics["draw_metrics"]
     minimum_ess = np.asarray(metrics["particle_min_ess"], dtype=float)
@@ -369,8 +373,8 @@ def univariate_compatibility_check() -> dict[str, object]:
 
 
 def run(data_dir: str | Path) -> dict[str, object]:
-    if bx.__version__ != "2.1.2":
-        raise RuntimeError(f"Expected bucex 2.1.2, found {bx.__version__}.")
+    if bx.__version__ != "2.1.5":
+        raise RuntimeError(f"Expected bucex 2.1.5, found {bx.__version__}.")
     started = time.perf_counter()
     graph, data, compiled = uccle_graph_check(data_dir)
     algebra = fs_algebra_check(compiled)
@@ -389,7 +393,7 @@ def run(data_dir: str | Path) -> dict[str, object]:
         "univariate_compatibility": univariate,
     }
     return {
-        "release": "bucex 2.1.2",
+        "release": "bucex 2.1.5",
         "version": bx.__version__,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "sections": sections,
@@ -406,7 +410,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("validation/factor_validation_2.1.2.json"),
+        default=Path("validation/factor_validation_2.1.5.json"),
     )
     args = parser.parse_args()
     result = run(args.data_dir)

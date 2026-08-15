@@ -38,6 +38,12 @@ from .factor_horseshoe import (
     initialise_factor_horseshoe,
     update_factor_horseshoe,
 )
+from .factor_triple_gamma import (
+    factor_triple_gamma_coefficient_logpdf,
+    factor_triple_gamma_logpdf,
+    initialise_factor_triple_gamma,
+    update_factor_triple_gamma,
+)
 from .factor_loading import (
     collapsed_gaussian_intercept_keys,
     collapsed_gaussian_loading_keys,
@@ -578,6 +584,7 @@ def _static_prior_logpdf(
     compiled: CompiledFactorModel,
     priors: FactorPriors,
     horseshoe_state: Mapping[str, Any],
+    triple_gamma_state: Mapping[str, Any],
 ) -> float:
     if key.startswith("intercept."):
         channel = key.removeprefix("intercept.")
@@ -602,6 +609,10 @@ def _static_prior_logpdf(
             return factor_horseshoe_coefficient_logpdf(
                 value, process, priors, horseshoe_state
             )
+        if process in priors.triple_gamma_processes:
+            return factor_triple_gamma_coefficient_logpdf(
+                value, process, priors, triple_gamma_state
+            )
         return _symmetric_process_logpdf(priors.process[process], value)
     raise KeyError(key)
 
@@ -614,6 +625,7 @@ def _fs_static_sweep(
     params: dict[str, float],
     priors: FactorPriors,
     horseshoe_state: Mapping[str, Any],
+    triple_gamma_state: Mapping[str, Any],
     steps: dict[str, float],
     rng: np.random.Generator,
     *,
@@ -650,10 +662,12 @@ def _fs_static_sweep(
             proposal_params,
         )
         current_target = current_likelihood + _static_prior_logpdf(
-            key, current, compiled, priors, horseshoe_state
+            key, current, compiled, priors, horseshoe_state,
+            triple_gamma_state,
         )
         proposal_target = proposal_likelihood + _static_prior_logpdf(
-            key, proposal, compiled, priors, horseshoe_state
+            key, proposal, compiled, priors, horseshoe_state,
+            triple_gamma_state,
         )
         take = bool(
             np.isfinite(proposal_target)
@@ -675,6 +689,7 @@ def _fs_asis_scale_sweep(
     params: dict[str, float],
     priors: FactorPriors,
     horseshoe_state: Mapping[str, Any],
+    triple_gamma_state: Mapping[str, Any],
     steps: dict[str, float],
     rng: np.random.Generator,
     *,
@@ -714,6 +729,7 @@ def _fs_asis_scale_sweep(
                     compiled,
                     priors,
                     horseshoe_state,
+                    triple_gamma_state,
                 )
                 + np.log(magnitude)
             )
@@ -737,21 +753,27 @@ def _fs_log_posterior(
     params: dict[str, float],
     priors: FactorPriors,
     horseshoe_state: Mapping[str, Any],
+    triple_gamma_state: Mapping[str, Any],
 ) -> float:
     value = joint_state_log_density(y, path, fs, params)
     for key in _mutable_fs_parameters(compiled, fs):
         if not key.startswith("signed_sd."):
             value += _static_prior_logpdf(
-                key, params[key], compiled, priors, horseshoe_state
+                key, params[key], compiled, priors, horseshoe_state,
+                triple_gamma_state,
             )
     for process in compiled.noise_names:
-        if process not in priors.horseshoe_processes:
+        if (
+            process not in priors.horseshoe_processes
+            and process not in priors.triple_gamma_processes
+        ):
             value += _static_prior_logpdf(
                 f"signed_sd.{process}",
                 params[f"signed_sd.{process}"],
                 compiled,
                 priors,
                 horseshoe_state,
+                triple_gamma_state,
             )
     if priors.horseshoe is not None:
         value += factor_horseshoe_logpdf(
@@ -761,6 +783,15 @@ def _fs_log_posterior(
             },
             priors,
             horseshoe_state,
+        )
+    if priors.triple_gamma is not None:
+        value += factor_triple_gamma_logpdf(
+            {
+                process: params[f"signed_sd.{process}"]
+                for process in priors.triple_gamma_processes
+            },
+            priors,
+            triple_gamma_state,
         )
     for channel in compiled.model.channels:
         value += _prior_logpdf(
@@ -838,6 +869,61 @@ def sample_factor_fs_posterior(
         if priors.horseshoe is not None
         else []
     )
+    triple_gamma_names = (
+        [
+            "triple_gamma.global",
+            "triple_gamma.a",
+            "triple_gamma.c",
+            *(
+                ["triple_gamma.slab2"]
+                if priors.triple_gamma.regularized
+                else []
+            ),
+            *(
+                f"triple_gamma.numerator.{name}"
+                for name in priors.triple_gamma_processes
+            ),
+            *(
+                f"triple_gamma.denominator.{name}"
+                for name in priors.triple_gamma_processes
+            ),
+            *(
+                f"triple_gamma.rho.{name}"
+                for name in priors.triple_gamma_processes
+            ),
+        ]
+        if priors.triple_gamma is not None
+        else []
+    )
+    triple_gamma_update_names = (
+        [
+            *(
+                ["triple_gamma.global"]
+                if priors.triple_gamma.learn_global
+                else []
+            ),
+            *(
+                ["triple_gamma.a", "triple_gamma.c"]
+                if priors.triple_gamma.learn_shapes
+                else []
+            ),
+            *(
+                ["triple_gamma.slab2"]
+                if priors.triple_gamma.regularized
+                else []
+            ),
+            *(
+                f"triple_gamma.numerator.{name}"
+                for name in priors.triple_gamma_processes
+            ),
+            *(
+                f"triple_gamma.denominator.{name}"
+                for name in priors.triple_gamma_processes
+            ),
+        ]
+        if priors.triple_gamma is not None
+        else []
+    )
     parameter_names = list(
         dict.fromkeys(
             [
@@ -846,6 +932,7 @@ def sample_factor_fs_posterior(
                 *compiled.observation_parameter_names,
                 *compiled.loading_names,
                 *horseshoe_names,
+                *triple_gamma_names,
             ]
         )
     )
@@ -875,6 +962,7 @@ def sample_factor_fs_posterior(
         *compiled.observation_parameter_names,
         *compiled.estimated_loading_names,
         *horseshoe_names,
+        *triple_gamma_update_names,
     ]
     if plan.asis:
         acceptance_names.extend(
@@ -891,6 +979,7 @@ def sample_factor_fs_posterior(
     for chain, sequence in enumerate(sequences):
         rng = np.random.default_rng(sequence)
         horseshoe_state = initialise_factor_horseshoe(priors)
+        triple_gamma_state = initialise_factor_triple_gamma(priors)
         params = _initial_fs_parameters(
             compiled, fs, priors, rng, initial_parameters
         )
@@ -902,6 +991,18 @@ def sample_factor_fs_posterior(
                     "local": dict(horseshoe_state.get("local", {})),
                     "global": horseshoe_state.get("global"),
                     "slab2": horseshoe_state.get("slab2"),
+                },
+                "triple_gamma": {
+                    "numerator": dict(
+                        triple_gamma_state.get("numerator", {})
+                    ),
+                    "denominator": dict(
+                        triple_gamma_state.get("denominator", {})
+                    ),
+                    "global": triple_gamma_state.get("global"),
+                    "a": triple_gamma_state.get("a"),
+                    "c": triple_gamma_state.get("c"),
+                    "slab2": triple_gamma_state.get("slab2"),
                 },
             }
         )
@@ -923,6 +1024,8 @@ def sample_factor_fs_posterior(
         for name in compiled.noise_names:
             if name in priors.horseshoe_processes:
                 reference = priors.horseshoe.coefficient_scale_for(name)
+            elif name in priors.triple_gamma_processes:
+                reference = priors.triple_gamma.coefficient_scale_for(name)
             else:
                 reference = max(float(priors.process[name].initial()), 1e-10)
             steps[f"signed_sd.{name}"] = (
@@ -947,6 +1050,15 @@ def sample_factor_fs_posterior(
                     for name in priors.horseshoe_processes
                 }
             )
+        if priors.triple_gamma is not None:
+            steps["triple_gamma.global"] = 1.0
+            steps["triple_gamma.a"] = 0.8
+            steps["triple_gamma.c"] = 0.8
+            if priors.triple_gamma.regularized:
+                steps["triple_gamma.slab2"] = 0.8
+            for name in priors.triple_gamma_processes:
+                steps[f"triple_gamma.numerator.{name}"] = 1.0
+                steps[f"triple_gamma.denominator.{name}"] = 1.0
 
         attempts = {name: 0 for name in acceptance_names}
         accepts = {name: 0 for name in acceptance_names}
@@ -1003,6 +1115,7 @@ def sample_factor_fs_posterior(
                 params,
                 priors,
                 horseshoe_state,
+                triple_gamma_state,
                 steps,
                 rng,
                 adapt=adapting,
@@ -1020,6 +1133,7 @@ def sample_factor_fs_posterior(
                     params,
                     priors,
                     horseshoe_state,
+                    triple_gamma_state,
                     steps,
                     rng,
                     adapt=adapting,
@@ -1053,6 +1167,7 @@ def sample_factor_fs_posterior(
                 params,
                 priors,
                 horseshoe_state,
+                triple_gamma_state,
                 steps,
                 rng,
                 adapt=adapting,
@@ -1129,8 +1244,20 @@ def sample_factor_fs_posterior(
                 for key, outcome in outcomes.items():
                     attempts[key] += 1
                     accepts[key] += int(outcome)
-                    if adapting:
-                        steps[key] = _adapt(steps[key], outcome, iteration)
+            if priors.triple_gamma is not None:
+                triple_gamma_state, outcomes = update_factor_triple_gamma(
+                    {
+                        name: params[f"signed_sd.{name}"]
+                        for name in priors.triple_gamma_processes
+                    },
+                    triple_gamma_state,
+                    priors,
+                    rng,
+                    widths=steps,
+                )
+                for key, outcome in outcomes.items():
+                    attempts[key] += 1
+                    accepts[key] += int(outcome)
 
             path, params = fs.sign_switch(path, params, rng)
             _sync_signed_scales(params, compiled)
@@ -1151,6 +1278,31 @@ def sample_factor_fs_posterior(
                         value = horseshoe_state["local"][
                             name.removeprefix("horseshoe.local.")
                         ]
+                    elif name == "triple_gamma.global":
+                        value = triple_gamma_state["global"]
+                    elif name == "triple_gamma.a":
+                        value = triple_gamma_state["a"]
+                    elif name == "triple_gamma.c":
+                        value = triple_gamma_state["c"]
+                    elif name == "triple_gamma.slab2":
+                        value = triple_gamma_state["slab2"]
+                    elif name.startswith("triple_gamma.numerator."):
+                        process = name.removeprefix(
+                            "triple_gamma.numerator."
+                        )
+                        value = triple_gamma_state["numerator"][process]
+                    elif name.startswith("triple_gamma.denominator."):
+                        process = name.removeprefix(
+                            "triple_gamma.denominator."
+                        )
+                        value = triple_gamma_state["denominator"][process]
+                    elif name.startswith("triple_gamma.rho."):
+                        process = name.removeprefix("triple_gamma.rho.")
+                        value = priors.triple_gamma.shrinkage_factor(
+                            numerator=triple_gamma_state["numerator"][process],
+                            denominator=triple_gamma_state["denominator"][process],
+                            global_scale=triple_gamma_state["global"],
+                        )
                     else:
                         value = params[name]
                     parameter_draws[name][chain, saved] = float(value)
@@ -1162,6 +1314,7 @@ def sample_factor_fs_posterior(
                     params,
                     priors,
                     horseshoe_state,
+                    triple_gamma_state,
                 )
                 for name, value in last_metrics.items():
                     draw_metrics[name][chain, saved] = value
@@ -1190,6 +1343,7 @@ def sample_factor_fs_posterior(
                             compiled,
                             params,
                             horseshoe_state=horseshoe_state,
+                            triple_gamma_state=triple_gamma_state,
                         ),
                         metrics=last_metrics,
                         particles=particles.n if plan.engine == "pgas" else None,
@@ -1280,6 +1434,18 @@ def sample_factor_fs_posterior(
             "collapsed_gaussian_processes": sorted(collapsed_processes),
             "regularized_horseshoe": priors.horseshoe is not None,
             "horseshoe_processes": list(priors.horseshoe_processes),
+            "triple_gamma": priors.triple_gamma is not None,
+            "regularized_triple_gamma": bool(
+                priors.triple_gamma is not None
+                and priors.triple_gamma.regularized
+            ),
+            "triple_gamma_processes": list(priors.triple_gamma_processes),
+            "shrinkage_update": (
+                "slice"
+                if priors.horseshoe is not None
+                or priors.triple_gamma is not None
+                else None
+            ),
         },
     )
 

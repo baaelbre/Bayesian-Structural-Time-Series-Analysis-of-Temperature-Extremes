@@ -1,6 +1,8 @@
 """Data-agnostic posterior, risk, and prior-versus-posterior plots."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from ..priors.process import FixedSD
@@ -8,6 +10,111 @@ from ..priors.process import FixedSD
 
 def _prior_density(prior, grid):
     return np.asarray([np.exp(prior.logpdf(float(value))) for value in grid])
+
+
+def _save_result(result, save) -> None:
+    """Save the figure in a plotting result using one consistent API."""
+
+    if save is None:
+        return
+    options = {}
+    if isinstance(save, dict):
+        options = dict(save)
+        try:
+            path = options.pop("path")
+        except KeyError as exc:
+            raise ValueError("A save mapping requires a 'path' entry.") from exc
+    else:
+        path = save
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure = result[0] if isinstance(result, tuple) else result
+    if not hasattr(figure, "savefig"):
+        raise TypeError("The selected plot did not return a Matplotlib figure.")
+    options.setdefault("bbox_inches", "tight")
+    figure.savefig(path, **options)
+
+
+def _triple_gamma_absolute_density(prior, component: str, grid) -> np.ndarray:
+    """Analytic |signed scale| density for fixed, unregularized triple gamma."""
+
+    from scipy.special import betaln, gammaln, hyperu
+
+    values = np.asarray(grid, dtype=float)
+    scale = float(prior.coefficient_scale_for(component))
+    x = np.maximum(values / scale, np.finfo(float).tiny)
+    a = float(prior.spike_shape)
+    c = float(prior.tail_shape)
+    phi = float(prior.global_scale)
+    log_constant = (
+        np.log(2.0)
+        + gammaln(c + 0.5)
+        - 0.5 * np.log(2.0 * np.pi * phi)
+        - betaln(a, c)
+        - np.log(scale)
+    )
+    density = np.exp(log_constant) * hyperu(
+        c + 0.5,
+        1.5 - a,
+        x**2 / (2.0 * phi),
+    )
+    density = np.asarray(density, dtype=float)
+    if density.size > 1 and not np.isfinite(density[0]):
+        density[0] = density[1]
+    return density
+
+
+def _structural_prior_density(fit, name: str, grid):
+    """Return an analytic structural-SD density where one is available."""
+
+    from scipy.stats import norm
+
+    priors = fit.priors
+    component = {"level": "level", "slope": "trend", "seasonal": "season"}.get(
+        name, name
+    )
+    if getattr(priors, "pc", None) is not None:
+        rate = (
+            priors.pc.standardized_rate_for(component)
+            / priors.pc.coefficient_scale_for(component)
+        )
+        return rate * np.exp(-rate * np.asarray(grid)), "prior (analytic PC)", 0.0
+    triple_gamma = getattr(priors, "triple_gamma", None)
+    selected_tg = set(getattr(priors, "triple_gamma_processes", ()))
+    if triple_gamma is not None and (
+        not selected_tg or component in selected_tg
+    ):
+        if (
+            not triple_gamma.regularized
+            and not triple_gamma.learn_global
+            and not triple_gamma.learn_shapes
+        ):
+            return (
+                _triple_gamma_absolute_density(triple_gamma, component, grid),
+                "prior (analytic triple gamma)",
+                0.0,
+            )
+        return None
+    if getattr(priors, "ssvs", None) is not None:
+        prior = priors.ssvs
+        probability = {
+            "level": prior.level_dynamic_probability,
+            "trend": prior.trend_probabilities[2],
+            "season": prior.season_probabilities[2],
+        }[component]
+        scale = float(prior.innovation_slab_sd[component])
+        density = 2.0 * norm.pdf(np.asarray(grid), loc=0.0, scale=scale)
+        return density, "prior slab (analytic half-normal)", 1.0 - probability
+    key = {"level": "s_level", "trend": "s_trend", "season": "s_season"}.get(
+        component
+    )
+    prior = None if key is None else getattr(priors, key, None)
+    if prior is not None:
+        values = np.asarray(grid)
+        density = norm.pdf(values, loc=prior.mean, scale=prior.sd)
+        density += norm.pdf(-values, loc=prior.mean, scale=prior.sd)
+        return density, "prior (analytic folded normal)", 0.0
+    return None
 
 
 def _interval(values, credible_interval: float, *, axis: int = 0):
@@ -29,7 +136,9 @@ def _structural_prior_samples(fit, name: str, size: int, rng) -> np.ndarray:
     """Draw the implied process SD under an FS signed-scale prior."""
 
     priors = fit.priors
-    component = {"level": "level", "slope": "trend", "seasonal": "season"}[name]
+    component = {"level": "level", "slope": "trend", "seasonal": "season"}.get(
+        name, name
+    )
     if getattr(priors, "pc", None) is not None:
         rate = (
             priors.pc.standardized_rate_for(component)
@@ -51,6 +160,33 @@ def _structural_prior_samples(fit, name: str, size: int, rng) -> np.ndarray:
             * global_scale**2
             * regularized
         )
+        return np.abs(rng.normal(scale=np.sqrt(variance)))
+    if getattr(priors, "triple_gamma", None) is not None:
+        prior = priors.triple_gamma
+        if prior.learn_shapes:
+            a = 0.5 * rng.beta(*prior.spike_shape_prior, size=size)
+            c = 0.5 * rng.beta(*prior.tail_shape_prior, size=size)
+        else:
+            a = np.full(size, prior.spike_shape)
+            c = np.full(size, prior.tail_shape)
+        numerator = rng.gamma(a, scale=1.0)
+        denominator = rng.gamma(c, scale=1.0)
+        if prior.learn_global:
+            global_scale = (
+                rng.gamma(c, scale=1.0)
+                / np.maximum(rng.gamma(a, scale=1.0), 1e-300)
+            )
+        else:
+            global_scale = np.full(size, prior.global_scale)
+        variance = global_scale * numerator / np.maximum(denominator, 1e-300)
+        if prior.regularized:
+            slab2 = 1.0 / rng.gamma(
+                shape=0.5 * prior.slab_df,
+                scale=2.0 / (prior.slab_df * prior.slab_scale**2),
+                size=size,
+            )
+            variance = slab2 * variance / (slab2 + variance)
+        variance *= prior.coefficient_scale_for(component) ** 2
         return np.abs(rng.normal(scale=np.sqrt(variance)))
     if getattr(priors, "lasso", None) is not None:
         prior = priors.lasso
@@ -105,8 +241,17 @@ def plot_process_sds(
     truths=None,
     title: str | None = None,
     figsize=None,
+    xmax=None,
 ):
-    """Overlay each process-SD prior with its marginal posterior."""
+    """Overlay each process-SD prior with its marginal posterior.
+
+    Heavy-tailed global-local priors can have astronomically large upper
+    quantiles. Their default display is capped at five coefficient reference
+    scales (or 1.5 times the posterior range, whichever is larger) so the
+    scientifically relevant spike is visible. Pass a positive numeric
+    ``xmax`` or a mapping keyed by process name to override that display limit.
+    The density itself is not truncated or renormalized.
+    """
 
     import matplotlib.pyplot as plt
     from scipy.stats import gaussian_kde
@@ -125,11 +270,19 @@ def plot_process_sds(
         posterior = fit.parameter(f"sd.{name}")
         process_priors = getattr(fit.priors, "process", None)
         prior = None if process_priors is None else process_priors[name]
+        hierarchical_processes = set(
+            getattr(fit.priors, "horseshoe_processes", ())
+        ) | set(getattr(fit.priors, "triple_gamma_processes", ()))
+        if name in hierarchical_processes:
+            # The process mapping is only a baseline/calibration carrier for a
+            # factor hierarchy; the hierarchy is the actual active prior.
+            prior = None
         grid_upper = max(
             float(np.quantile(posterior, 0.995)),
             float(np.max(posterior)),
             1e-10,
         )
+        prior_tail_clipped = False
         if prior is None:
             prior_sample = _structural_prior_samples(
                 fit,
@@ -137,36 +290,90 @@ def plot_process_sds(
                 int(prior_draws),
                 np.random.default_rng(140),
             )
-            grid_upper = max(grid_upper, float(np.quantile(prior_sample, 0.995)))
+            prior_sample = np.asarray(prior_sample, dtype=float)
+            prior_sample = prior_sample[np.isfinite(prior_sample)]
+            if prior_sample.size:
+                prior_upper = float(np.quantile(prior_sample, 0.995))
+                hierarchy = (
+                    getattr(fit.priors, "horseshoe", None)
+                    or getattr(fit.priors, "triple_gamma", None)
+                )
+                if hierarchy is not None:
+                    component = {
+                        "level": "level",
+                        "slope": "trend",
+                        "seasonal": "season",
+                    }.get(name, name)
+                    reference = float(
+                        hierarchy.coefficient_scale_for(component)
+                    )
+                    display_cap = max(1.5 * grid_upper, 5.0 * reference)
+                    prior_tail_clipped = prior_upper > display_cap
+                    prior_upper = min(prior_upper, display_cap)
+                grid_upper = max(grid_upper, prior_upper)
         elif not isinstance(prior, FixedSD):
             prior_sample = np.asarray(prior.sample(np.random.default_rng(140), size=prior_draws))
             grid_upper = max(grid_upper, float(np.quantile(prior_sample, 0.995)))
+        if xmax is not None:
+            selected_xmax = (
+                xmax.get(name, xmax.get(f"sd.{name}"))
+                if isinstance(xmax, dict)
+                else xmax
+            )
+            if selected_xmax is not None:
+                if float(selected_xmax) <= 0.0:
+                    raise ValueError("Every process-SD xmax must be positive.")
+                grid_upper = float(selected_xmax)
+                prior_tail_clipped = False
         grid = np.linspace(0.0, grid_upper * 1.05, 400)
         structural_ssvs = bool(
             prior is None and getattr(fit.priors, "ssvs", None) is not None
         )
         if prior is None:
-            positive_prior = prior_sample[prior_sample > 0.0]
-            prior_zero_mass = float(np.mean(prior_sample == 0.0))
-            plotted_prior = (
-                positive_prior
-                if structural_ssvs and positive_prior.size
-                else prior_sample
-            )
-            axis.hist(
-                plotted_prior,
-                bins=bins,
-                range=(0.0, grid[-1]),
-                density=True,
-                histtype="step",
-                color="0.35",
-                linestyle="--",
-                label=(
-                    f"prior slab; P(SD=0)={prior_zero_mass:.2f}"
-                    if structural_ssvs
-                    else "prior"
-                ),
-            )
+            analytic = _structural_prior_density(fit, name, grid)
+            if analytic is not None:
+                prior_density, prior_label, prior_zero_mass = analytic
+                label = prior_label
+                if prior_zero_mass > 0.0:
+                    label += f"; P(SD=0)={prior_zero_mass:.2f}"
+                if prior_tail_clipped:
+                    label += "; heavy tail continues"
+                axis.plot(
+                    grid,
+                    prior_density,
+                    color="0.35",
+                    linestyle="--",
+                    label=label,
+                )
+            else:
+                positive_prior = prior_sample[prior_sample > 0.0]
+                prior_zero_mass = float(np.mean(prior_sample == 0.0))
+                plotted_prior = (
+                    positive_prior
+                    if structural_ssvs and positive_prior.size
+                    else prior_sample
+                )
+                if plotted_prior.size > 2 and np.std(plotted_prior) > 1e-14:
+                    prior_kde = gaussian_kde(plotted_prior)
+                    label = "prior (smooth Monte Carlo)"
+                    if prior_zero_mass > 0.0:
+                        label += f"; P(SD=0)={prior_zero_mass:.2f}"
+                    if prior_tail_clipped:
+                        label += "; heavy tail continues"
+                    axis.plot(
+                        grid,
+                        prior_kde(grid),
+                        color="0.35",
+                        linestyle="--",
+                        label=label,
+                    )
+                elif plotted_prior.size:
+                    axis.axvline(
+                        float(np.mean(plotted_prior)),
+                        color="0.35",
+                        linestyle="--",
+                        label="prior",
+                    )
         elif isinstance(prior, FixedSD):
             axis.axvline(prior.value, color="0.35", linestyle="--", label="prior")
         else:
@@ -524,6 +731,82 @@ def plot_process_sd_traces(
     return figure, axes[:, 0]
 
 
+def plot_parameter_acfs(
+    fit,
+    *,
+    parameters=None,
+    max_lag: int = 50,
+    reference_band: bool = True,
+    figsize=None,
+):
+    """Chain-specific autocorrelation functions for scalar parameters.
+
+    The chains are never concatenated before computing an ACF.  This avoids a
+    false discontinuity at chain boundaries and makes persistent chains easy
+    to spot.  The optional band is the usual ``+-1.96/sqrt(n)`` white-noise
+    reference, not a posterior credible interval.
+    """
+
+    import matplotlib.pyplot as plt
+
+    if parameters is None:
+        prefixes = ("sd.", "sigma", "xi", "loading.")
+        names = [
+            name
+            for name, values in fit.parameter_draws.items()
+            if np.asarray(values).ndim == 2 and name.startswith(prefixes)
+        ]
+    else:
+        names = [parameters] if isinstance(parameters, str) else list(parameters)
+    if not names:
+        raise ValueError("Choose at least one scalar parameter for the ACF plot.")
+    max_lag = int(max_lag)
+    if max_lag < 1:
+        raise ValueError("max_lag must be at least one.")
+    figure, axes = plt.subplots(
+        len(names),
+        1,
+        figsize=figsize or (9, max(2.5, 2.2 * len(names))),
+        squeeze=False,
+        sharex=True,
+    )
+    for axis, name in zip(axes[:, 0], names):
+        values = np.asarray(
+            fit.parameter(name, combine_chains=False), dtype=float
+        )
+        lag_count = min(max_lag, values.shape[1] - 1)
+        lags = np.arange(lag_count + 1)
+        for chain_index, chain in enumerate(values):
+            centered = chain - np.mean(chain)
+            variance = float(centered @ centered)
+            if variance <= 0.0:
+                acf = np.full(lag_count + 1, np.nan)
+                acf[0] = 1.0
+            else:
+                size = 1 << (2 * chain.size - 1).bit_length()
+                spectrum = np.fft.rfft(centered, n=size)
+                covariance = np.fft.irfft(
+                    spectrum * np.conjugate(spectrum), n=size
+                )[: lag_count + 1]
+                acf = covariance / covariance[0]
+            axis.plot(
+                lags,
+                acf,
+                linewidth=1.0,
+                label=f"chain {chain_index + 1}",
+            )
+        if reference_band:
+            band = 1.96 / np.sqrt(max(values.shape[1], 1))
+            axis.axhspan(-band, band, color="0.5", alpha=0.12)
+        axis.axhline(0.0, color="0.4", linewidth=0.7)
+        axis.set_ylim(-1.0, 1.05)
+        axis.set_ylabel(name)
+    axes[0, 0].legend(ncol=min(fit.n_chains, 5), fontsize=8)
+    axes[-1, 0].set_xlabel("lag (retained draws)")
+    figure.tight_layout()
+    return figure, axes[:, 0]
+
+
 def plot_loading_deviation_joint(
     fit,
     *,
@@ -776,56 +1059,66 @@ def plot_component_probabilities(fit, *, ax=None):
 
 
 def plot_fit(fit, kind: str = "state", **kwargs):
+    save = kwargs.pop("save", None)
+
+    def finish(result):
+        _save_result(result, save)
+        return result
+
     key = str(kind).lower().replace("-", "_")
     if getattr(fit, "is_factor_model", False):
         if key in {"factor", "shared_factor", "factor_state"}:
-            return plot_factor_state(fit, **kwargs)
+            return finish(plot_factor_state(fit, **kwargs))
         if key in {"state", "channel", "channel_predictor", "fit"}:
             if "channel" not in kwargs:
                 kwargs["channel"] = fit.channel_names[0]
-            return plot_channel_predictor(fit, **kwargs)
+            return finish(plot_channel_predictor(fit, **kwargs))
         if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
-            return plot_process_sds(fit, **kwargs)
+            return finish(plot_process_sds(fit, **kwargs))
         if key in {"decomposition", "factor_decomposition"}:
-            return plot_factor_decomposition(fit, **kwargs)
+            return finish(plot_factor_decomposition(fit, **kwargs))
         if key in {"parameter_density", "parameter_densities", "densities"}:
-            return plot_parameter_densities(fit, **kwargs)
+            return finish(plot_parameter_densities(fit, **kwargs))
         if key in {"trace", "traces", "process_sd_traces"}:
-            return plot_process_sd_traces(fit, **kwargs)
+            return finish(plot_process_sd_traces(fit, **kwargs))
+        if key in {"acf", "acfs", "autocorrelation", "autocorrelations"}:
+            return finish(plot_parameter_acfs(fit, **kwargs))
         if key in {"loading_deviation", "loading_deviation_joint"}:
-            return plot_loading_deviation_joint(fit, **kwargs)
+            return finish(plot_loading_deviation_joint(fit, **kwargs))
         if key in {"identification", "loading_deviation_correlations"}:
-            return plot_loading_deviation_correlations(fit, **kwargs)
+            return finish(plot_loading_deviation_correlations(fit, **kwargs))
         if key in {"idiosyncratic_innovations", "idio_innovations"}:
-            return plot_idiosyncratic_innovations(fit, **kwargs)
+            return finish(plot_idiosyncratic_innovations(fit, **kwargs))
         raise ValueError(
             "Factor-model kind must be channel, factor, process_sd, "
-            "factor_decomposition, parameter_density, traces, "
+            "factor_decomposition, parameter_density, traces, acf, "
             "loading_deviation, identification, or idiosyncratic_innovations."
         )
     if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
-        return plot_process_sds(fit, **kwargs)
+        return finish(plot_process_sds(fit, **kwargs))
     if key in {"predictor", "eta", "fit"}:
-        return plot_predictor(fit, **kwargs)
+        return finish(plot_predictor(fit, **kwargs))
     if key in {"parameter_density", "parameter_densities", "densities"}:
-        return plot_parameter_densities(fit, **kwargs)
+        return finish(plot_parameter_densities(fit, **kwargs))
     if key in {"trace", "traces", "process_sd_traces"}:
-        return plot_process_sd_traces(fit, **kwargs)
+        return finish(plot_process_sd_traces(fit, **kwargs))
+    if key in {"acf", "acfs", "autocorrelation", "autocorrelations"}:
+        return finish(plot_parameter_acfs(fit, **kwargs))
     if key in {"state", "level", "slope"}:
         if key in {"level", "slope"} and "state" not in kwargs:
             kwargs["state"] = key
-        return plot_state(fit, **kwargs)
+        return finish(plot_state(fit, **kwargs))
     if key in {"level_slope", "states"}:
-        return plot_level_slope(fit, **kwargs)
+        return finish(plot_level_slope(fit, **kwargs))
     if key == "endpoint":
-        return plot_endpoint(fit, **kwargs)
+        return finish(plot_endpoint(fit, **kwargs))
     if key in {"exceedance", "return_period"}:
-        return plot_risk(fit, kind=key, **kwargs)
+        return finish(plot_risk(fit, kind=key, **kwargs))
     if key in {"component_probabilities", "inclusion_probabilities"}:
-        return plot_component_probabilities(fit, **kwargs)
+        return finish(plot_component_probabilities(fit, **kwargs))
     raise ValueError(
         "kind must be state, level, slope, level_slope, predictor, process_sd, "
-        "parameter_density, traces, endpoint, exceedance, return_period, or "
+        "parameter_density, traces, acf, endpoint, exceedance, return_period, or "
         "component_probabilities."
     )
 
@@ -836,6 +1129,7 @@ def plot_bulk_tail(
     kind: str = "states",
     credible_interval: float = 0.90,
     figsize=(10, 7),
+    save=None,
 ):
     import matplotlib.pyplot as plt
 
@@ -848,10 +1142,19 @@ def plot_bulk_tail(
     axes[1].set_title("Tail location (GEV)")
     figure.suptitle("Parallel bulk and tail fits (independent posteriors)")
     figure.tight_layout()
-    return figure, axes
+    result = (figure, axes)
+    _save_result(result, save)
+    return result
 
 
-def plot_collection(collection, *, kind: str = "level", credible_interval: float = 0.90, figsize=None):
+def plot_collection(
+    collection,
+    *,
+    kind: str = "level",
+    credible_interval: float = 0.90,
+    figsize=None,
+    save=None,
+):
     """Plot one state for each fit in a Uccle collection."""
 
     import matplotlib.pyplot as plt
@@ -874,7 +1177,9 @@ def plot_collection(collection, *, kind: str = "level", credible_interval: float
         )
         axis.set_title(name)
     figure.tight_layout()
-    return figure, axes[:, 0]
+    result = (figure, axes[:, 0])
+    _save_result(result, save)
+    return result
 
 
 def plot(value, type: str = "state", **kwargs):

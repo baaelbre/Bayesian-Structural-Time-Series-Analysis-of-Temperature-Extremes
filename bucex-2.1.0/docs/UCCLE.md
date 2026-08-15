@@ -59,7 +59,7 @@ back to the original lower-tail orientation.
 ```python
 fits = bx.fit_uccle_all(
     series=("TXm", "TXx", "TNn"),
-    priors="regularized_horseshoe",
+    priors="ssvs",
     parameterization="fruehwirth_schnatter",
     mcmc=bx.MCMC(draws=2_000, warmup=1_000, chains=4, seed=40),
 )
@@ -70,6 +70,12 @@ fits.save("results/uccle")
 
 Each series receives a deterministic child seed. Collection members are
 ordinary `FitResult` objects.
+
+`examples/09_uccle_univariate.py` runs all six summaries separately and
+prints the zero/fixed/dynamic SSVS probabilities and switching diagnostics for
+each. For GEV summaries its SSVS route uses the explicitly labelled Laplace
+pseudo-observation approximation; continuous-prior GEV analyses can use exact-
+invariant PGAS.
 
 ## Fit the v2.1 shared-factor model
 
@@ -84,7 +90,7 @@ model = bx.make_uccle_factor_model()
 compiled = bx.compile_model(model, data)
 priors = bx.identified_factor_priors(
     compiled,
-    profile="regularized_horseshoe",
+    profile="regularized_triple_gamma",
     smooth_factor=True,
     reference_channel="TXm",
 )
@@ -113,10 +119,12 @@ block. Lower-tail loading initial values are converted to the internal sign
 orientation. The helper fixes both factor initial conditions at zero; the
 factor remains dynamic through its level and slope innovation scales.
 
-The default factor prior is a regularized horseshoe on the six idiosyncratic
-local-level innovation scales only. This continuous shrinkage lets a channel
-decouple when supported while strongly tethering weak idiosyncratic dynamics.
-The shared-factor and seasonal innovations retain calibrated process priors.
+The package default remains a regularized horseshoe, while the example above
+uses the new regularized triple gamma. Both act only on the six idiosyncratic
+local-level innovation scales. Triple gamma additionally stores the
+interpretable shrinkage factor `rho` for each selected process; its optional
+slab caps extremely large local variances. Shared-factor and seasonal
+innovations retain calibrated process priors.
 
 Use `parameterization="disturbance"` as a sensitivity analysis or
 `priors="regularized"` to replace the horseshoe with PC process-SD priors. The
@@ -139,6 +147,7 @@ joint.idiosyncratic_innovation_draws("TXx")
 joint.factor_identification_diagnostics()
 joint.plot("factor_decomposition", baseline=slice(0, 30 * 12))
 joint.plot("identification", baseline=slice(0, 30 * 12))
+joint.plot("acf", save="figures/uccle_factor_acf.png")
 ```
 
 A `TXx` loading above one concerns the shared-factor contribution; a claim

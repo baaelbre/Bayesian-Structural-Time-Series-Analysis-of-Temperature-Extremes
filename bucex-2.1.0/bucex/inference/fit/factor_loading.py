@@ -28,6 +28,7 @@ from ...priors.process import FixedSD
 from ..state.kalman import ffbs, kalman_filter
 from .disturbance import _adapt, _prior_logpdf
 from .factor_horseshoe import factor_horseshoe_coefficient_logpdf
+from .factor_triple_gamma import factor_triple_gamma_coefficient_logpdf
 
 if TYPE_CHECKING:  # pragma: no cover - imported only for static checking
     from .factor_fs import CompiledFactorFS, FactorFSBlock
@@ -200,10 +201,15 @@ def _signed_process_prior_logpdf(
     value: float,
     priors: FactorPriors,
     horseshoe_state: Mapping[str, object],
+    triple_gamma_state: Mapping[str, object],
 ) -> float:
     if process in priors.horseshoe_processes:
         return factor_horseshoe_coefficient_logpdf(
             value, process, priors, horseshoe_state
+        )
+    if process in priors.triple_gamma_processes:
+        return factor_triple_gamma_coefficient_logpdf(
+            value, process, priors, triple_gamma_state
         )
     return _prior_logpdf(priors.process[process], abs(float(value)))
 
@@ -216,6 +222,7 @@ def collapsed_gaussian_scale_sweep(
     params: dict[str, float],
     priors: FactorPriors,
     horseshoe_state: Mapping[str, object],
+    triple_gamma_state: Mapping[str, object],
     steps: dict[str, float],
     rng: np.random.Generator,
     *,
@@ -284,6 +291,7 @@ def collapsed_gaussian_scale_sweep(
                     sign * magnitude,
                     priors,
                     horseshoe_state,
+                    triple_gamma_state,
                 )
                 + np.log(magnitude)
             )

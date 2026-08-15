@@ -7,6 +7,7 @@ and runtime should differ.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from time import perf_counter
 
 import matplotlib.pyplot as plt
@@ -28,9 +29,11 @@ PROCESS_SCALES = {
     "slope": 0.0002,
     "seasonal": 0.03,
 }
+FIGURE_DIR = Path("figures/05_compare_parameterizations")
 
 
 def main() -> None:
+    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     # Match the general state-space initial priors to the FS prior profile.
     model = bx.Model(
         bx.Gaussian(),
@@ -133,6 +136,7 @@ def main() -> None:
         axis.set_title(parameterization)
         axis.legend()
     figure.tight_layout()
+    figure.savefig(FIGURE_DIR / "predictor_comparison.png", bbox_inches="tight")
 
     for parameterization, fit in fits.items():
         trace_figure, _ = fit.plot(
@@ -142,6 +146,16 @@ def main() -> None:
         )
         trace_figure.suptitle(parameterization, y=0.995)
         trace_figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.965))
+        trace_figure.savefig(
+            FIGURE_DIR / f"{parameterization}_traces.png",
+            bbox_inches="tight",
+        )
+        fit.plot(
+            "acf",
+            parameters=parameters,
+            max_lag=50,
+            save=FIGURE_DIR / f"{parameterization}_acf.png",
+        )
     plt.show()
 
 

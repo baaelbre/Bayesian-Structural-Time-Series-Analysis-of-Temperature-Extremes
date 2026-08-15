@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
             "manuscript_lasso",
             "regularized_lasso",
             "regularized_horseshoe",
+            "triple_gamma",
+            "regularized_triple_gamma",
             "pc",
             "normal",
             "ssvs",

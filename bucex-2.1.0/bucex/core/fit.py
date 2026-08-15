@@ -821,6 +821,11 @@ class FitResult:
                     "switch_rate": float(switches / max(values.size - 1, 1)),
                     "first_state": "slab" if values[0] else "spike",
                     "last_state": "slab" if values[-1] else "spike",
+                    "status": (
+                        "constant posterior allocation"
+                        if switches == 0
+                        else "switching"
+                    ),
                 }
             )
         for name, key in {
@@ -841,6 +846,11 @@ class FitResult:
                     "switch_rate": float(switches / max(values.size - 1, 1)),
                     "first_state": labels[int(values[0])],
                     "last_state": labels[int(values[-1])],
+                    "status": (
+                        "constant posterior allocation"
+                        if switches == 0
+                        else "switching"
+                    ),
                 }
             )
         if not rows:
