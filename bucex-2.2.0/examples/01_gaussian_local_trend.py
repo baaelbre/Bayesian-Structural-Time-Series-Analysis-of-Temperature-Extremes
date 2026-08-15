@@ -5,7 +5,6 @@ fit it, check convergence, inspect recovery, forecast, and plot.  All settings
 are visible below; change them here when experimenting.
 """
 from __future__ import annotations
-from dataclasses import replace
 
 from pathlib import Path
 
@@ -19,11 +18,12 @@ import bucex as bx
 # ---------------------------------------------------------------------------
 # 1. Settings a user is expected to change
 # ---------------------------------------------------------------------------
-N_TIME = 200
-PERIOD = 4
+N_TIME = 120
+PERIOD = 12
+PRIOR = "normal"       # try "pc", "triple_gamma", or "ssvs" afterwards
 DRAWS = 1_000
-WARMUP = 500
-CHAINS = 2
+WARMUP = 1_000
+CHAINS = 4
 SEED = 101
 FIGURE_DIR = Path("figures/01_gaussian_local_trend")
 
@@ -44,7 +44,7 @@ def main() -> None:
         "sd.level": 0.020,
         "sd.slope": 0.00015,
         "sd.seasonal": 0.015,
-        "sigma": 1.5,
+        "sigma": 0.30,
     }
 
     compiled = bx.compile_model(model, np.zeros(N_TIME))
@@ -63,14 +63,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # 3. Fit the model
     # -----------------------------------------------------------------------
-
     fit = bx.fit(
         data,
         model,
         parameterization="fruehwirth_schnatter",
         engine="ffbs",                    # exact for Gaussian observations
-        priors="normal",                     # interpretable shrinkage toward zero
-        asis=True,
+        priors=PRIOR,
+        asis=PRIOR != "ssvs",
         mcmc=bx.MCMC(
             draws=DRAWS,
             warmup=WARMUP,
@@ -121,7 +120,7 @@ def main() -> None:
     fit.plot(
         "process_sd",
         truths=truth,
-        title="PC prior: Gaussian model",
+        title=f"{PRIOR.replace('_', ' ')} prior: Gaussian model",
         save=FIGURE_DIR / "prior_posterior_sd.png",
     )
     fit.plot(

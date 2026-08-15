@@ -4,9 +4,6 @@ This is a controlled sampler experiment, not a scientific analysis.  It fits
 the same simulated data with more particles and with a different
 parameterization.  Interpret relative changes in restoration failures,
 particle diagnostics, R-hat, ESS, and runtime.
-
-A controlled computational experiment comparing 96 versus 256 particles and FS 
-versus disturbance parameterization. Use this when a GEV chain has high R-hat or low ESS.
 """
 from __future__ import annotations
 
