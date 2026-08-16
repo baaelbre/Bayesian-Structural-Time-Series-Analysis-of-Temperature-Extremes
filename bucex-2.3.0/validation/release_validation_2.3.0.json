@@ -1,0 +1,118 @@
+{
+  "archive_forecast": {
+    "archive_bytes": 12358,
+    "forecast_shape": [
+      3,
+      3,
+      2
+    ],
+    "roundtrip_equal": true
+  },
+  "gaussian_panel": {
+    "component_table_shape": [
+      6,
+      3
+    ],
+    "finite": true,
+    "plan": {
+      "approximation": null,
+      "asis": false,
+      "backend": "hierarchical_ssvs",
+      "engine": "ffbs",
+      "family": "multivariate_gaussian",
+      "interweaves_with": null,
+      "parameterization": "fruehwirth_schnatter",
+      "state_update": "exact Gaussian FFBS",
+      "targets_exact_posterior": true,
+      "warnings": [
+        "Channels share structural-selection probabilities and slab scales, but no latent time path. Use FactorModel when a common dynamic warming signal is the scientific target."
+      ]
+    },
+    "population_table_shape": [
+      8,
+      4
+    ],
+    "sign_invariance_error": 0.0,
+    "state_shape": [
+      2,
+      4,
+      29,
+      10
+    ]
+  },
+  "mixed_panel": {
+    "engine_diagnostics": {
+      "mean_changed_fraction": 0.763157894736842,
+      "mean_unique_ancestors": 12.416666666666668,
+      "median_min_particle_ess": 19.999998921672624,
+      "path_change_rate": 1.0,
+      "ssvs_mean_elliptical_slice_steps": NaN,
+      "ssvs_median_log_acceptance_ratio": NaN,
+      "ssvs_model_move_acceptance": 1.0,
+      "ssvs_proposed_change_rate": 0.5
+    },
+    "model_selection_exact": true,
+    "pgas_exact_invariant": true,
+    "plan": {
+      "approximation": null,
+      "asis": false,
+      "backend": "hierarchical_ssvs",
+      "engine": "pgas",
+      "family": "mixed",
+      "interweaves_with": null,
+      "parameterization": "fruehwirth_schnatter",
+      "state_update": "conditional SMC with ancestor sampling",
+      "targets_exact_posterior": true,
+      "warnings": [
+        "The transition is singular; PGAS operates on its affine support. Inspect particle ESS and ancestor diversity.",
+        "Channels share structural-selection probabilities and slab scales, but no latent time path. Use FactorModel when a common dynamic warming signal is the scientific target."
+      ]
+    },
+    "restored_iterations": 0
+  },
+  "python": "3.12.13",
+  "seconds": 0.664648144000239,
+  "single_result_type": true,
+  "uccle_graph": {
+    "channels": [
+      "TXm",
+      "TNm",
+      "TXx",
+      "TXn",
+      "TNx",
+      "TNn"
+    ],
+    "families": [
+      "gaussian",
+      "gaussian",
+      "gev",
+      "gev",
+      "gev",
+      "gev"
+    ],
+    "plan": {
+      "approximation": null,
+      "asis": false,
+      "backend": "multiseries_state_space",
+      "engine": "pgas",
+      "family": "mixed",
+      "interweaves_with": null,
+      "parameterization": "fruehwirth_schnatter",
+      "state_update": "conditional SMC with ancestor sampling",
+      "targets_exact_posterior": true,
+      "warnings": [
+        "The transition is singular; PGAS operates on its affine support. Inspect particle ESS and ancestor diversity.",
+        "Channels share structural-selection probabilities and slab scales, but no latent time path. Use FactorModel when a common dynamic warming signal is the scientific target."
+      ]
+    },
+    "transform_signs": [
+      1.0,
+      1.0,
+      1.0,
+      -1.0,
+      1.0,
+      -1.0
+    ]
+  },
+  "version": "2.3.0"
+}

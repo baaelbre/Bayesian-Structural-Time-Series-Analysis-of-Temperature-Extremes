@@ -1,0 +1,137 @@
+{
+  "all_passed": true,
+  "elapsed_seconds": 7.1998225480001565,
+  "generated_at_utc": "2026-08-13T18:43:31.462993+00:00",
+  "release": "bucex 2.0.0",
+  "sections": {
+    "gaussian_likelihood": {
+      "absolute_error": 1.7763568394002505e-15,
+      "joint_normal_log_likelihood": -4.410184075815946,
+      "kalman_log_likelihood": -4.410184075815944,
+      "passed": true
+    },
+    "loading_recovery": {
+      "all_finite": true,
+      "elapsed_seconds": 3.1576011280003513,
+      "loading_acceptance": 0.28125,
+      "loading_mean": 0.6492933285208526,
+      "loading_q05_q50_q95": [
+        0.6224153872398157,
+        0.6378148993033237,
+        0.7126608890395617
+      ],
+      "passed": true,
+      "state_shape": [
+        1,
+        100,
+        61,
+        1
+      ],
+      "truth": {
+        "loading.shared.b": 0.65,
+        "sd.factor.shared.level": 0.2,
+        "sigma.a": 0.12,
+        "sigma.b": 0.15
+      },
+      "truth_in_90_interval": true
+    },
+    "mixed_near_boundary": {
+      "active_rank": 2,
+      "active_transition_variances": [
+        3.9999999999999994e-14,
+        0.0009
+      ],
+      "all_finite": true,
+      "elapsed_seconds": 3.8006364590000885,
+      "laplace_plan": {
+        "approximation": "iterated_laplace",
+        "asis": false,
+        "backend": "factor_state_space",
+        "engine": "laplace",
+        "family": "mixed",
+        "interweaves_with": null,
+        "parameterization": "disturbance",
+        "state_update": "iterated Laplace FFBS approximation",
+        "targets_exact_posterior": false,
+        "warnings": [
+          "Channel likelihoods are conditionally independent given shared and individual states; residual/copula dependence is not modeled."
+        ]
+      },
+      "particle_diagnostics": {
+        "mean_changed_fraction": 0.8200000000000002,
+        "mean_unique_ancestors": 19.174999999999997,
+        "median_min_particle_ess": 8.480305202212392,
+        "path_change_rate": 1.0
+      },
+      "passed": true,
+      "pgas_plan": {
+        "approximation": null,
+        "asis": false,
+        "backend": "factor_state_space",
+        "engine": "pgas",
+        "family": "mixed",
+        "interweaves_with": null,
+        "parameterization": "centered",
+        "state_update": "conditional SMC with ancestor sampling",
+        "targets_exact_posterior": true,
+        "warnings": [
+          "Channel likelihoods are conditionally independent given shared and individual states; residual/copula dependence is not modeled."
+        ]
+      },
+      "state_shape": [
+        1,
+        50,
+        25,
+        2
+      ],
+      "terminal_slope_draw_sd": 0.005672359740554119,
+      "truth": {
+        "sd.factor.climate.level": 0.03,
+        "sd.factor.climate.slope": 2e-07,
+        "sigma.mean": 0.2,
+        "sigma.tail": 0.3,
+        "xi.tail": -0.05
+      }
+    },
+    "persistence_and_forecast": {
+      "archive_eta_max_abs_error": 0.0,
+      "archive_state_max_abs_error": 0.0,
+      "forecast_all_finite": true,
+      "forecast_shape": [
+        10,
+        4,
+        2
+      ],
+      "passed": true
+    },
+    "uccle_constructor": {
+      "channel_names": [
+        "TXm",
+        "TNm",
+        "TXx",
+        "TXn",
+        "TNx",
+        "TNn"
+      ],
+      "data_shape": [
+        24,
+        6
+      ],
+      "design_shape": [
+        24,
+        6,
+        14
+      ],
+      "factor_names": [
+        "common",
+        "day_night",
+        "extremes_mean",
+        "upper_lower"
+      ],
+      "noise_dim": 8,
+      "passed": true,
+      "state_dim": 14
+    }
+  },
+  "version": "2.0.0"
+}

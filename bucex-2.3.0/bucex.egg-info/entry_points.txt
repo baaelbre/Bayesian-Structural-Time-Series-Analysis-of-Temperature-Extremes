@@ -1,0 +1,2 @@
+[console_scripts]
+bucex-uccle = bucex.cli:main

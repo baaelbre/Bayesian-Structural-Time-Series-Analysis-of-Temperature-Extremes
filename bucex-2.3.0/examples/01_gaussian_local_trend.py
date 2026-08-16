@@ -18,12 +18,12 @@ import bucex as bx
 # ---------------------------------------------------------------------------
 # 1. Settings a user is expected to change
 # ---------------------------------------------------------------------------
-N_TIME = 1200
+N_TIME = 120
 PERIOD = 12
-PRIOR = "ssvs"       # try "pc", "triple_gamma", or "ssvs" afterwards
+PRIOR = "normal"       # try "pc", "triple_gamma", or "ssvs" afterwards
 DRAWS = 1_000
 WARMUP = 1_000
-CHAINS = 1
+CHAINS = 4
 SEED = 101
 FIGURE_DIR = Path("figures/01_gaussian_local_trend")
 
@@ -44,7 +44,7 @@ def main() -> None:
         "sd.level": 0.020,
         "sd.slope": 0.00015,
         "sd.seasonal": 0.015,
-        "sigma": 1,
+        "sigma": 0.30,
     }
 
     compiled = bx.compile_model(model, np.zeros(N_TIME))
