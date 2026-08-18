@@ -60,6 +60,25 @@ def prior_for(series: str):
     )
 
 
+def selected_series() -> tuple[str, ...]:
+    """Normalize one name or a sequence and validate it before fitting.
+
+    Accepting ``SERIES_TO_FIT = "TXm"`` deliberately avoids the common Python
+    mistake of writing ``("TXm")`` and then iterating over ``"T", "X", "m"``.
+    ``("TXm",)`` remains the clearest spelling for a one-element tuple.
+    """
+
+    selected = (SERIES_TO_FIT,) if isinstance(SERIES_TO_FIT, str) else tuple(SERIES_TO_FIT)
+    if not selected:
+        raise ValueError("SERIES_TO_FIT must contain at least one Uccle series.")
+    unknown = [name for name in selected if name not in bx.UCCLE_INFO]
+    if unknown:
+        raise ValueError(
+            f"Unknown Uccle series {unknown}; choose from {bx.UCCLE_SERIES}."
+        )
+    return selected
+
+
 def main() -> None:
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     if SAVE_FITS:
@@ -68,7 +87,7 @@ def main() -> None:
     summary_rows = []
     probability_tables = []
 
-    for index, series in enumerate(SERIES_TO_FIT):
+    for index, series in enumerate(selected_series()):
         info = bx.UCCLE_INFO[series]
         engine = engine_for(info["family"])
         print(f"\n{'=' * 78}\n{series}: {info['description']}\n{'=' * 78}")

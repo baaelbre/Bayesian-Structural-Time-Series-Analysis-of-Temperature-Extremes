@@ -28,14 +28,52 @@ UCCLE_INFO = {
 }
 
 
-def _resolve_data_dir(data_dir: str | Path | None = None) -> Path:
-    candidates = [] if data_dir is None else [Path(data_dir)]
-    candidates.extend([Path.cwd() / "data", Path(__file__).resolve().parents[1] / "data"])
+def _normalize_series_names(series: Iterable[str] | str) -> tuple[str, ...]:
+    """Treat a single series name as one name rather than an iterable of letters."""
+
+    selected = (series,) if isinstance(series, str) else tuple(series)
+    unknown = sorted(set(selected) - set(UCCLE_SERIES))
+    if unknown:
+        raise ValueError(f"Unknown Uccle series: {unknown}; choose from {UCCLE_SERIES}.")
+    if len(set(selected)) != len(selected):
+        raise ValueError("Uccle series names must be unique.")
+    return selected
+
+
+def _resolve_data_dir(
+    data_dir: str | Path | None = None,
+    *,
+    required_series: Iterable[str] | str = UCCLE_SERIES,
+) -> Path:
+    required = _normalize_series_names(required_series)
+    if data_dir is not None:
+        explicit = Path(data_dir)
+        missing = [name for name in required if not (explicit / f"{name}.csv").is_file()]
+        if not missing:
+            return explicit
+        has_any_summary = any(
+            (explicit / f"{name}.csv").is_file() for name in UCCLE_SERIES
+        )
+        is_daily_source_directory = (
+            explicit.is_dir()
+            and (explicit / "Uccle_24_10_23.csv").is_file()
+            and not has_any_summary
+        )
+        if not is_daily_source_directory:
+            raise FileNotFoundError(
+                f"Explicit Uccle data directory {explicit} is missing: "
+                + ", ".join(f"{name}.csv" for name in missing)
+            )
+
+    candidates = [Path.cwd() / "data", Path(__file__).resolve().parents[1] / "data"]
     for candidate in candidates:
-        if all((candidate / f"{name}.csv").is_file() for name in UCCLE_SERIES):
+        if all((candidate / f"{name}.csv").is_file() for name in required):
             return candidate
     tried = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(f"Could not locate all six Uccle monthly files. Tried: {tried}")
+    requested = ", ".join(f"{name}.csv" for name in required)
+    raise FileNotFoundError(
+        f"Could not locate requested Uccle files ({requested}). Tried: {tried}"
+    )
 
 
 def load_uccle_series(
@@ -49,7 +87,7 @@ def load_uccle_series(
 
     if series not in UCCLE_INFO:
         raise ValueError(f"Unknown Uccle series {series!r}; choose from {UCCLE_SERIES}.")
-    path = _resolve_data_dir(data_dir) / f"{series}.csv"
+    path = _resolve_data_dir(data_dir, required_series=series) / f"{series}.csv"
     frame = pd.read_csv(path)
     if "date" not in frame:
         raise ValueError(f"{path.name} must contain a date column.")
@@ -76,16 +114,13 @@ def load_uccle_series(
 def load_uccle_multiseries(
     data_dir: str | Path | None = None,
     *,
-    series: Iterable[str] = UCCLE_SERIES,
+    series: Iterable[str] | str = UCCLE_SERIES,
     start: str | None = None,
     end: str | None = None,
 ) -> pd.DataFrame:
     """Load aligned summaries in the requested channel order."""
 
-    selected = tuple(series)
-    unknown = sorted(set(selected) - set(UCCLE_SERIES))
-    if unknown:
-        raise ValueError(f"Unknown Uccle series: {unknown}.")
+    selected = _normalize_series_names(series)
     if len(selected) < 2:
         raise ValueError("A hierarchical analysis requires at least two series.")
     frame = pd.concat(
@@ -138,9 +173,21 @@ def derive_uccle_monthly(data_dir: str | Path | None = None, *, end: str = "2022
 def validate_uccle_data(data_dir: str | Path | None = None, *, check_daily: bool = False) -> pd.DataFrame:
     """Return an integrity table for the bundled summaries."""
 
+    # A source checkout keeps the optional daily file in ``data/`` and the six
+    # packaged summaries in ``bucex/data/``. If the explicit directory has no
+    # summary files at all, use it only for the requested daily cross-check.
+    summary_data_dir = data_dir
+    if data_dir is not None:
+        candidate = Path(data_dir)
+        has_any_summary = any(
+            (candidate / f"{name}.csv").is_file() for name in UCCLE_SERIES
+        )
+        if not has_any_summary:
+            summary_data_dir = None
+
     rows = []
     for name in UCCLE_SERIES:
-        values = load_uccle_series(name, data_dir)
+        values = load_uccle_series(name, summary_data_dir)
         rows.append(
             {"series": name, "n": values.size, "start": values.index[0], "end": values.index[-1], "minimum": values.min(), "maximum": values.max()}
         )
@@ -148,7 +195,7 @@ def validate_uccle_data(data_dir: str | Path | None = None, *, check_daily: bool
     if check_daily:
         rebuilt = derive_uccle_monthly(data_dir)
         for name in UCCLE_SERIES:
-            supplied = load_uccle_series(name, data_dir)
+            supplied = load_uccle_series(name, summary_data_dir)
             delta = rebuilt[name].reindex(supplied.index).to_numpy() - supplied.to_numpy()
             table.loc[name, "daily_max_abs_difference"] = np.nanmax(np.abs(delta))
     return table
@@ -156,7 +203,7 @@ def validate_uccle_data(data_dir: str | Path | None = None, *, check_daily: bool
 
 def make_uccle_hierarchical_model(
     *,
-    series: Iterable[str] = UCCLE_SERIES,
+    series: Iterable[str] | str = UCCLE_SERIES,
     seasonal: bool = True,
     period: int = 12,
 ) -> MultiSeriesModel:
@@ -166,10 +213,7 @@ def make_uccle_hierarchical_model(
     selection it may be fixed or dynamic, but it is not allowed to disappear.
     """
 
-    selected = tuple(series)
-    unknown = sorted(set(selected) - set(UCCLE_SERIES))
-    if unknown:
-        raise ValueError(f"Unknown Uccle series: {unknown}.")
+    selected = _normalize_series_names(series)
     if len(selected) < 2:
         raise ValueError("A hierarchical model requires at least two series.")
     if int(period) < 2:
@@ -200,7 +244,7 @@ def fit_uccle_hierarchical(
     data_dir: str | Path | None = None,
     *,
     model: MultiSeriesModel | None = None,
-    series: Iterable[str] = UCCLE_SERIES,
+    series: Iterable[str] | str = UCCLE_SERIES,
     pooling: str = "selection",
     priors: HierarchicalPrior | HierarchicalPriors | str | None = None,
     seasonal: bool = True,
@@ -277,12 +321,17 @@ class UccleFitCollection:
 def fit_uccle_all(
     data_dir: str | Path | None = None,
     *,
-    series: Iterable[str] = UCCLE_SERIES,
+    series: Iterable[str] | str = UCCLE_SERIES,
     **kwargs,
 ) -> UccleFitCollection:
     """Fit the requested summaries independently with a common user API."""
 
-    return UccleFitCollection({name: fit_uccle_series(name, data_dir, **kwargs) for name in tuple(series)})
+    selected = _normalize_series_names(series)
+    if not selected:
+        raise ValueError("At least one Uccle series is required.")
+    return UccleFitCollection(
+        {name: fit_uccle_series(name, data_dir, **kwargs) for name in selected}
+    )
 
 
 __all__ = [

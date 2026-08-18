@@ -844,6 +844,34 @@ def normal_gev_priors(
     )
 
 
+def _resolve_ssvs_prior(
+    ssvs: Optional[SSVSPrior],
+    *,
+    innovation_slab_sd: Optional[Mapping[str, float]],
+    level_dynamic_probability: Optional[float],
+    trend_probabilities: Optional[Sequence[float]],
+    season_probabilities: Optional[Sequence[float]],
+) -> SSVSPrior:
+    """Resolve the object and convenience-keyword SSVS APIs consistently."""
+
+    settings = {
+        "innovation_slab_sd": innovation_slab_sd,
+        "level_dynamic_probability": level_dynamic_probability,
+        "trend_probabilities": trend_probabilities,
+        "season_probabilities": season_probabilities,
+    }
+    supplied = {name: value for name, value in settings.items() if value is not None}
+    if ssvs is not None and supplied:
+        names = ", ".join(sorted(supplied))
+        raise ValueError(
+            "Pass either ssvs=SSVSPrior(...) or direct SSVS settings, not both; "
+            f"direct settings supplied: {names}."
+        )
+    if ssvs is not None:
+        return ssvs
+    return SSVSPrior(**supplied)
+
+
 def ssvs_gaussian_priors(
     period: int = 12,
     *,
@@ -851,10 +879,26 @@ def ssvs_gaussian_priors(
     beta_mean: float = 0.0,
     beta_sd: float = 0.005,
     ssvs: Optional[SSVSPrior] = None,
+    innovation_slab_sd: Optional[Mapping[str, float]] = None,
+    level_dynamic_probability: Optional[float] = None,
+    trend_probabilities: Optional[Sequence[float]] = None,
+    season_probabilities: Optional[Sequence[float]] = None,
 ) -> FSGaussianPriors:
-    """Gaussian structural SSVS prior with exact zero/fixed/dynamic states."""
+    """Gaussian structural SSVS prior with exact structural states.
+
+    The SSVS settings may be supplied either as an explicit :class:`SSVSPrior`
+    through ``ssvs=`` or as the readable convenience keywords exposed here.
+    Do not mix the two forms in one call.
+    """
 
     k = period - 1
+    resolved_ssvs = _resolve_ssvs_prior(
+        ssvs,
+        innovation_slab_sd=innovation_slab_sd,
+        level_dynamic_probability=level_dynamic_probability,
+        trend_probabilities=trend_probabilities,
+        season_probabilities=season_probabilities,
+    )
     return FSGaussianPriors(
         sigma2=InverseGammaPrior(a=2.0, b=1.0),
         alpha0=NormalPrior(alpha_mean, np.sqrt(10.0)),
@@ -862,7 +906,7 @@ def ssvs_gaussian_priors(
         gamma0_season=DiagonalNormalPrior(
             mean=np.zeros(k), sd=np.full(k, np.sqrt(5.0))
         ),
-        ssvs=SSVSPrior() if ssvs is None else ssvs,
+        ssvs=resolved_ssvs,
     )
 
 
@@ -873,10 +917,26 @@ def ssvs_gev_priors(
     beta_mean: float = 0.0,
     beta_sd: float = 0.005,
     ssvs: Optional[SSVSPrior] = None,
+    innovation_slab_sd: Optional[Mapping[str, float]] = None,
+    level_dynamic_probability: Optional[float] = None,
+    trend_probabilities: Optional[Sequence[float]] = None,
+    season_probabilities: Optional[Sequence[float]] = None,
 ) -> FSGEVPriors:
-    """DGEV structural SSVS prior using Laplace pseudo-observations."""
+    """DGEV structural SSVS prior with exact zero/fixed/dynamic states.
+
+    The SSVS settings may be supplied either as an explicit :class:`SSVSPrior`
+    through ``ssvs=`` or as the readable convenience keywords exposed here.
+    Do not mix the two forms in one call.
+    """
 
     k = period - 1
+    resolved_ssvs = _resolve_ssvs_prior(
+        ssvs,
+        innovation_slab_sd=innovation_slab_sd,
+        level_dynamic_probability=level_dynamic_probability,
+        trend_probabilities=trend_probabilities,
+        season_probabilities=season_probabilities,
+    )
     return FSGEVPriors(
         sigma2=InverseGammaPrior(a=2.0, b=2.0),
         xi=UniformPrior(-0.5, 0.5),
@@ -885,7 +945,7 @@ def ssvs_gev_priors(
         gamma0_season=DiagonalNormalPrior(
             mean=np.zeros(k), sd=np.full(k, np.sqrt(5.0))
         ),
-        ssvs=SSVSPrior() if ssvs is None else ssvs,
+        ssvs=resolved_ssvs,
     )
 
 

@@ -2,6 +2,18 @@
 
 ## 2.4.0
 
+### Uccle workflow hotfix
+
+- Aligned `ssvs_gaussian_priors()` and `ssvs_gev_priors()` with Example 09 by
+  accepting direct level, trend, season, and slab SSVS settings as well as an
+  explicit `SSVSPrior` object.
+- Made one-series Uccle selections robust to a bare string, so `"TXm"` cannot
+  be accidentally interpreted as the three names `"T"`, `"X"`, and `"m"`.
+- Made a requested single-series CSV authoritative without requiring the
+  explicit directory to contain all six Uccle summaries.
+- Restored the zero-restoration metadata contract for successful
+  centered/disturbance PGAS fits.
+
 ### Model surface
 
 - Unified univariate `Model` and hierarchical `MultiSeriesModel` under

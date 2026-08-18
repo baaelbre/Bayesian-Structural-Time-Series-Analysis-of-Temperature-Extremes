@@ -651,4 +651,16 @@ def sample_posterior(
             "state_mean": compiled.initial_mean.tolist(),
             "state_sd": np.sqrt(np.diag(compiled.initial_cov)).tolist(),
         },
+        metadata={
+            # This sampler does not silently restore failed iterations. If a
+            # state update cannot be completed it raises immediately, so a
+            # successful return certifies zero restorations for every chain.
+            "restored_iterations": 0,
+            "restored_iterations_by_chain": [0] * chains,
+            "restored_fraction": 0.0,
+            "restored_fraction_by_chain": [0.0] * chains,
+            "attempt_failure_counts": {},
+            "restore_failure_counts": {},
+            "pgas_exact_invariant": plan.engine == "pgas",
+        },
     )
