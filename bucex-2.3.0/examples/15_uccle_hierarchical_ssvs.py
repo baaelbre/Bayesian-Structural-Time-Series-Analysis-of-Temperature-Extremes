@@ -20,7 +20,7 @@ END = None
 DRAWS = 1_000
 WARMUP = 1_000
 CHAINS = 4
-N_PARTICLES = 512
+N_PARTICLES = 24
 SEED = 1_501
 SAVE_FIT = False
 SHOW_PLOTS = False
@@ -49,6 +49,7 @@ def main() -> None:
             chains=CHAINS,
             seed=SEED,
             progress=True,
+            progress_every = 1
         ),
         particles=bx.Particles(n=N_PARTICLES, proposal="guided"),
     )

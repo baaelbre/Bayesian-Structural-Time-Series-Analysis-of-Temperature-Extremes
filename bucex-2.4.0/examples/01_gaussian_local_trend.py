@@ -18,7 +18,7 @@ import bucex as bx
 # ---------------------------------------------------------------------------
 # 1. Settings a user is expected to change
 # ---------------------------------------------------------------------------
-N_TIME = 1200
+N_TIME = 120
 PERIOD = 12
 PRIOR = "normal"       # try "pc", "triple_gamma", or "ssvs" afterwards
 DRAWS = 1_000

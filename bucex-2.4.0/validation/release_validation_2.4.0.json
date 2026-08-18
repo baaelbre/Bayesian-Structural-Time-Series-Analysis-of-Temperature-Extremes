@@ -1,0 +1,115 @@
+{
+  "bucex_version": "2.4.0",
+  "disturbance_guided_pgas": {
+    "backend": "state_space",
+    "engine": "pgas",
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "initial_parameters": [
+      "initial.level",
+      "initial.slope"
+    ],
+    "restored_iterations": 0
+  },
+  "hierarchical_gaussian": {
+    "both": {
+      "backend": "hierarchical_state_space",
+      "engine": "ffbs",
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "hierarchy_probability_rows": 8,
+      "hierarchy_slab_rows": 3,
+      "initial_parameters": [
+        "initial.channel.maximum.level",
+        "initial.channel.maximum.seasonal",
+        "initial.channel.maximum.slope",
+        "initial.channel.mean.level",
+        "initial.channel.mean.seasonal",
+        "initial.channel.mean.slope"
+      ],
+      "restored_iterations": 0,
+      "season_zero_probability": [
+        0.0,
+        0.0
+      ],
+      "sign_invariance_max_error": 0.0
+    },
+    "selection": {
+      "backend": "hierarchical_state_space",
+      "engine": "ffbs",
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "hierarchy_probability_rows": 8,
+      "hierarchy_slab_rows": 3,
+      "initial_parameters": [
+        "initial.channel.maximum.level",
+        "initial.channel.maximum.seasonal",
+        "initial.channel.maximum.slope",
+        "initial.channel.mean.level",
+        "initial.channel.mean.seasonal",
+        "initial.channel.mean.slope"
+      ],
+      "restored_iterations": 0,
+      "season_zero_probability": [
+        0.0,
+        0.0
+      ],
+      "sign_invariance_max_error": 0.0
+    },
+    "slab": {
+      "backend": "hierarchical_state_space",
+      "engine": "ffbs",
+      "finite_log_posterior": true,
+      "finite_states": true,
+      "hierarchy_probability_rows": 8,
+      "hierarchy_slab_rows": 3,
+      "initial_parameters": [
+        "initial.channel.maximum.level",
+        "initial.channel.maximum.seasonal",
+        "initial.channel.maximum.slope",
+        "initial.channel.mean.level",
+        "initial.channel.mean.seasonal",
+        "initial.channel.mean.slope"
+      ],
+      "restored_iterations": 0,
+      "season_zero_probability": [
+        0.0,
+        0.0
+      ],
+      "sign_invariance_max_error": 0.0
+    }
+  },
+  "long_gaussian": {
+    "backend": "fruehwirth_schnatter",
+    "engine": "ffbs",
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "initial_level_finite": true,
+    "initial_parameters": [
+      "initial.level",
+      "initial.seasonal",
+      "initial.slope"
+    ],
+    "initial_slope_finite": true,
+    "restored_iterations": 0,
+    "sign_invariance_max_error": 0.0
+  },
+  "mixed_guided_pgas": {
+    "backend": "hierarchical_state_space",
+    "engine": "pgas",
+    "finite_log_posterior": true,
+    "finite_states": true,
+    "initial_parameters": [
+      "initial.channel.maximum.level",
+      "initial.channel.maximum.seasonal",
+      "initial.channel.maximum.slope",
+      "initial.channel.mean.level",
+      "initial.channel.mean.seasonal",
+      "initial.channel.mean.slope"
+    ],
+    "restored_iterations": 0
+  },
+  "platform": "Linux-6.18.35-x86_64-with-glibc2.39",
+  "python": "3.12.13",
+  "total_seconds": 1.025390355998752
+}
