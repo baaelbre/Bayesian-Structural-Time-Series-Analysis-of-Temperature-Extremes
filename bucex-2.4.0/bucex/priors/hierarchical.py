@@ -22,6 +22,12 @@ _LABELS = {
     "trend": ("zero", "fixed", "dynamic"),
     "season": ("zero", "fixed", "dynamic"),
 }
+_TREND_MODELS = (
+    "linear_trend",
+    "rw1_drift",
+    "rw2_smooth_trend",
+    "local_linear_trend",
+)
 
 
 def _positive_mapping(values: Mapping[str, float], *, label: str) -> dict[str, float]:
@@ -69,12 +75,14 @@ class HierarchicalPrior:
 
     pool: str = "both"
     slab: str = "normal"
+    model_space: str = "joint_trend"
     level_states: Sequence[str] = ("fixed", "dynamic")
-    trend_states: Sequence[str] = ("zero", "fixed", "dynamic")
+    trend_states: Sequence[str] = ("fixed", "dynamic")
     season_states: Sequence[str] = ("fixed", "dynamic")
     level_concentration: Sequence[float] = (1.0, 1.0)
-    trend_concentration: Sequence[float] = (1.0, 1.0, 1.0)
+    trend_concentration: Sequence[float] = (1.0, 1.0)
     season_concentration: Sequence[float] = (1.0, 1.0)
+    trend_model_concentration: Sequence[float] = (1.0, 1.0, 1.0, 1.0)
     coefficient_scale: Mapping[str, float] = field(
         default_factory=lambda: {
             "level": 0.03,
@@ -103,8 +111,19 @@ class HierarchicalPrior:
             raise ValueError("pool must be 'selection', 'slab', or 'both'.")
         if str(self.slab).lower() != "normal":
             raise ValueError("The hierarchical release currently uses a normal slab.")
+        model_space = str(self.model_space).lower().replace("-", "_")
+        model_space = {
+            "joint": "joint_trend",
+            "clean": "joint_trend",
+            "four_class": "joint_trend",
+            "legacy": "componentwise",
+            "factorized": "componentwise",
+        }.get(model_space, model_space)
+        if model_space not in {"joint_trend", "componentwise"}:
+            raise ValueError("model_space must be 'joint_trend' or 'componentwise'.")
         object.__setattr__(self, "pool", pool)
         object.__setattr__(self, "slab", "normal")
+        object.__setattr__(self, "model_space", model_space)
         for component in ("level", "trend", "season"):
             object.__setattr__(
                 self,
@@ -123,6 +142,28 @@ class HierarchicalPrior:
                 raise ValueError(
                     f"{component}_concentration must contain {expected} positive values."
                 )
+        model_concentration = np.asarray(
+            self.trend_model_concentration, dtype=float
+        )
+        if (
+            model_concentration.shape != (4,)
+            or np.any(~np.isfinite(model_concentration))
+            or np.any(model_concentration <= 0.0)
+        ):
+            raise ValueError(
+                "trend_model_concentration must contain four positive values."
+            )
+        if self.model_space == "joint_trend":
+            if "zero" in self.trend_states:
+                raise ValueError(
+                    "The joint trend model space always estimates a slope. Use "
+                    "model_space='componentwise' for an exact no-slope state."
+                )
+            if "zero" in self.season_states:
+                raise ValueError(
+                    "The joint temperature model keeps seasonality present and "
+                    "selects only fixed versus dynamic seasonality."
+                )
         if not np.isfinite(float(self.slab_df)) or float(self.slab_df) <= 0.0:
             raise ValueError("slab_df must be finite and positive.")
         _positive_mapping(self.coefficient_scale, label="coefficient_scale")
@@ -137,6 +178,23 @@ class HierarchicalPrior:
     def pools_slab(self) -> bool:
         return self.pool in {"slab", "both"}
 
+    @property
+    def uses_joint_trend_space(self) -> bool:
+        return self.model_space == "joint_trend"
+
+    def initial_model_probabilities(self) -> np.ndarray:
+        """Prior probabilities for the four joint trend evolution classes."""
+
+        if not self.uses_joint_trend_space:
+            raise ValueError(
+                "Joint trend-model probabilities are unavailable in the "
+                "componentwise model space."
+            )
+        if not self.pools_selection:
+            return np.asarray((0.0, 0.0, 0.0, 1.0), dtype=float)
+        concentration = np.asarray(self.trend_model_concentration, dtype=float)
+        return concentration / concentration.sum()
+
     def allowed_indices(self, component: str) -> np.ndarray:
         labels = _LABELS[component]
         states = getattr(self, f"{component}_states")
@@ -146,6 +204,11 @@ class HierarchicalPrior:
         return np.asarray(getattr(self, f"{component}_concentration"), dtype=float)
 
     def initial_probabilities(self, component: str) -> np.ndarray:
+        if self.uses_joint_trend_space and component in {"level", "trend"}:
+            model = self.initial_model_probabilities()
+            if component == "level":
+                return np.asarray((model[0] + model[2], model[1] + model[3]))
+            return np.asarray((0.0, model[0] + model[1], model[2] + model[3]))
         size = len(_LABELS[component])
         output = np.zeros(size, dtype=float)
         if self.pools_selection:
@@ -163,6 +226,15 @@ class HierarchicalPrior:
         level = np.asarray(probabilities["level"], dtype=float)
         trend = np.asarray(probabilities["trend"], dtype=float)
         season = np.asarray(probabilities["season"], dtype=float)
+        joint = None
+        if self.uses_joint_trend_space:
+            model_probabilities = np.asarray(
+                probabilities["trend_model"], dtype=float
+            )
+            joint = {
+                name: float(model_probabilities[index])
+                for index, name in enumerate(_TREND_MODELS)
+            }
         return SSVSPrior(
             innovation_slab_sd={
                 name: float(self.coefficient_scale[name]) * float(slab_scale[name])
@@ -171,6 +243,7 @@ class HierarchicalPrior:
             level_dynamic_probability=float(level[1]),
             trend_probabilities=tuple(trend),
             season_probabilities=tuple(season),
+            trend_model_probabilities=joint,
         )
 
 

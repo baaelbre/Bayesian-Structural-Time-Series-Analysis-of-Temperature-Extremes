@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.4.1
+
+### Hierarchical model space
+
+- Added the default four-class joint level/slope innovation space: linear
+  trend, RW1 with drift, RW2 smooth trend, and full local linear trend.
+- Kept initial slope estimated in every class and retained componentwise
+  no-slope SSVS only as an explicit legacy sensitivity.
+- Added posterior summaries and plotting for shared trend-class probabilities.
+- Added expert-scale calibration and implication helpers for normal/half-t
+  hierarchical slabs.
+
+### Mixed/GEV inference
+
+- Added exploratory hierarchical Laplace SSVS for mixed and all-GEV models.
+- Added validated `FitResult.warm_start()` and `init=<laplace fit>` support for
+  exact PGAS.
+- Added `HierarchicalSampler` controls for Laplace initialization and optional
+  concurrent channel updates.
+- Vectorized GEV particle weights, complete-path likelihoods, and Laplace
+  pseudo-data calculations.
+- Grouped channel-specific GEV shape values in progress output.
+- Renamed changed fraction to the scientifically explicit path-update fraction,
+  retaining a deprecated compatibility alias.
+
+### Workflows and persistence
+
+- Added a Laplace-to-PGAS example, four-process HPC chain example, Slurm array,
+  and chain-combination example.
+- Updated the checksummed archive schema to 2.4.1 while retaining readers for
+  prior supported schemas.
+
 ## 2.4.0
 
 ### Uccle workflow hotfix

@@ -1,4 +1,43 @@
-# Migration to 2.4
+# Migration to 2.4.1
+
+Version 2.4.1 is source-compatible with the 2.4 public `Model`,
+`MultiSeriesModel`, and `fit` workflow. The important changes are semantic and
+additive:
+
+- hierarchical selection defaults to the four-class joint trend space;
+- mixed/all-GEV hierarchies now support explicit exploratory
+  `engine="laplace"`;
+- a compatible hierarchical Laplace fit can be passed as `init=` to PGAS;
+- `HierarchicalSampler` controls Laplace initialization and optional channel
+  workers;
+- PGAS reports `path_update_fraction`; `changed_fraction` is a deprecated alias;
+- schema 2.4.1 archives retain support for reading 2.4 results.
+
+The four default trend classes always estimate the initial slope. To reproduce
+the older independent `zero`/`fixed`/`dynamic` slope indicator, request:
+
+```python
+bx.HierarchicalPrior(
+    pool="selection",
+    model_space="componentwise",
+    trend_states=("zero", "fixed", "dynamic"),
+)
+```
+
+Treat that as an explicit sensitivity model, not an implicit compatibility
+default.
+
+For a mixed hierarchy, the new two-stage workflow is:
+
+```python
+screen = bx.fit(data, model, priors=prior, engine="laplace", ...)
+fit = bx.fit(data, model, priors=prior, engine="pgas", init=screen, ...)
+```
+
+The screen is approximate. The PGAS fit remains exact-invariant and must be
+diagnosed independently.
+
+## Changes introduced in 2.4
 
 Version 2.4 narrows the public model surface to univariate structural models
 and hierarchical collections of separate structural paths.
@@ -99,7 +138,7 @@ or encourage users to rely on an incomplete run.
 
 ## Archives
 
-New hierarchical results use schema 2.4. Save and load with:
+New hierarchical results use schema 2.4.1. Save and load with:
 
 ```python
 fit.save("results/model.bucex")

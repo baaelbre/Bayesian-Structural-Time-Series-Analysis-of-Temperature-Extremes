@@ -955,6 +955,49 @@ def plot_hierarchy(fit, *, figsize=(9, 6)):
     return figure, axes
 
 
+def plot_trend_models(fit, *, credible_interval: float = 0.90, ax=None):
+    """Plot the learned population probabilities of four joint trend models."""
+
+    import matplotlib.pyplot as plt
+
+    table = fit.hierarchical_trend_model_probabilities(credible_interval)
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(8, 4))
+    else:
+        figure = ax.figure
+    labels = {
+        "linear_trend": "linear\ntrend",
+        "rw1_drift": "RW1 +\ndrift",
+        "rw2_smooth_trend": "RW2 smooth\ntrend",
+        "local_linear_trend": "local linear\ntrend",
+    }
+    if hasattr(table, "index"):
+        names = list(table.index)
+        means = table["mean"].to_numpy(dtype=float)
+        lower = table["lower"].to_numpy(dtype=float)
+        upper = table["upper"].to_numpy(dtype=float)
+    else:
+        names = [row["model"] for row in table]
+        means = np.asarray([row["mean"] for row in table], dtype=float)
+        lower = np.asarray([row["lower"] for row in table], dtype=float)
+        upper = np.asarray([row["upper"] for row in table], dtype=float)
+    positions = np.arange(len(names))
+    ax.bar(positions, means, color=("C1", "C0", "C2", "C3"))
+    ax.errorbar(
+        positions,
+        means,
+        yerr=np.vstack((means - lower, upper - means)),
+        fmt="none",
+        ecolor="0.2",
+        capsize=4,
+    )
+    ax.set_xticks(positions, [labels.get(name, name) for name in names])
+    ax.set_ylim(0.0, 1.0)
+    ax.set_ylabel("posterior mean population probability")
+    ax.set_title("Joint trend-evolution model")
+    return figure, ax
+
+
 def plot_fit(fit, kind: str = "state", **kwargs):
     save = kwargs.pop("save", None)
 
@@ -980,9 +1023,11 @@ def plot_fit(fit, kind: str = "state", **kwargs):
             return finish(plot_component_probabilities(fit, **kwargs))
         if key in {"hierarchy", "population"}:
             return finish(plot_hierarchy(fit, **kwargs))
+        if key in {"trend_models", "trend_model_probabilities", "model_space"}:
+            return finish(plot_trend_models(fit, **kwargs))
         raise ValueError(
             "Multiseries kind must be channel, process_sd, parameter_density, "
-            "traces, acf, component_probabilities, or hierarchy."
+            "traces, acf, component_probabilities, hierarchy, or trend_models."
         )
     if key in {"process_sd", "process_sds", "prior_posterior_sd"}:
         return finish(plot_process_sds(fit, **kwargs))

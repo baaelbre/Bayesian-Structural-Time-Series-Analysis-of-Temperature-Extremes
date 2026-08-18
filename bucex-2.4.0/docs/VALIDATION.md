@@ -1,6 +1,6 @@
 # Release validation
 
-Version 2.4 validation has four layers:
+Version 2.4.1 validation has four layers:
 
 1. unit and integration tests for models, priors, samplers, results, plotting,
    prediction, and persistence;
@@ -16,13 +16,16 @@ python validation/run_release_validation.py
 python -m build
 ```
 
-## Required 2.4 checks
+## Required 2.4.1 checks
 
 The release validator checks:
 
 - one public `fit()` path for `Model` and `MultiSeriesModel`;
 - exact Gaussian FFBS and exact-invariant mixed PGAS plans;
+- explicitly approximate mixed hierarchical Laplace plans;
+- validated transfer of a complete Laplace draw into a PGAS warm start;
 - pooled selection, pooled slab, and pooled-both prior resolution;
+- the four-class joint trend space and its population probabilities;
 - seasonality present by default with fixed/dynamic states only;
 - initial level and slope stored as estimated posterior parameters;
 - random FS sign switches preserve each complete predictor;
@@ -30,13 +33,15 @@ The release validator checks:
   covariance;
 - guided disturbance PGAS remains on affine support and does not produce
   all-zero ancestor weights;
+- vectorized GEV weights and path likelihoods agree with scalar references;
+- optional channel workers preserve finite reproducible fits;
 - the FS PGAS ancestor fallback preserves the conditioned path;
 - Gaussian and mixed hierarchical smoke fits return finite state and parameter
   draws;
 - hierarchy, component allocation, trace, ACF, and save APIs work;
 - `level_slope` uses seasonally adjusted observations;
 - predictive scores and PITs remain finite and inside mathematical ranges;
-- schema-2.4 archive round-trips preserve model, data, and draws;
+- schema-2.4.1 archive round-trips preserve model, data, and draws;
 - the Uccle helper preserves two Gaussian and four GEV channels and both
   lower-tail transformations.
 

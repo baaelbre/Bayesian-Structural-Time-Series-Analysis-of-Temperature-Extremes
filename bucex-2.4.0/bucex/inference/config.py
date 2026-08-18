@@ -97,3 +97,29 @@ class Particles:
             raise ValueError("resampling must be systematic or multinomial.")
         if self.proposal not in {"bootstrap", "guided"}:
             raise ValueError("proposal must be bootstrap or guided.")
+
+
+@dataclass(frozen=True)
+class HierarchicalSampler:
+    """Execution controls for a multi-series hierarchical sampler.
+
+    ``initializer='laplace'`` obtains a fast approximate path for every GEV
+    channel before exact PGAS starts. It changes only the chain starting point,
+    not the PGAS target. ``channel_workers`` optionally updates conditionally
+    independent channels in parallel within each hierarchical Gibbs sweep.
+    """
+
+    initializer: str = "laplace"
+    channel_workers: int = 1
+
+    def __post_init__(self) -> None:
+        initializer = str(self.initializer).lower().replace("-", "_")
+        initializer = {"none": "data", "default": "data"}.get(
+            initializer, initializer
+        )
+        if initializer not in {"data", "laplace"}:
+            raise ValueError("initializer must be 'data' or 'laplace'.")
+        if int(self.channel_workers) < 1:
+            raise ValueError("channel_workers must be at least one.")
+        object.__setattr__(self, "initializer", initializer)
+        object.__setattr__(self, "channel_workers", int(self.channel_workers))

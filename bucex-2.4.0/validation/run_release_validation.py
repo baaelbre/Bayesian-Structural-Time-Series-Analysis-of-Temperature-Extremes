@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-seed release validation for bucex 2.4.0."""
+"""Fixed-seed release validation for bucex 2.4.1."""
 from __future__ import annotations
 
 import argparse
@@ -60,9 +60,9 @@ def _finite_fit(fit: bx.FitResult) -> dict[str, object]:
 
 def run() -> dict[str, object]:
     started = time.perf_counter()
-    if bx.__version__ != "2.4.0":
-        raise RuntimeError(f"Expected bucex 2.4.0, found {bx.__version__}.")
-    rng = np.random.default_rng(2400)
+    if bx.__version__ != "2.4.1":
+        raise RuntimeError(f"Expected bucex 2.4.1, found {bx.__version__}.")
+    rng = np.random.default_rng(2410)
     record: dict[str, object] = {
         "bucex_version": bx.__version__,
         "python": platform.python_version(),
@@ -117,6 +117,7 @@ def run() -> dict[str, object]:
             dates=_dates(n_time),
         )
         probabilities = fit.component_probabilities()
+        trend_models = fit.hierarchical_trend_model_probabilities()
         pooling[mode] = {
             **_finite_fit(fit),
             "sign_invariance_max_error": float(
@@ -129,6 +130,8 @@ def run() -> dict[str, object]:
                 fit.hierarchical_probabilities().shape[0]
             ),
             "hierarchy_slab_rows": int(fit.hierarchical_slab_summary().shape[0]),
+            "trend_model_rows": int(trend_models.shape[0]),
+            "trend_model_probability_sum": float(trend_models["mean"].sum()),
         }
     record["hierarchical_gaussian"] = pooling
 
@@ -138,15 +141,44 @@ def run() -> dict[str, object]:
             rng.gumbel(scale=0.3, size=16),
         )
     )
+    laplace_screen = bx.fit(
+        mixed_values,
+        _model(mixed=True),
+        priors=bx.HierarchicalPrior(pool="selection"),
+        engine="laplace",
+        mcmc=bx.MCMC(draws=2, warmup=2, chains=1, seed=2420),
+        dates=_dates(16),
+    )
+    record["mixed_hierarchical_laplace"] = {
+        **_finite_fit(laplace_screen),
+        "targets_exact_posterior": bool(
+            laplace_screen.plan.targets_exact_posterior
+        ),
+        "warm_start_keys": sorted(laplace_screen.warm_start()),
+    }
+
     mixed_fit = bx.fit(
         mixed_values,
         _model(mixed=True),
         priors=bx.HierarchicalPrior(pool="selection"),
+        engine="pgas",
+        init=laplace_screen,
         particles=bx.Particles(n=20, proposal="guided"),
-        mcmc=bx.MCMC(draws=2, warmup=2, chains=1, seed=2420),
+        mcmc=bx.MCMC(draws=2, warmup=2, chains=1, seed=2421),
         dates=_dates(16),
     )
-    record["mixed_guided_pgas"] = _finite_fit(mixed_fit)
+    record["mixed_guided_pgas"] = {
+        **_finite_fit(mixed_fit),
+        "targets_exact_posterior": bool(mixed_fit.plan.targets_exact_posterior),
+        "external_warm_start": bool(mixed_fit.meta["external_warm_start"]),
+        "path_update_fraction_finite": bool(
+            np.all(
+                np.isfinite(
+                    mixed_fit.draws_aux["particle_path_update_fraction"]
+                )
+            )
+        ),
+    }
 
     disturbance_fit = bx.fit(
         rng.gumbel(size=18),
@@ -157,7 +189,7 @@ def run() -> dict[str, object]:
         parameterization="disturbance",
         asis=False,
         particles=bx.Particles(n=20, proposal="guided"),
-        mcmc=bx.MCMC(draws=2, warmup=2, chains=1, seed=2421),
+        mcmc=bx.MCMC(draws=2, warmup=2, chains=1, seed=2422),
     )
     record["disturbance_guided_pgas"] = _finite_fit(disturbance_fit)
     record["total_seconds"] = time.perf_counter() - started
@@ -169,7 +201,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("validation/release_validation_2.4.0.json"),
+        default=Path("validation/release_validation_2.4.1.json"),
     )
     args = parser.parse_args()
     result = run()

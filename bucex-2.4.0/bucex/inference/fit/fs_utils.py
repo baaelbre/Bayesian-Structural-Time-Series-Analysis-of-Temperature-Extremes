@@ -1861,8 +1861,14 @@ class NCPPGASResult:
     unique_ancestors: Array
     reference_ancestors: Array
     path_changed: bool
-    changed_fraction: float
+    path_update_fraction: float
     exact_invariant: bool = True
+
+    @property
+    def changed_fraction(self) -> float:
+        """Deprecated 2.4 name for :attr:`path_update_fraction`."""
+
+        return float(self.path_update_fraction)
 
 
 @dataclass(frozen=True)
@@ -1943,18 +1949,21 @@ def _ncp_observation_logweights(
     params_obs: ParamDict,
 ) -> Array:
     eta = float(offset_t) + np.asarray(states, dtype=float) @ np.asarray(H, dtype=float)
-    values = np.full(eta.size, -np.inf, dtype=float)
-    for index, eta_value in enumerate(eta):
-        try:
-            value = float(
-                model.obs.logpdf(
-                    y=float(y_t), eta=float(eta_value), params=params_obs
-                )
-            )
-        except Exception:
-            value = -np.inf
-        if np.isfinite(value):
-            values[index] = value
+    try:
+        values = np.asarray(
+            model.obs.logpdf(
+                y=np.full(eta.shape, float(y_t), dtype=float),
+                eta=eta,
+                params=params_obs,
+            ),
+            dtype=float,
+        )
+        if values.ndim == 0:
+            values = np.full(eta.shape, float(values), dtype=float)
+        values = np.broadcast_to(values, eta.shape).astype(float, copy=True)
+    except Exception:
+        values = np.full(eta.shape, -np.inf, dtype=float)
+    values[~np.isfinite(values)] = -np.inf
     return values
 
 
@@ -2210,7 +2219,7 @@ def ncp_pgas(
         unique_ancestors=unique,
         reference_ancestors=reference_ancestors,
         path_changed=bool(np.any(changed)),
-        changed_fraction=float(np.mean(changed)),
+        path_update_fraction=float(np.mean(changed)),
     )
 
 
@@ -2223,20 +2232,24 @@ def _ncp_exact_observation_loglik(
     layout: NCPLayout,
 ) -> float:
     mu = mu_from_ncp(z_path, params_state, layout)
-    total = 0.0
-    for observed, location in zip(np.asarray(y, dtype=float), mu):
-        try:
-            value = float(
-                model.obs.logpdf(
-                    y=float(observed), eta=float(location), params=params_obs
-                )
-            )
-        except Exception:
-            return -np.inf
-        if not np.isfinite(value):
-            return -np.inf
-        total += value
-    return float(total)
+    try:
+        values = np.asarray(
+            model.obs.logpdf(
+                y=np.asarray(y, dtype=float), eta=mu, params=params_obs
+            ),
+            dtype=float,
+        )
+    except Exception:
+        return -np.inf
+    if values.ndim == 0:
+        values = np.full(mu.shape, float(values), dtype=float)
+    try:
+        values = np.broadcast_to(values, mu.shape)
+    except ValueError:
+        return -np.inf
+    if not np.all(np.isfinite(values)):
+        return -np.inf
+    return float(np.sum(values))
 
 
 def _ncp_state_log_density(z_path: Array, G: Array, Q: Array) -> float:
@@ -2264,24 +2277,22 @@ def _ncp_laplace_pseudo_data(
 ) -> tuple[Array, Array]:
     y = np.asarray(y, dtype=float).reshape(-1)
     eta = np.asarray(eta, dtype=float).reshape(-1)
-    pseudo_y = np.zeros(y.size, dtype=float)
-    pseudo_variance = np.zeros(y.size, dtype=float)
-    for index, (observed, location) in enumerate(zip(y, eta)):
-        gradient = float(
-            model.obs.grad_eta(float(observed), float(location), params_obs)
-        )
-        hessian = float(
-            model.obs.hess_eta(float(observed), float(location), params_obs)
-        )
-        if not np.isfinite(gradient) or not np.isfinite(hessian):
-            raise FloatingPointError("Invalid GEV derivatives at the Laplace mode.")
-        information = max(-hessian, float(curvature_floor))
-        pseudo_variance[index] = min(
-            1.0 / information, float(maximum_variance)
-        )
-        pseudo_y[index] = float(location) + float(
-            np.clip(gradient / information, -shift_limit, shift_limit)
-        )
+    try:
+        gradient = np.asarray(model.obs.grad_eta(y, eta, params_obs), dtype=float)
+        hessian = np.asarray(model.obs.hess_eta(y, eta, params_obs), dtype=float)
+        gradient = np.broadcast_to(gradient, y.shape)
+        hessian = np.broadcast_to(hessian, y.shape)
+    except Exception as error:
+        raise FloatingPointError(
+            "Invalid GEV derivatives at the Laplace mode."
+        ) from error
+    if not np.all(np.isfinite(gradient)) or not np.all(np.isfinite(hessian)):
+        raise FloatingPointError("Invalid GEV derivatives at the Laplace mode.")
+    information = np.maximum(-hessian, float(curvature_floor))
+    pseudo_variance = np.minimum(1.0 / information, float(maximum_variance))
+    pseudo_y = eta + np.clip(
+        gradient / information, -float(shift_limit), float(shift_limit)
+    )
     return pseudo_y, pseudo_variance
 
 

@@ -385,6 +385,7 @@ def sample_posterior(
         "particle_min_ess",
         "particle_mean_unique_ancestors",
         "particle_path_changed",
+        "particle_path_update_fraction",
         "particle_changed_fraction",
     ]
     draw_metrics = {name: np.full((chains, draws), np.nan) for name in metric_names}
@@ -459,7 +460,8 @@ def sample_posterior(
                     particle_min_ess=float(np.min(state.ess[1:])),
                     particle_mean_unique_ancestors=float(np.mean(state.unique_ancestors[1:])),
                     particle_path_changed=float(state.path_changed),
-                    particle_changed_fraction=state.changed_fraction,
+                    particle_path_update_fraction=state.path_update_fraction,
+                    particle_changed_fraction=state.path_update_fraction,
                 )
             else:
                 raise RuntimeError(f"Unhandled engine '{plan.engine}'.")

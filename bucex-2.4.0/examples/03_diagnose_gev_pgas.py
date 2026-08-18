@@ -103,7 +103,7 @@ def main() -> None:
                 "min_particle_ess/N": engine["median_min_particle_ess"] / n_particles,
                 "unique_ancestors/N": engine["mean_unique_ancestors"] / n_particles,
                 "path_change_rate": engine["path_change_rate"],
-                "changed_fraction": engine["mean_changed_fraction"],
+                "path_update_fraction": engine["mean_path_update_fraction"],
                 "support_margin_1pct": float(np.quantile(minimum_support, 0.01)),
                 "attempt_failures": str(fit.metadata.get("attempt_failure_counts", {})),
             }

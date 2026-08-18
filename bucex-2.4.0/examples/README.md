@@ -1,4 +1,4 @@
-# bucex 2.4.0 examples
+# bucex 2.4.1 examples
 
 Each example is a genuine standalone script with editable constants at the
 top—there is no shared configuration file. Run one from the project root:
@@ -19,9 +19,12 @@ python examples/01_gaussian_local_trend.py
 | 8 | `08_bulk_tail_independent.py` | Parallel unpooled Gaussian bulk and GEV tail analyses |
 | 9 | `09_uccle_univariate.py` | Six separate Uccle analyses: the no-pooling comparator |
 | 10 | `10_uccle_hierarchical.py` | Proposed six-summary Uccle analysis with pooled structure |
-| 11 | `11_fixed_and_dynamic_components.py` | Exact SSVS semantics for zero, fixed, and dynamic components |
+| 11 | `11_fixed_and_dynamic_components.py` | Legacy componentwise SSVS semantics; explicit sensitivity model |
 | 12 | `12_gev_ssvs_pgas.py` | Exact GEV SSVS with PGAS-corrected model moves |
 | 13 | `13_leave_future_out.py` | Held-out log score, CRPS, tail scores, and PIT diagnostics |
+| 14 | `14_hierarchical_laplace_then_pgas.py` | Exploratory hierarchical Laplace screen and validated exact PGAS warm start |
+| 15 | `15_hpc_independent_chain.py` | One independently seeded publication PGAS chain per HPC process |
+| 16 | `16_combine_hpc_chains.py` | Combine four checksummed chain archives and run final diagnostics |
 
 ## The unified API
 
@@ -56,6 +59,15 @@ GEV shape where relevant. Monthly seasonality is physically present by
 default and is therefore `fixed` versus `dynamic`, not `absent` versus
 `present`.
 
+The default joint trend model space has four classes: deterministic linear
+trend, RW1 with drift, RW2 smooth changing trend, and full local linear trend.
+All four estimate a slope. Example 11 deliberately demonstrates the older
+componentwise space and is not the recommended primary temperature model.
+
+For mixed/GEV hierarchies, `engine="laplace"` is an exploratory approximation.
+Example 14 shows how to pass its complete fit as `init=` to exact-invariant
+PGAS. The screen changes the start, not the target posterior.
+
 ## What to check before interpretation
 
 1. Split rank-normalized R-hat (target approximately below 1.01) and bulk ESS
@@ -65,7 +77,7 @@ default and is therefore `fixed` versus `dynamic`, not `absent` versus
    state has undefined R-hat/ESS; it is not automatically evidence of perfect
    mixing.
 4. For PGAS, minimum particle ESS, ancestor diversity, path-change rate,
-   changed fraction, and zero unexplained/restored iterations.
+   path-update fraction, and zero unexplained/restored iterations.
 5. Repeat a final mixed analysis with more particles. Agreement is more
    important than a single apparently healthy particle statistic.
 6. Check the stored sign-invariance error. Signed FS innovation scales are
@@ -74,6 +86,21 @@ default and is therefore `fixed` versus `dynamic`, not `absent` versus
    v2.4 rather than silently fixed.
 8. Use held-out prediction for model comparisons. In-sample reconstruction is
    not predictive validation.
+9. Inspect the four joint trend-class probabilities; do not interpret an
+   inactive slope innovation as an absent fitted slope.
+
+## HPC chains
+
+The Slurm array in `examples/hpc/slurm_four_chains.sh` launches four independent
+one-chain jobs. After they finish:
+
+```bash
+python examples/16_combine_hpc_chains.py
+```
+
+This is preferable to allocating all four long PGAS chains inside one Python
+process. `--workers` in Example 15 controls optional within-chain channel
+parallelism and should not exceed the CPUs assigned to that job.
 
 ## Reading the Uccle results
 

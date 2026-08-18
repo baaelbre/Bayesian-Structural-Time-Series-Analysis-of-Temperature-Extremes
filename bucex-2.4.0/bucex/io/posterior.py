@@ -24,8 +24,8 @@ from ..priors import structural as structural_priors
 
 
 FORMAT = "bucex-fit"
-SCHEMA_VERSION = "2.4"
-SUPPORTED_SCHEMA_VERSIONS = {"1.2", "2.0", "2.1", "2.3", "2.4"}
+SCHEMA_VERSION = "2.4.1"
+SUPPORTED_SCHEMA_VERSIONS = {"1.2", "2.0", "2.1", "2.3", "2.4", "2.4.1"}
 
 
 def _prior_classes() -> dict[str, type]:

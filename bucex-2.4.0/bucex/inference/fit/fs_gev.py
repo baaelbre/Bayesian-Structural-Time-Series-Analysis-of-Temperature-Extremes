@@ -245,7 +245,9 @@ class FSGEVKernel:
         horseshoe_state = initialise_horseshoe(self.priors, self.layout)
         triple_gamma_state = initialise_triple_gamma(self.priors, self.layout)
         model_state = initial_structural_state(params_state, self.layout)
-        model_candidates = enumerate_structural_models(self.layout)
+        model_candidates = enumerate_structural_models(
+            self.layout, None if self.priors.ssvs is None else self.priors.ssvs
+        )
         if self.priors.ssvs is not None and not np.isfinite(
             structural_model_log_prior(model_state, self.priors.ssvs)
         ):
@@ -364,6 +366,7 @@ class FSGEVKernel:
             "particle_min_ess": [],
             "particle_mean_unique_ancestors": [],
             "particle_path_changed": [],
+            "particle_path_update_fraction": [],
             "particle_changed_fraction": [],
             "fs_elliptical_slice_steps": [],
             "ssvs_model_move_accepted": [],
@@ -828,14 +831,21 @@ class FSGEVKernel:
                 engine_diagnostics["particle_path_changed"].append(
                     float(successful_pgas_result.path_changed)
                 )
+                update_fraction = float(
+                    successful_pgas_result.path_update_fraction
+                )
+                engine_diagnostics["particle_path_update_fraction"].append(
+                    update_fraction
+                )
                 engine_diagnostics["particle_changed_fraction"].append(
-                    float(successful_pgas_result.changed_fraction)
+                    update_fraction
                 )
             else:
                 for name in (
                     "particle_min_ess",
                     "particle_mean_unique_ancestors",
                     "particle_path_changed",
+                    "particle_path_update_fraction",
                     "particle_changed_fraction",
                 ):
                     engine_diagnostics[name].append(np.nan)

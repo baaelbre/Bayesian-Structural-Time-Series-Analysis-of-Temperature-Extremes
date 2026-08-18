@@ -108,7 +108,7 @@ def inference_plan(
     allowed = (
         {"ffbs"}
         if all_gaussian
-        else ({"pgas"} if is_multiseries else {"laplace", "pgas"})
+        else ({"laplace", "pgas"} if is_multiseries else {"laplace", "pgas"})
     )
     if resolved_engine not in allowed:
         raise ValueError(
@@ -153,6 +153,12 @@ def inference_plan(
             "while retaining separate latent paths. Residual/copula dependence "
             "is not modeled."
         )
+        if resolved_engine == "laplace":
+            warnings.append(
+                "Hierarchical Laplace SSVS is an exploratory approximation. Use "
+                "it for screening or PGAS initialization, and rerun exact PGAS "
+                "for final non-Gaussian inference."
+            )
     state_update = {
         "ffbs": "exact Gaussian FFBS",
         "pgas": "conditional SMC with ancestor sampling",

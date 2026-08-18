@@ -26,8 +26,12 @@ from .diagnostics import (
     leave_future_out, log_predictive_score, pit_diagnostics, posterior_pit,
     quantile_score, rhat, threshold_weighted_crps,
 )
-from .inference import GibbsConfig, InferencePlan, Laplace, MCMC, Particles, ffbs, iterated_laplace, kalman_filter, kalman_smoother, particle_filter, pgas
-from .inference.fit.model_space import ComponentState, StructuralModelState
+from .inference import GibbsConfig, HierarchicalSampler, InferencePlan, Laplace, MCMC, Particles, ffbs, iterated_laplace, kalman_filter, kalman_smoother, particle_filter, pgas
+from .inference.fit.model_space import (
+    ComponentState,
+    StructuralModelState,
+    TrendModelClass,
+)
 from .models import Channel, CompiledMultiSeriesModel, Model, MultiSeriesModel, StructuralModel, StructuralSSM, compile_multiseries_model, structural_model
 from .models.compiler import CompiledModel, DisturbancePath, NonCenteredPath, compile_model
 from .observation import GEV, GEVObs, Gaussian, GaussianObs
@@ -44,6 +48,8 @@ from .priors import (
     regularized_horseshoe_gaussian_priors, regularized_horseshoe_gev_priors,
     regularized_triple_gamma_gaussian_priors,
     regularized_triple_gamma_gev_priors, resolve_hierarchical_priors,
+    calibrate_structural_scales, half_student_t_scale_for_median,
+    structural_scale_implications,
     ssvs_gaussian_priors, ssvs_gev_priors, triple_gamma_gaussian_priors,
     triple_gamma_gev_priors,
 )

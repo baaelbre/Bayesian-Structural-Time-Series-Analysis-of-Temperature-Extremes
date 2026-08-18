@@ -1,5 +1,5 @@
 """Inference configuration, planning and state-update kernels."""
-from .config import GibbsConfig, Laplace, MCMC, Particles
+from .config import GibbsConfig, HierarchicalSampler, Laplace, MCMC, Particles
 from .plan import InferencePlan, inference_plan
 from .state import (
     ffbs,
@@ -15,6 +15,7 @@ __all__ = [
     "GibbsConfig",
     "Laplace",
     "Particles",
+    "HierarchicalSampler",
     "InferencePlan",
     "inference_plan",
     "kalman_filter",

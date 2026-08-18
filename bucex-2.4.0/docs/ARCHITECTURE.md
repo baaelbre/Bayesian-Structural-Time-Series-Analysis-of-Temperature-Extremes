@@ -1,6 +1,6 @@
 # Architecture
 
-Version 2.4 uses one compiled state-space contract, one fitting entry point,
+Version 2.4.1 uses one compiled state-space contract, one fitting entry point,
 and one result type for univariate and hierarchical analyses.
 
 ```text
@@ -11,7 +11,7 @@ bucex/
   observation/         Gaussian and GEV families
   priors/              univariate and hierarchical prior specifications
   inference/
-    config.py          MCMC, Laplace, Particles
+    config.py          MCMC, Laplace, Particles, HierarchicalSampler
     plan.py            compatibility and exactness resolution
     state/             FFBS, Laplace, and PGAS primitives
     fit/               univariate FS/general and hierarchical samplers
@@ -64,11 +64,21 @@ are inserted as a block. Parameters use explicit namespaces such as
 The channels retain separate paths. Dependence is introduced only by the
 prior hierarchy. The joint sampler cycles through:
 
-1. a Gaussian FFBS or GEV PGAS state update for every channel;
+1. a Gaussian FFBS, approximate GEV Laplace, or exact-invariant GEV PGAS state
+   update for every channel;
 2. exact structural allocation updates;
 3. channel observation-parameter updates;
 4. conjugate Dirichlet updates of population allocation probabilities;
 5. exact log-scale slice updates of pooled half-t slab multipliers.
+
+The default structural state combines level and slope innovation indicators
+into four joint trend classes. This keeps the slope coefficient present in
+every class while selecting deterministic linear trend, RW1 with drift, RW2
+smooth changing trend, or the full local linear trend. Fixed/dynamic
+seasonality is selected separately.
+
+Conditional channel updates can use deterministic child seeds and a bounded
+thread pool. This is an execution strategy, not a new model or result type.
 
 ASIS is disabled for this sampler because structural state changes already
 alter the active parameter dimension. Random FS sign switches remain enabled
@@ -108,10 +118,14 @@ conditioned trajectory or alter the invariant posterior target.
 
 ## Persistence
 
-`.bucex` schema 2.4 archives contain JSON metadata and compressed NumPy arrays.
+`.bucex` schema 2.4.1 archives contain JSON metadata and compressed NumPy arrays.
 Loading uses `allow_pickle=False`, verifies SHA-256 checksums, accepts only
 allowlisted archive members, and regenerates the compiled model from the
 stored declarative specification and data.
+
+`FitResult.warm_start()` exports a validated starting draw for a compatible
+multiseries fit. An approximate hierarchical Laplace result can therefore
+initialize PGAS without coupling the two posterior contracts.
 
 ## Extension rule
 

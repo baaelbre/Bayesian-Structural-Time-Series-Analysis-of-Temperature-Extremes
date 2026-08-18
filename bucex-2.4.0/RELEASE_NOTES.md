@@ -1,37 +1,91 @@
-# bucex 2.4.0 release notes
+# bucex 2.4.1 release notes
 
-Version 2.4 focuses the package on a single coherent research design: Bayesian
-structural time-series analysis for one outcome or for several related
-outcomes whose structural behavior is partially pooled.
+Version 2.4.1 completes the hierarchical structural workflow introduced in
+2.4. The package remains focused on univariate models and collections of
+series-specific structural paths whose model choices and/or innovation scales
+are partially pooled.
 
-The recommended paper model gives every temperature summary a separate latent
-level, slope, and annual cycle. A hierarchy can pool exact SSVS allocations,
-normal dynamic-slab magnitudes, or both. This directly estimates whether
-fixed or dynamic behavior recurs across summaries without forcing the paths to
-be identical.
+## Cleaner scientific model space
 
-The default monthly hierarchy treats seasonality as present. SSVS distinguishes
-a fixed annual pattern from an evolving one; it does not ask the physically
-unhelpful question of whether the annual cycle exists.
+Hierarchical SSVS now defaults to four joint trend classes:
 
-Initial level and slope are now estimated posterior parameters. Chain starts
-come from a seasonally adjusted regression, and the level--slope plot uses
-seasonally adjusted observations for a scientifically fair visual comparison.
+1. deterministic linear trend;
+2. RW1 with drift;
+3. RW2 smooth changing trend;
+4. full local linear trend.
 
-This release also fixes guided disturbance PGAS for singular transitions. The
-reference path is projected onto affine support, disturbance recovery uses the
-actual scaled transition loading, and an invalid optional ancestor update keeps
-the validated conditioned predecessor. Mixed hierarchical PGAS should be rerun
-with this release; older incomplete or failed runs should not be reported.
+Every class estimates initial level and slope. Selection concerns level and
+slope innovations, so an inactive slope innovation no longer means an exact
+no-warming forecast. Monthly seasonality remains present and is selected as
+fixed or dynamic. The old componentwise no-slope state is retained only through
+the explicit `model_space="componentwise"` sensitivity option.
 
-For Uccle, the advised sequence is:
+Posterior population probabilities of the four classes are available from
+`fit.hierarchical_trend_model_probabilities()` and through
+`fit.plot("trend_models")`.
 
-1. transparent independent normal-prior fits;
-2. independent SSVS fits;
-3. pooled-selection hierarchy as the main joint analysis;
-4. pooled slab and pooled both as sensitivity analyses;
-5. start-date, hyperprior, particle-count, and predictive sensitivity checks.
+## Hierarchical Laplace and exact PGAS
 
-Indecisive fixed/dynamic probabilities can be a valid finite-record result. If
-R-hat, ESS, chain overlap, switching, ACF, and PGAS diagnostics are sound, the
-uncertainty should be reported rather than forced into a hard classification.
+Mixed and all-GEV multiseries models now support an exploratory hierarchical
+Laplace engine. Its `InferencePlan` clearly marks the fit approximate. A
+complete screening fit can be passed directly to exact-invariant PGAS:
+
+```python
+screen = bx.fit(data, model, engine="laplace", ...)
+exact = bx.fit(data, model, engine="pgas", init=screen, ...)
+```
+
+The validated warm start carries channel parameters, latent paths, hierarchy
+probabilities, and slab scales. It changes only the start; PGAS still runs full
+warmup and targets its declared posterior. `FitResult.warm_start()` exposes the
+same conversion explicitly.
+
+`HierarchicalSampler(initializer="laplace", channel_workers=n)` provides a
+lighter internal Laplace initialization and optional concurrent channel
+updates.
+
+## PGAS performance and robustness
+
+- Vectorized GEV particle observation weights and complete-path likelihoods.
+- Vectorized Laplace pseudo-data calculations.
+- Optional deterministic per-channel thread updates within a hierarchy sweep.
+- Grouped `xi=(channel:value,...)` progress output for mixed models.
+- Renamed the ambiguous changed-fraction diagnostic to
+  `path_update_fraction`; the old name remains a deprecated compatibility
+  alias.
+- Retained the 2.4 singular-support guided disturbance fix, initial-slope
+  correction, conditioned-predecessor fallback, and Joseph-form covariance
+  handling.
+
+## Priors and calibration
+
+The primary hierarchy continues to use normal SSVS slabs, optionally with a
+shared half-Student-t scale multiplier. New helpers translate expert bounds on
+accumulated level change, change in decadal warming rate, and seasonal
+innovations into coefficient scales:
+
+- `calibrate_structural_scales()`;
+- `structural_scale_implications()`;
+- `half_student_t_scale_for_median()`.
+
+This makes slab calibration reproducible and helps avoid Bartlett's paradox
+from arbitrarily diffuse model-selection slabs.
+
+## Reproducible examples and HPC
+
+Three examples complete the workflow:
+
+- Example 14: hierarchical Laplace screen followed by warm-started PGAS;
+- Example 15: one independently seeded publication chain per HPC process;
+- Example 16: combine four checksummed archives and run final diagnostics.
+
+A Slurm array template is included in `examples/hpc/slurm_four_chains.sh`.
+
+## Interpretation
+
+The recommended Uccle analysis is pooled structural selection over the four
+trend classes, with fixed/dynamic seasonality and a scientifically calibrated
+normal slab. Pooled slab magnitude is a sensitivity analysis. Laplace is for
+exploration; final mixed/GEV results use PGAS. Model probabilities and
+model-averaged paths should be reported rather than forcing uncertain classes
+into a hard decision.

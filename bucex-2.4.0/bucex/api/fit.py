@@ -13,7 +13,13 @@ from ..__about__ import __version__
 from ..components import DummySeasonal, LocalLinearTrend
 from ..core.fit import BulkTailFit, FitResult, combine_fits
 from ..inference.fit._fs_output import FSOutput
-from ..inference.config import GibbsConfig, Laplace, MCMC, Particles
+from ..inference.config import (
+    GibbsConfig,
+    HierarchicalSampler,
+    Laplace,
+    MCMC,
+    Particles,
+)
 from ..inference.fit.disturbance import sample_posterior
 from ..inference.fit.hierarchical import sample_hierarchical_posterior
 from ..inference.fit.fs_gaussian import FSGaussianKernel
@@ -271,6 +277,7 @@ def _stack_fs_chains(
         "particle_min_ess",
         "particle_mean_unique_ancestors",
         "particle_path_changed",
+        "particle_path_update_fraction",
         "particle_changed_fraction",
         "fs_elliptical_slice_steps",
         "ssvs_model_move_accepted",
@@ -475,7 +482,8 @@ def _fit_multiseries_model(
     mcmc: MCMC | None,
     particles: Particles | int | None,
     laplace: Laplace | None,
-    init: Mapping[str, Any] | None,
+    hierarchical_sampler: HierarchicalSampler | None,
+    init: Mapping[str, Any] | FitResult | None,
     dates: Array | None,
     name: str | None,
     config: GibbsConfig | None,
@@ -519,6 +527,15 @@ def _fit_multiseries_model(
     resolved_laplace = Laplace() if laplace is None else laplace
     if not isinstance(resolved_laplace, Laplace):
         raise TypeError("laplace must be Laplace(...).")
+    resolved_hierarchical_sampler = (
+        HierarchicalSampler()
+        if hierarchical_sampler is None
+        else hierarchical_sampler
+    )
+    if not isinstance(resolved_hierarchical_sampler, HierarchicalSampler):
+        raise TypeError(
+            "hierarchical_sampler must be HierarchicalSampler(...)."
+        )
     resolved_plan = inference_plan(
         compiled,
         engine=engine,
@@ -534,6 +551,14 @@ def _fit_multiseries_model(
         raise ValueError("ASIS is not combined with the joint hierarchical sampler.")
     resolved_plan = replace(resolved_plan, backend="hierarchical_state_space")
     resolved_priors = resolve_hierarchical_priors(compiled, priors)
+    if isinstance(init, FitResult):
+        if not init.is_multiseries_model:
+            raise ValueError("A multiseries fit is required as a multiseries warm start.")
+        if init.model != model:
+            raise ValueError("The warm-start fit uses a different multiseries model.")
+        if not np.array_equal(np.asarray(init.y), y_model, equal_nan=True):
+            raise ValueError("The warm-start fit uses different observations.")
+        init = init.warm_start()
     return sample_hierarchical_posterior(
         y_model,
         compiled,
@@ -542,6 +567,7 @@ def _fit_multiseries_model(
         mcmc=resolved_mcmc,
         particles=resolved_particles,
         laplace=resolved_laplace,
+        sampler=resolved_hierarchical_sampler,
         dates=dates,
         initial_parameters=init,
     )
@@ -562,7 +588,8 @@ def fit(
     mcmc: MCMC | None = None,
     particles: Particles | int | None = None,
     laplace: Laplace | None = None,
-    init: Mapping[str, Any] | None = None,
+    hierarchical_sampler: HierarchicalSampler | None = None,
+    init: Mapping[str, Any] | FitResult | None = None,
     init_params_state: Mapping[str, Any] | None = None,
     init_params_obs: Mapping[str, Any] | None = None,
     dates: Array | None = None,
@@ -633,6 +660,7 @@ def fit(
             mcmc=mcmc,
             particles=particles,
             laplace=laplace,
+            hierarchical_sampler=hierarchical_sampler,
             init=init,
             dates=dates,
             name=name,
@@ -644,6 +672,12 @@ def fit(
             seed=seed,
             progress=progress,
         )
+    if hierarchical_sampler is not None:
+        raise ValueError(
+            "hierarchical_sampler= is only valid for MultiSeriesModel fits."
+        )
+    if isinstance(init, FitResult):
+        raise ValueError("FitResult warm starts are currently multiseries-only.")
     if model is None:
         family = "gaussian" if family is None else family
         model = _default_model(family, period, trend or "local_linear")

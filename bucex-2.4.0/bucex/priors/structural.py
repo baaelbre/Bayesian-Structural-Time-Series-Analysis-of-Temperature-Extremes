@@ -558,6 +558,7 @@ class SSVSPrior:
     level_dynamic_probability: float = 0.5
     trend_probabilities: Sequence[float] = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
     season_probabilities: Sequence[float] = (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+    trend_model_probabilities: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         required = {"level", "trend", "season"}
@@ -578,6 +579,31 @@ class SSVSPrior:
                 raise ValueError(f"{name} must contain (zero, fixed, dynamic).")
             if np.any(values < 0.0) or not np.isclose(values.sum(), 1.0):
                 raise ValueError(f"{name} entries must be non-negative and sum to one.")
+        if self.trend_model_probabilities is not None:
+            required_models = {
+                "linear_trend",
+                "rw1_drift",
+                "rw2_smooth_trend",
+                "local_linear_trend",
+            }
+            supplied_models = set(self.trend_model_probabilities)
+            if supplied_models != required_models:
+                raise ValueError(
+                    "trend_model_probabilities must contain exactly "
+                    f"{sorted(required_models)}."
+                )
+            model_probabilities = np.asarray(
+                [self.trend_model_probabilities[name] for name in sorted(required_models)],
+                dtype=float,
+            )
+            if (
+                np.any(~np.isfinite(model_probabilities))
+                or np.any(model_probabilities < 0.0)
+                or not np.isclose(model_probabilities.sum(), 1.0)
+            ):
+                raise ValueError(
+                    "trend_model_probabilities must be non-negative and sum to one."
+                )
 
 @dataclass(frozen=True)
 class FSGaussianPriors:

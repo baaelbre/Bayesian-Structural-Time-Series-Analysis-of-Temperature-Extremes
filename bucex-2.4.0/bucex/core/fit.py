@@ -570,6 +570,51 @@ class FitResult:
         except ImportError:
             return rows
 
+    def hierarchical_trend_model_probabilities(
+        self, credible_interval: float = 0.90
+    ):
+        """Posterior probabilities of the four joint trend-evolution classes.
+
+        The classes are linear trend, RW1 with drift, RW2 smooth changing
+        trend, and the full local-linear trend.  Unlike marginal level/slope
+        allocations, these probabilities answer the structural question
+        directly and always retain an estimated slope.
+        """
+
+        rows = []
+        prefix = "hierarchy.model_prob."
+        alpha = 1.0 - float(credible_interval)
+        for key in self.parameter_draws:
+            if not key.startswith(prefix):
+                continue
+            model = key.removeprefix(prefix)
+            values = np.asarray(self.parameter(key), dtype=float)
+            lower, upper = np.quantile(values, [alpha / 2.0, 1.0 - alpha / 2.0])
+            rows.append(
+                {
+                    "model": model,
+                    "mean": float(np.mean(values)),
+                    "median": float(np.median(values)),
+                    "lower": float(lower),
+                    "upper": float(upper),
+                }
+            )
+        if not rows:
+            raise ValueError("This fit does not use the joint trend model space.")
+        order = {
+            "linear_trend": 0,
+            "rw1_drift": 1,
+            "rw2_smooth_trend": 2,
+            "local_linear_trend": 3,
+        }
+        rows.sort(key=lambda row: order.get(row["model"], 99))
+        try:
+            import pandas as pd
+
+            return pd.DataFrame(rows).set_index("model")
+        except ImportError:
+            return rows
+
     def hierarchical_slab_summary(self, credible_interval: float = 0.90):
         """Posterior summaries of shared dynamic-slab multipliers."""
 
@@ -975,6 +1020,138 @@ class FitResult:
         from ..plotting import plot_fit
 
         return plot_fit(self, kind=kind if type is None else type, **kwargs)
+
+    def warm_start(
+        self,
+        *,
+        chain: int | None = None,
+        draw: int | None = None,
+    ) -> dict[str, Any]:
+        """Export one multiseries posterior draw as a new sampler start.
+
+        With no indices, the finite draw with the largest stored log posterior
+        is selected.  Passing both ``chain=`` and ``draw=`` selects a specific
+        zero-based draw.  The returned mapping can be supplied directly as
+        ``init=`` in a compatible multiseries fit.  In particular, this makes
+        the intended exploratory-Laplace-to-exact-PGAS workflow explicit.
+
+        The export contains scientific parameters, the centred latent path,
+        shared structural probabilities, and shared slab scales.  The target
+        sampler converts each centred path back to its non-centred FS state
+        using the exported signed innovation scales.
+        """
+
+        if not self.is_multiseries_model:
+            raise ValueError("warm_start() is currently available for multiseries fits.")
+        if (chain is None) != (draw is None):
+            raise ValueError("Give both chain= and draw=, or omit both.")
+        if chain is None:
+            scores = np.asarray(self.log_posterior, dtype=float)
+            finite = np.isfinite(scores)
+            if not np.any(finite):
+                chain_index, draw_index = self.n_chains - 1, self.draws_per_chain - 1
+            else:
+                ranked = np.where(finite, scores, -np.inf)
+                chain_index, draw_index = np.unravel_index(
+                    int(np.argmax(ranked)), ranked.shape
+                )
+                chain_index, draw_index = int(chain_index), int(draw_index)
+        else:
+            chain_index, draw_index = int(chain), int(draw)
+            if not 0 <= chain_index < self.n_chains:
+                raise IndexError("chain is outside the stored chain range.")
+            if not 0 <= draw_index < self.draws_per_chain:
+                raise IndexError("draw is outside the stored draw range.")
+
+        output: dict[str, Any] = {
+            "__warm_start__": {
+                "source_engine": self.plan.engine,
+                "chain": chain_index,
+                "draw": draw_index,
+            }
+        }
+        blocks = {
+            block.name: block
+            for block in self.compiled.blocks
+            if getattr(block, "kind", None) == "channel"
+        }
+        for name in self.channel_names:
+            prefix = f"channel.{name}."
+            level_key = f"initial.channel.{name}.level"
+            slope_key = f"initial.channel.{name}.slope"
+            season_key = f"initial.channel.{name}.seasonal"
+            output[prefix + "initial.level"] = float(
+                np.asarray(self.parameter_draws[level_key])[chain_index, draw_index]
+            )
+            if slope_key in self.parameter_draws:
+                output[prefix + "initial.slope"] = float(
+                    np.asarray(self.parameter_draws[slope_key])[chain_index, draw_index]
+                )
+            if season_key in self.parameter_draws:
+                output[prefix + "initial.seasonal"] = np.asarray(
+                    self.parameter_draws[season_key]
+                )[chain_index, draw_index].copy()
+            for process, signed_name in (
+                ("level", "s_level"),
+                ("slope", "s_trend"),
+                ("seasonal", "s_season"),
+            ):
+                key = f"signed_sd.channel.{name}.{process}"
+                if key in self.parameter_draws:
+                    output[prefix + signed_name] = float(
+                        np.asarray(self.parameter_draws[key])[chain_index, draw_index]
+                    )
+            output[prefix + "sigma"] = float(
+                np.asarray(self.parameter_draws[f"sigma.{name}"])[
+                    chain_index, draw_index
+                ]
+            )
+            xi_key = f"xi.{name}"
+            if xi_key in self.parameter_draws:
+                output[prefix + "xi"] = float(
+                    np.asarray(self.parameter_draws[xi_key])[chain_index, draw_index]
+                )
+            output[prefix + "__centered_path"] = np.asarray(
+                self.state_draws[chain_index, draw_index, :, blocks[name].state_slice],
+                dtype=float,
+            ).copy()
+
+        trend_names = (
+            "linear_trend",
+            "rw1_drift",
+            "rw2_smooth_trend",
+            "local_linear_trend",
+        )
+        trend_keys = [f"hierarchy.model_prob.{name}" for name in trend_names]
+        if all(key in self.parameter_draws for key in trend_keys):
+            output["hierarchy.trend_model_probabilities"] = np.asarray(
+                [
+                    self.parameter_draws[key][chain_index, draw_index]
+                    for key in trend_keys
+                ],
+                dtype=float,
+            )
+        labels = {
+            "level": ("fixed", "dynamic"),
+            "trend": ("zero", "fixed", "dynamic"),
+            "season": ("zero", "fixed", "dynamic"),
+        }
+        for component, names in labels.items():
+            keys = [f"hierarchy.prob.{component}.{name}" for name in names]
+            if all(key in self.parameter_draws for key in keys):
+                output[f"hierarchy.prob.{component}"] = np.asarray(
+                    [
+                        self.parameter_draws[key][chain_index, draw_index]
+                        for key in keys
+                    ],
+                    dtype=float,
+                )
+            scale_key = f"hierarchy.slab_scale.{component}"
+            if scale_key in self.parameter_draws:
+                output[scale_key] = float(
+                    self.parameter_draws[scale_key][chain_index, draw_index]
+                )
+        return output
 
     def save(self, path: str | Path) -> None:
         from ..io import save_fit

@@ -23,6 +23,48 @@ class ComponentState(IntEnum):
         return {0: "zero", 1: "fixed", 2: "dynamic"}[int(self)]
 
 
+class TrendModelClass(IntEnum):
+    """Joint evolution class for a level and its always-present slope."""
+
+    LINEAR_TREND = 0
+    RW1_WITH_DRIFT = 1
+    RW2_SMOOTH_TREND = 2
+    LOCAL_LINEAR_TREND = 3
+
+    @property
+    def label(self) -> str:
+        return (
+            "linear_trend",
+            "rw1_drift",
+            "rw2_smooth_trend",
+            "local_linear_trend",
+        )[int(self)]
+
+
+_TREND_CLASS_STATES = {
+    TrendModelClass.LINEAR_TREND: (ComponentState.FIXED, ComponentState.FIXED),
+    TrendModelClass.RW1_WITH_DRIFT: (ComponentState.DYNAMIC, ComponentState.FIXED),
+    TrendModelClass.RW2_SMOOTH_TREND: (ComponentState.FIXED, ComponentState.DYNAMIC),
+    TrendModelClass.LOCAL_LINEAR_TREND: (
+        ComponentState.DYNAMIC,
+        ComponentState.DYNAMIC,
+    ),
+}
+
+
+def trend_model_class(state: "StructuralModelState") -> TrendModelClass:
+    """Map level/slope innovation allocation to its scientific trend class."""
+
+    pair = (state.level, state.trend)
+    for model_class, states in _TREND_CLASS_STATES.items():
+        if pair == states:
+            return model_class
+    raise ValueError(
+        "A zero slope is outside the joint trend model space; use the legacy "
+        "componentwise SSVS model space when an absent slope is required."
+    )
+
+
 @dataclass(frozen=True)
 class StructuralModelState:
     """One zero/fixed/dynamic structural specification.
@@ -79,8 +121,26 @@ class ExactStructuralSelectionResult:
     elliptical_slice_steps: int
 
 
-def enumerate_structural_models(layout: Any) -> tuple[StructuralModelState, ...]:
+def enumerate_structural_models(
+    layout: Any,
+    ssvs: Any | None = None,
+) -> tuple[StructuralModelState, ...]:
     """Enumerate the complete structural model space supported by ``layout``."""
+
+    joint = getattr(ssvs, "trend_model_probabilities", None)
+    if joint is not None:
+        if not bool(layout.has_beta):
+            raise ValueError("The joint trend model space requires a slope state.")
+        season_states = (
+            (ComponentState.FIXED, ComponentState.DYNAMIC)
+            if int(layout.season_dim) > 0
+            else (ComponentState.ZERO,)
+        )
+        return tuple(
+            StructuralModelState(level=level, trend=trend, season=season)
+            for level, trend in _TREND_CLASS_STATES.values()
+            for season in season_states
+        )
 
     level_states = (ComponentState.FIXED, ComponentState.DYNAMIC)
     trend_states = (
@@ -223,6 +283,19 @@ def _component_probability(
 
 def structural_model_log_prior(state: StructuralModelState, ssvs: Any) -> float:
     """Log prior probability of one structural model."""
+
+    joint = getattr(ssvs, "trend_model_probabilities", None)
+    if joint is not None:
+        try:
+            model_probability = float(joint[trend_model_class(state).label])
+        except (KeyError, ValueError):
+            return -np.inf
+        p_season = _component_probability(
+            state.season, tuple(ssvs.season_probabilities)
+        )
+        if min(model_probability, p_season) <= 0.0:
+            return -np.inf
+        return float(np.log(model_probability) + np.log(p_season))
 
     p_level = (
         float(ssvs.level_dynamic_probability)
@@ -430,7 +503,7 @@ def sample_structural_regression(
     if getattr(priors, "ssvs", None) is None:
         raise ValueError("sample_structural_regression requires priors.ssvs.")
 
-    candidates = enumerate_structural_models(layout)
+    candidates = enumerate_structural_models(layout, priors.ssvs)
     log_weights = np.full(len(candidates), -np.inf, dtype=float)
     cache: list[tuple[list[str], Array, Array] | None] = [None] * len(candidates)
 
@@ -545,7 +618,7 @@ def sample_structural_regression_exact(
     if X.shape != (y.size, len(theta_names)) or pseudo_y.size != y.size:
         raise ValueError("X, y, pseudo_y, and theta_names have incompatible shapes.")
 
-    candidates = enumerate_structural_models(layout)
+    candidates = enumerate_structural_models(layout, priors.ssvs)
     if current_state not in candidates:
         raise ValueError("current_state is not supported by this model layout.")
     current_index = candidates.index(current_state)

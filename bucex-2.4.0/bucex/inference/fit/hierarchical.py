@@ -8,6 +8,7 @@ updates of those hyperparameters.
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from time import perf_counter
 from typing import Any, Mapping
@@ -20,7 +21,7 @@ from ...models.multiseries_compiler import CompiledMultiSeriesModel
 from ...models.structural import Model
 from ...priors.hierarchical import HierarchicalPriors
 from ...priors.structural import FSGaussianPriors, FSGEVPriors
-from ..config import Laplace, MCMC, Particles
+from ..config import HierarchicalSampler, Laplace, MCMC, Particles
 from ..plan import InferencePlan
 from ._progress import (
     compact_group,
@@ -39,6 +40,8 @@ from .fs_utils import (
     elliptical_slice_gaussian_prior,
     ffbs_gaussian_1d,
     infer_ncp_layout,
+    iterated_laplace_ncp,
+    map_centered_to_ncp,
     map_ncp_to_centered,
     measurement_vector,
     mu_from_ncp,
@@ -49,9 +52,11 @@ from .fs_utils import (
 from .model_space import (
     ComponentState,
     StructuralModelState,
+    TrendModelClass,
     initial_structural_state,
     sample_structural_regression,
     sample_structural_regression_exact,
+    trend_model_class,
 )
 
 
@@ -147,6 +152,7 @@ def _initial_channel_state(
             if key.startswith(prefix):
                 local[key.removeprefix(prefix)] = value
                 break
+    centered_path = local.pop("__centered_path", None)
     aliases = {
         "intercept": "alpha0",
         "initial.level": "alpha0",
@@ -168,7 +174,17 @@ def _initial_channel_state(
     state = canonicalize_ncp_params(state, layout)
     observation["sigma2"] = float(observation["sigma"]) ** 2
     model_state = initial_structural_state(state, layout)
-    z_path = np.zeros((y.size + 1, layout.ncp_state_dim), dtype=float)
+    if centered_path is None:
+        z_path = np.zeros((y.size + 1, layout.ncp_state_dim), dtype=float)
+    else:
+        centered = np.asarray(centered_path, dtype=float)
+        expected = (y.size + 1, layout.centered_state_dim)
+        if centered.shape != expected or not np.all(np.isfinite(centered)):
+            raise ValueError(
+                f"Warm-start path for channel '{name}' must have shape {expected} "
+                "and contain only finite values."
+            )
+        z_path = map_centered_to_ncp(centered, state, layout)
     if family == "gev" and not _gev_support_ok(
         y, mu_from_ncp(z_path, state, layout), model, observation
     ):
@@ -270,6 +286,7 @@ def _update_hierarchy(
         "trend": np.zeros(3, dtype=float),
         "season": np.zeros(3, dtype=float),
     }
+    model_counts = np.zeros(4, dtype=float)
     coefficients: dict[str, list[float]] = {name: [] for name in _COMPONENTS}
     for item in states:
         counts["level"][0 if item.model_state.level == ComponentState.FIXED else 1] += 1.0
@@ -277,6 +294,8 @@ def _update_hierarchy(
             counts["trend"][int(item.model_state.trend)] += 1.0
         if item.layout.season_dim > 0:
             counts["season"][int(item.model_state.season)] += 1.0
+        if hierarchy.uses_joint_trend_space:
+            model_counts[int(trend_model_class(item.model_state))] += 1.0
         if item.model_state.level == ComponentState.DYNAMIC:
             coefficients["level"].append(float(item.params_state["s_level"]))
         if item.model_state.trend == ComponentState.DYNAMIC:
@@ -284,13 +303,41 @@ def _update_hierarchy(
         if item.model_state.season == ComponentState.DYNAMIC:
             coefficients["season"].append(float(item.params_state["s_season"]))
     probabilities: dict[str, Array] = {}
-    for name in _COMPONENTS:
-        probabilities[name] = hierarchy.initial_probabilities(name)
+    if hierarchy.uses_joint_trend_space:
+        model_probabilities = hierarchy.initial_model_probabilities()
         if hierarchy.pools_selection:
-            indices = hierarchy.allowed_indices(name)
-            probabilities[name][indices] = rng.dirichlet(
-                hierarchy.concentration(name) + counts[name][indices]
+            model_probabilities = rng.dirichlet(
+                np.asarray(hierarchy.trend_model_concentration, dtype=float)
+                + model_counts
             )
+        probabilities["trend_model"] = model_probabilities
+        probabilities["level"] = np.asarray(
+            (
+                model_probabilities[0] + model_probabilities[2],
+                model_probabilities[1] + model_probabilities[3],
+            )
+        )
+        probabilities["trend"] = np.asarray(
+            (
+                0.0,
+                model_probabilities[0] + model_probabilities[1],
+                model_probabilities[2] + model_probabilities[3],
+            )
+        )
+        probabilities["season"] = hierarchy.initial_probabilities("season")
+        if hierarchy.pools_selection:
+            indices = hierarchy.allowed_indices("season")
+            probabilities["season"][indices] = rng.dirichlet(
+                hierarchy.concentration("season") + counts["season"][indices]
+            )
+    else:
+        for name in _COMPONENTS:
+            probabilities[name] = hierarchy.initial_probabilities(name)
+            if hierarchy.pools_selection:
+                indices = hierarchy.allowed_indices(name)
+                probabilities[name][indices] = rng.dirichlet(
+                    hierarchy.concentration(name) + counts[name][indices]
+                )
     slab = {}
     for name in _COMPONENTS:
         current = float(current_slab[name])
@@ -481,7 +528,13 @@ def _gev_step(
                 np.mean(pgas_result.unique_ancestors[1:])
             ),
             "particle_path_changed": float(pgas_result.path_changed),
-            "particle_changed_fraction": float(pgas_result.changed_fraction),
+            "particle_path_update_fraction": float(
+                pgas_result.path_update_fraction
+            ),
+            # Kept in the serialized diagnostics for 2.4 compatibility.
+            "particle_changed_fraction": float(
+                pgas_result.path_update_fraction
+            ),
             "ssvs_model_move_accepted": float(selection.move_accepted),
             "ssvs_model_proposed_change": float(
                 selection.proposed_index != last[4]
@@ -508,9 +561,177 @@ def _gev_step(
         )
 
 
+def _gev_laplace_step(
+    state: _ChannelState,
+    prior: FSGEVPriors,
+    laplace: Laplace,
+    rng: np.random.Generator,
+) -> tuple[float, dict[str, float], bool, bool, bool]:
+    """Exploratory approximate GEV update for hierarchical screening.
+
+    The state path and structural regression use the iterated Gaussian
+    approximation. Observation parameters are still updated against the exact
+    GEV likelihood. This kernel is intentionally labelled approximate in the
+    inference plan and fit metadata.
+    """
+
+    assert state.gev_kernel is not None
+    state.gev_kernel.priors = prior
+    state.gev_kernel.rng = rng
+    last = (
+        state.z_path.copy(),
+        dict(state.params_state),
+        dict(state.params_obs),
+        state.model_state,
+        state.model_index,
+    )
+    try:
+        result = iterated_laplace_ncp(
+            state.y,
+            state.model,
+            state.params_state,
+            state.params_obs,
+            state.layout,
+            initial_path=state.z_path,
+            rng=rng,
+            max_iterations=int(laplace.max_iterations),
+            tolerance=float(laplace.tolerance),
+            curvature_floor=float(laplace.curvature_floor),
+            maximum_variance=float(laplace.maximum_variance),
+            draw_attempts=int(laplace.draw_attempts),
+        )
+        state.z_path = result.z_path
+        X, theta_names, tbar = design_matrix_ncp(
+            state.z_path, state.layout, center_time=True
+        )
+        selection = sample_structural_regression(
+            y=result.pseudo_y,
+            X=X,
+            theta_names=theta_names,
+            tbar=tbar,
+            noise_variance=result.pseudo_variance,
+            priors=prior,
+            layout=state.layout,
+            rng=rng,
+            apply_theta_draw=apply_theta_draw,
+        )
+        state.params_state.update(selection.params_state)
+        state.model_state = selection.state
+        state.model_index = int(selection.selected_index)
+        switches, sign_error = _sign_move(state, rng)
+        mu = mu_from_ncp(state.z_path, state.params_state, state.layout)
+        if not _gev_support_ok(state.y, mu, state.model, state.params_obs):
+            raise ValueError("GEV support failed after Laplace structural update.")
+        state.params_obs, accepted_sigma = state.gev_kernel._mh_update_log_sigma(
+            state.y, mu, state.params_obs
+        )
+        state.params_obs, accepted_xi = state.gev_kernel._mh_update_xi(
+            state.y, mu, state.params_obs
+        )
+        log_likelihood = _exact_gev_loglik(
+            state.y, mu, state.model, state.params_obs
+        )
+        if not np.isfinite(log_likelihood):
+            raise ValueError("GEV observation update left the finite support.")
+        changed_model = float(state.model_index != last[4])
+        metrics = {
+            "laplace_iterations": float(result.iterations),
+            "laplace_converged": float(result.converged),
+            "laplace_relative_change": float(result.relative_change),
+            "laplace_support_rejections": float(result.support_rejections),
+            "ssvs_model_move_accepted": changed_model,
+            "ssvs_model_proposed_change": changed_model,
+            "sign_error": sign_error,
+            **{f"sign_{name}": float(value) for name, value in switches.items()},
+        }
+        return (
+            float(log_likelihood),
+            metrics,
+            bool(accepted_sigma),
+            bool(accepted_xi),
+            False,
+        )
+    except (FloatingPointError, ValueError, np.linalg.LinAlgError):
+        (
+            state.z_path,
+            state.params_state,
+            state.params_obs,
+            state.model_state,
+            state.model_index,
+        ) = last
+        mu = mu_from_ncp(state.z_path, state.params_state, state.layout)
+        return (
+            float(_exact_gev_loglik(state.y, mu, state.model, state.params_obs)),
+            {},
+            False,
+            False,
+            True,
+        )
+
+
+def _laplace_initialize_channel(
+    state: _ChannelState,
+    laplace: Laplace,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    """Create a support-valid GEV starting path without changing the PGAS target."""
+
+    if state.family != "gev":
+        return {"channel": state.name, "used": False, "reason": "gaussian"}
+    try:
+        result = iterated_laplace_ncp(
+            state.y,
+            state.model,
+            state.params_state,
+            state.params_obs,
+            state.layout,
+            initial_path=state.z_path,
+            rng=rng,
+            max_iterations=int(laplace.max_iterations),
+            tolerance=float(laplace.tolerance),
+            curvature_floor=float(laplace.curvature_floor),
+            maximum_variance=float(laplace.maximum_variance),
+            draw_attempts=int(laplace.draw_attempts),
+        )
+        state.z_path = result.z_path
+        return {
+            "channel": state.name,
+            "used": True,
+            "converged": bool(result.converged),
+            "iterations": int(result.iterations),
+            "relative_change": float(result.relative_change),
+            "support_rejections": int(result.support_rejections),
+        }
+    except (FloatingPointError, ValueError, np.linalg.LinAlgError) as error:
+        return {
+            "channel": state.name,
+            "used": False,
+            "reason": type(error).__name__,
+        }
+
+
+def _channel_step(
+    state: _ChannelState,
+    prior: FSGaussianPriors | FSGEVPriors,
+    engine: str,
+    particles: Particles,
+    laplace: Laplace,
+    rng: np.random.Generator,
+) -> tuple[float, dict[str, float], bool, bool, bool]:
+    """One conditionally independent channel update with a uniform contract."""
+
+    if state.family == "gaussian":
+        log_likelihood, metrics = _gaussian_step(state, prior, rng)
+        return log_likelihood, metrics, False, False, False
+    if engine == "laplace":
+        return _gev_laplace_step(state, prior, laplace, rng)
+    return _gev_step(state, prior, particles, laplace, rng)
+
+
 def _parameter_storage(
     compiled: CompiledMultiSeriesModel,
     states: list[_ChannelState],
+    priors: HierarchicalPriors,
     chains: int,
     draws: int,
 ) -> dict[str, Array]:
@@ -553,6 +774,14 @@ def _parameter_storage(
         output[f"hierarchy.slab_scale.{component}"] = np.zeros(
             (chains, draws)
         )
+    if priors.hierarchy.uses_joint_trend_space:
+        for name in (
+            "linear_trend",
+            "rw1_drift",
+            "rw2_smooth_trend",
+            "local_linear_trend",
+        ):
+            output[f"hierarchy.model_prob.{name}"] = np.zeros((chains, draws))
     return output
 
 
@@ -608,6 +837,99 @@ def _store_parameters(
         output[f"hierarchy.slab_scale.{component}"][chain, draw] = float(
             slab[component]
         )
+    if "trend_model" in probabilities:
+        for index, name in enumerate(
+            (
+                "linear_trend",
+                "rw1_drift",
+                "rw2_smooth_trend",
+                "local_linear_trend",
+            )
+        ):
+            output[f"hierarchy.model_prob.{name}"][chain, draw] = float(
+                probabilities["trend_model"][index]
+            )
+
+
+def _normalized_probabilities(
+    values: Any,
+    *,
+    size: int,
+    label: str,
+) -> Array:
+    output = np.asarray(values, dtype=float).reshape(-1)
+    if (
+        output.size != int(size)
+        or np.any(~np.isfinite(output))
+        or np.any(output < 0.0)
+        or float(output.sum()) <= 0.0
+    ):
+        raise ValueError(
+            f"Warm-start {label} must contain {size} finite non-negative "
+            "values with a positive sum."
+        )
+    return output / float(output.sum())
+
+
+def _initial_hierarchy(
+    hierarchy: Any,
+    initial: Mapping[str, Any] | None,
+) -> tuple[dict[str, Array], dict[str, float]]:
+    """Resolve default or exported shared-hierarchy starting values."""
+
+    probabilities = {
+        component: hierarchy.initial_probabilities(component)
+        for component in _COMPONENTS
+    }
+    if hierarchy.uses_joint_trend_space:
+        probabilities["trend_model"] = hierarchy.initial_model_probabilities()
+    slab = {
+        component: float(hierarchy.initial_slab_scale[component])
+        for component in _COMPONENTS
+    }
+    if initial is None:
+        return probabilities, slab
+
+    supplied = dict(initial)
+    if hierarchy.pools_selection:
+        if hierarchy.uses_joint_trend_space and (
+            "hierarchy.trend_model_probabilities" in supplied
+        ):
+            model = _normalized_probabilities(
+                supplied["hierarchy.trend_model_probabilities"],
+                size=4,
+                label="trend-model probabilities",
+            )
+            probabilities["trend_model"] = model
+            probabilities["level"] = np.asarray(
+                (model[0] + model[2], model[1] + model[3]), dtype=float
+            )
+            probabilities["trend"] = np.asarray(
+                (0.0, model[0] + model[1], model[2] + model[3]), dtype=float
+            )
+        elif not hierarchy.uses_joint_trend_space:
+            for component, size in (("level", 2), ("trend", 3)):
+                key = f"hierarchy.prob.{component}"
+                if key in supplied:
+                    probabilities[component] = _normalized_probabilities(
+                        supplied[key], size=size, label=f"{component} probabilities"
+                    )
+        season_key = "hierarchy.prob.season"
+        if season_key in supplied:
+            probabilities["season"] = _normalized_probabilities(
+                supplied[season_key], size=3, label="season probabilities"
+            )
+
+    if hierarchy.pools_slab:
+        for component in _COMPONENTS:
+            key = f"hierarchy.slab_scale.{component}"
+            if key not in supplied:
+                continue
+            value = float(supplied[key])
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"Warm-start {key} must be finite and positive.")
+            slab[component] = value
+    return probabilities, slab
 
 
 def sample_hierarchical_posterior(
@@ -619,10 +941,15 @@ def sample_hierarchical_posterior(
     mcmc: MCMC,
     particles: Particles,
     laplace: Laplace,
+    sampler: HierarchicalSampler,
     dates: Array | None = None,
     initial_parameters: Mapping[str, Any] | None = None,
 ) -> FitResult:
-    """Run the exact joint hierarchy for Gaussian and/or GEV channels."""
+    """Run joint hierarchical inference for Gaussian and/or GEV channels.
+
+    Gaussian FFBS and non-Gaussian PGAS target the exact posterior. The
+    hierarchical Laplace engine is an explicitly exploratory approximation.
+    """
 
     values = np.asarray(y, dtype=float)
     if values.ndim != 2 or values.shape[1] != len(compiled.channel_names):
@@ -633,8 +960,8 @@ def sample_hierarchical_posterior(
         )
     if plan.parameterization != "fruehwirth_schnatter":
         raise ValueError("Hierarchical inference requires parameterization='fs'.")
-    if plan.engine not in {"ffbs", "pgas"}:
-        raise ValueError("Hierarchical inference supports exact FFBS or PGAS, not Laplace.")
+    if plan.engine not in {"ffbs", "laplace", "pgas"}:
+        raise ValueError("Hierarchical inference supports FFBS, Laplace, or PGAS.")
     if plan.asis:
         raise ValueError("ASIS is not combined with the joint hierarchy sampler.")
 
@@ -660,12 +987,17 @@ def sample_hierarchical_posterior(
         for index, channel in enumerate(compiled.model.channels)
     ]
     parameter_draws = _parameter_storage(
-        compiled, template_states, mcmc.chains, mcmc.draws
+        compiled, template_states, priors, mcmc.chains, mcmc.draws
     )
     metric_names = (
+        "laplace_iterations",
+        "laplace_converged",
+        "laplace_relative_change",
+        "laplace_support_rejections",
         "particle_min_ess",
         "particle_mean_unique_ancestors",
         "particle_path_changed",
+        "particle_path_update_fraction",
         "particle_changed_fraction",
         "ssvs_model_move_accepted",
         "ssvs_model_proposed_change",
@@ -691,6 +1023,7 @@ def sample_hierarchical_posterior(
     }
     restored_by_chain: list[int] = []
     initial_by_chain: list[dict[str, Any]] = []
+    laplace_initialization_by_chain: list[list[dict[str, Any]]] = []
 
     for chain, sequence in enumerate(seed_sequences):
         rng = np.random.default_rng(sequence)
@@ -706,14 +1039,23 @@ def sample_hierarchical_posterior(
             )
             for index, channel in enumerate(compiled.model.channels)
         ]
-        probabilities = {
-            component: priors.hierarchy.initial_probabilities(component)
-            for component in _COMPONENTS
-        }
-        slab = {
-            component: float(priors.hierarchy.initial_slab_scale[component])
-            for component in _COMPONENTS
-        }
+        probabilities, slab = _initial_hierarchy(
+            priors.hierarchy, initial_parameters
+        )
+        initialization: list[dict[str, Any]] = []
+        if plan.engine == "pgas" and sampler.initializer == "laplace":
+            initializer_seeds = rng.integers(
+                0, np.iinfo(np.int64).max, size=len(states), dtype=np.int64
+            )
+            for item, child_seed in zip(states, initializer_seeds):
+                initialization.append(
+                    _laplace_initialize_channel(
+                        item,
+                        laplace,
+                        np.random.default_rng(int(child_seed)),
+                    )
+                )
+        laplace_initialization_by_chain.append(initialization)
         initial_by_chain.append(
             {
                 "probabilities": {
@@ -735,116 +1077,210 @@ def sample_hierarchical_posterior(
         attempts = Counter()
         progress_every = progress_interval(mcmc.iterations, mcmc.progress_every)
         started = perf_counter()
-        for iteration in range(mcmc.iterations):
-            total_loglik = 0.0
-            iteration_metrics: list[dict[str, float]] = []
-            for item in states:
-                prior = _current_prior(item, priors, probabilities, slab)
-                if item.family == "gaussian":
-                    ll, metrics = _gaussian_step(item, prior, rng)
+        workers = min(int(sampler.channel_workers), len(states))
+        executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+        try:
+            for iteration in range(mcmc.iterations):
+                total_loglik = 0.0
+                iteration_metrics: list[dict[str, float]] = []
+                current_priors = [
+                    _current_prior(item, priors, probabilities, slab)
+                    for item in states
+                ]
+                child_seeds = rng.integers(
+                    0, np.iinfo(np.int64).max, size=len(states), dtype=np.int64
+                )
+
+                def update_channel(index: int):
+                    return _channel_step(
+                        states[index],
+                        current_priors[index],
+                        plan.engine,
+                        particles,
+                        laplace,
+                        np.random.default_rng(int(child_seeds[index])),
+                    )
+
+                if executor is None:
+                    channel_results = [
+                        update_channel(index) for index in range(len(states))
+                    ]
                 else:
-                    ll, metrics, acc_sigma, acc_xi, was_restored = _gev_step(
-                        item, prior, particles, laplace, rng
+                    channel_results = list(
+                        executor.map(update_channel, range(len(states)))
                     )
-                    attempts[f"sigma.{item.name}"] += 1
-                    attempts[f"xi.{item.name}"] += 1
-                    accept_counts[f"sigma.{item.name}"] += int(acc_sigma)
-                    accept_counts[f"xi.{item.name}"] += int(acc_xi)
-                    restored += int(was_restored)
-                total_loglik += float(ll)
-                iteration_metrics.append(metrics)
-                for component in _COMPONENTS:
-                    sign_counts[component][chain] += int(
-                        metrics.get(f"sign_{component}", 0.0)
-                    )
-            probabilities, slab = _update_hierarchy(states, priors, slab, rng)
 
-            keep = iteration >= mcmc.warmup and (
-                (iteration - mcmc.warmup) % mcmc.thin == 0
-            )
-            if keep:
-                for item in states:
-                    block = block_by_name[item.name]
-                    state_draws[chain, saved, :, block.state_slice] = map_ncp_to_centered(
-                        item.z_path, item.params_state, item.layout
-                    )
-                _store_parameters(
-                    parameter_draws, states, probabilities, slab, chain, saved
+                for item, result in zip(states, channel_results):
+                    ll, metrics, acc_sigma, acc_xi, was_restored = result
+                    if item.family == "gev":
+                        attempts[f"sigma.{item.name}"] += 1
+                        attempts[f"xi.{item.name}"] += 1
+                        accept_counts[f"sigma.{item.name}"] += int(acc_sigma)
+                        accept_counts[f"xi.{item.name}"] += int(acc_xi)
+                        restored += int(was_restored)
+                    total_loglik += float(ll)
+                    iteration_metrics.append(metrics)
+                    for component in _COMPONENTS:
+                        sign_counts[component][chain] += int(
+                            metrics.get(f"sign_{component}", 0.0)
+                        )
+                probabilities, slab = _update_hierarchy(states, priors, slab, rng)
+
+                keep = iteration >= mcmc.warmup and (
+                    (iteration - mcmc.warmup) % mcmc.thin == 0
                 )
-                log_posterior[chain, saved] = total_loglik
-                for metric in metric_names:
-                    current = [entry[metric] for entry in iteration_metrics if metric in entry]
-                    if current:
-                        if metric == "particle_min_ess":
-                            value = float(np.min(current))
-                        elif metric == "sign_invariance_error":
-                            value = float(np.max(current))
-                        else:
-                            value = float(np.mean(current))
-                        draw_metrics[metric][chain, saved] = value
-                sign_errors = [
-                    entry.get("sign_error", np.nan) for entry in iteration_metrics
-                ]
-                finite_errors = [value for value in sign_errors if np.isfinite(value)]
-                if finite_errors:
-                    draw_metrics["sign_invariance_error"][chain, saved] = max(finite_errors)
-                saved += 1
+                if keep:
+                    for item in states:
+                        block = block_by_name[item.name]
+                        state_draws[chain, saved, :, block.state_slice] = map_ncp_to_centered(
+                            item.z_path, item.params_state, item.layout
+                        )
+                    _store_parameters(
+                        parameter_draws, states, probabilities, slab, chain, saved
+                    )
+                    log_posterior[chain, saved] = total_loglik
+                    for metric in metric_names:
+                        current = [
+                            entry[metric]
+                            for entry in iteration_metrics
+                            if metric in entry
+                        ]
+                        if current:
+                            if metric == "particle_min_ess":
+                                value = float(np.min(current))
+                            elif metric == "sign_invariance_error":
+                                value = float(np.max(current))
+                            else:
+                                value = float(np.mean(current))
+                            draw_metrics[metric][chain, saved] = value
+                    sign_errors = [
+                        entry.get("sign_error", np.nan)
+                        for entry in iteration_metrics
+                    ]
+                    finite_errors = [
+                        value for value in sign_errors if np.isfinite(value)
+                    ]
+                    if finite_errors:
+                        draw_metrics["sign_invariance_error"][chain, saved] = max(
+                            finite_errors
+                        )
+                    saved += 1
 
-            completed = iteration + 1
-            if mcmc.progress and should_report_progress(
-                completed,
-                total=mcmc.iterations,
-                warmup=mcmc.warmup,
-                every=progress_every,
-            ):
-                current_params: dict[str, Any] = {
-                    "sigma": compact_group(
-                        {item.name: item.params_obs["sigma"] for item in states}
-                    ),
-                    "pi_level": compact_group(
-                        {"F": probabilities["level"][0], "D": probabilities["level"][1]}
-                    ),
-                    "slab": compact_group(slab),
-                }
-                gev_metrics = [
-                    entry for entry in iteration_metrics if "particle_min_ess" in entry
-                ]
-                metrics = {}
-                if gev_metrics:
-                    metrics = {
-                        "particle_min_ess": min(
-                            entry["particle_min_ess"] for entry in gev_metrics
+                completed = iteration + 1
+                if mcmc.progress and should_report_progress(
+                    completed,
+                    total=mcmc.iterations,
+                    warmup=mcmc.warmup,
+                    every=progress_every,
+                ):
+                    current_params: dict[str, Any] = {
+                        "sigma": compact_group(
+                            {item.name: item.params_obs["sigma"] for item in states}
                         ),
-                        "particle_mean_unique_ancestors": float(
-                            np.mean(
-                                [entry["particle_mean_unique_ancestors"] for entry in gev_metrics]
-                            )
-                        ),
-                        "particle_changed_fraction": float(
-                            np.mean(
-                                [entry["particle_changed_fraction"] for entry in gev_metrics]
-                            )
-                        ),
+                        "slab": compact_group(slab),
                     }
-                print(
-                    mcmc_progress_line(
-                        label="hierarchical",
-                        engine=plan.engine,
-                        chain=chain + 1,
-                        chains=mcmc.chains,
-                        completed=completed,
-                        total=mcmc.iterations,
-                        warmup=mcmc.warmup,
-                        saved=saved,
-                        draws=mcmc.draws,
-                        elapsed=perf_counter() - started,
-                        parameters=current_params,
-                        metrics=metrics,
-                        particles=particles.n if plan.engine == "pgas" else None,
-                        details=(f"restored={restored}",) if restored else (),
-                    ),
-                    flush=True,
-                )
+                    xis = {
+                        item.name: item.params_obs["xi"]
+                        for item in states
+                        if item.family == "gev"
+                    }
+                    if xis:
+                        current_params["xi"] = compact_group(xis)
+                    if "trend_model" in probabilities:
+                        current_params["pi_trend"] = compact_group(
+                            {
+                                "LT": probabilities["trend_model"][0],
+                                "RW1": probabilities["trend_model"][1],
+                                "RW2": probabilities["trend_model"][2],
+                                "LLT": probabilities["trend_model"][3],
+                            }
+                        )
+                    else:
+                        current_params["pi_level"] = compact_group(
+                            {
+                                "F": probabilities["level"][0],
+                                "D": probabilities["level"][1],
+                            }
+                        )
+                    progress_metrics: dict[str, float] = {}
+                    if plan.engine == "pgas":
+                        gev_metrics = [
+                            entry
+                            for entry in iteration_metrics
+                            if "particle_min_ess" in entry
+                        ]
+                        if gev_metrics:
+                            progress_metrics = {
+                                "particle_min_ess": min(
+                                    entry["particle_min_ess"]
+                                    for entry in gev_metrics
+                                ),
+                                "particle_mean_unique_ancestors": float(
+                                    np.mean(
+                                        [
+                                            entry["particle_mean_unique_ancestors"]
+                                            for entry in gev_metrics
+                                        ]
+                                    )
+                                ),
+                                "particle_path_update_fraction": float(
+                                    np.mean(
+                                        [
+                                            entry["particle_path_update_fraction"]
+                                            for entry in gev_metrics
+                                        ]
+                                    )
+                                ),
+                            }
+                    elif plan.engine == "laplace":
+                        laplace_metrics = [
+                            entry
+                            for entry in iteration_metrics
+                            if "laplace_iterations" in entry
+                        ]
+                        if laplace_metrics:
+                            progress_metrics = {
+                                "laplace_iterations": float(
+                                    np.max(
+                                        [
+                                            entry["laplace_iterations"]
+                                            for entry in laplace_metrics
+                                        ]
+                                    )
+                                ),
+                                "laplace_converged": float(
+                                    np.mean(
+                                        [
+                                            entry["laplace_converged"]
+                                            for entry in laplace_metrics
+                                        ]
+                                    )
+                                ),
+                            }
+                    print(
+                        mcmc_progress_line(
+                            label="hierarchical SSVS",
+                            engine=plan.engine,
+                            chain=chain + 1,
+                            chains=mcmc.chains,
+                            completed=completed,
+                            total=mcmc.iterations,
+                            warmup=mcmc.warmup,
+                            saved=saved,
+                            draws=mcmc.draws,
+                            elapsed=perf_counter() - started,
+                            parameters=current_params,
+                            metrics=progress_metrics,
+                            particles=(
+                                particles.n if plan.engine == "pgas" else None
+                            ),
+                            details=(f"restored={restored}",) if restored else (),
+                        ),
+                        flush=True,
+                    )
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
         for name in acceptance:
             acceptance[name][chain] = (
                 accept_counts[name] / attempts[name] if attempts[name] else np.nan
@@ -866,16 +1302,18 @@ def sample_hierarchical_posterior(
             "mcmc": asdict(mcmc),
             "particles": asdict(particles),
             "laplace": asdict(laplace),
+            "hierarchical_sampler": asdict(sampler),
             "chain_seeds": [int(sequence.generate_state(1)[0]) for sequence in seed_sequences],
             "sign_switch_counts": {
                 key: value.tolist() for key, value in sign_counts.items()
             },
             "restored_iterations_by_chain": restored_by_chain,
+            "laplace_initialization_by_chain": laplace_initialization_by_chain,
         },
         dates=None if dates is None else np.asarray(dates),
         series_name=compiled.model.name,
         transform_sign=compiled.model.transform_signs,
-        schema_version="2.4",
+        schema_version="2.4.1",
         initial_values={"chains": initial_by_chain},
         metadata={
             "bucex_version": __version__,
@@ -886,15 +1324,33 @@ def sample_hierarchical_posterior(
             "shared_temporal_state": False,
             "conditional_channel_independence": True,
             "structural_ssvs": bool(priors.hierarchy.pools_selection),
-            "model_selection_exact": bool(priors.hierarchy.pools_selection),
+            "model_selection_exact": bool(
+                priors.hierarchy.pools_selection and plan.targets_exact_posterior
+            ),
             "pooled_normal_slab": bool(priors.hierarchy.pools_slab),
             "hierarchy_pool": priors.hierarchy.pool,
+            "trend_model_space": priors.hierarchy.model_space,
             "signed_innovation_scales": True,
             "sign_switching": True,
             "sign_switch_invariance_checked": True,
             "restored_iterations": int(sum(restored_by_chain)),
             "restored_iterations_by_chain": restored_by_chain,
             "pgas_exact_invariant": bool(plan.engine == "pgas"),
+            "hierarchical_laplace_approximation": bool(plan.engine == "laplace"),
+            "pgas_initializer": (
+                sampler.initializer if plan.engine == "pgas" else None
+            ),
+            "channel_workers": int(sampler.channel_workers),
+            "external_warm_start": bool(
+                initial_parameters is not None
+                and "__warm_start__" in initial_parameters
+            ),
+            "warm_start_source": (
+                dict(initial_parameters["__warm_start__"])
+                if initial_parameters is not None
+                and "__warm_start__" in initial_parameters
+                else None
+            ),
         },
     )
 

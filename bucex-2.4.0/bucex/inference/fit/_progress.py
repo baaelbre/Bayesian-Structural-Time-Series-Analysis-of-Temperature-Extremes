@@ -180,9 +180,14 @@ def mcmc_progress_line(
             pieces.append(f"particle_min_ess={ess:.1f}{denominator}")
         if np.isfinite(ancestors):
             pieces.append(f"ancestors={ancestors:.1f}")
-        path_change = float(values.get("particle_changed_fraction", np.nan))
-        if np.isfinite(path_change):
-            pieces.append(f"path_change={path_change:.2f}")
+        path_update = float(
+            values.get(
+                "particle_path_update_fraction",
+                values.get("particle_changed_fraction", np.nan),
+            )
+        )
+        if np.isfinite(path_update):
+            pieces.append(f"path_update={path_update:.2f}")
     elif str(engine).lower() == "laplace":
         iterations = float(values.get("laplace_iterations", np.nan))
         converged = float(values.get("laplace_converged", np.nan))

@@ -204,8 +204,11 @@ def fit_diagnostics(fit):
             "path_change_rate": _finite_mean(
                 metrics["particle_path_changed"]
             ),
-            "mean_changed_fraction": _finite_mean(
-                metrics["particle_changed_fraction"]
+            "mean_path_update_fraction": _finite_mean(
+                metrics.get(
+                    "particle_path_update_fraction",
+                    metrics.get("particle_changed_fraction", np.asarray([])),
+                )
             ),
         }
         if bool(fit.metadata.get("structural_ssvs", False)):

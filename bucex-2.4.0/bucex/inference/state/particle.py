@@ -40,8 +40,14 @@ class PGASResult:
     unique_ancestors: Array
     reference_ancestors: Array
     path_changed: bool
-    changed_fraction: float
+    path_update_fraction: float
     exact_invariant: bool = True
+
+    @property
+    def changed_fraction(self) -> float:
+        """Deprecated 2.4 name for :attr:`path_update_fraction`."""
+
+        return float(self.path_update_fraction)
 
 
 def _resample(weights: Array, rng: np.random.Generator, size: int, method: str) -> Array:
@@ -531,5 +537,5 @@ def pgas(
         unique_ancestors=unique,
         reference_ancestors=reference_ancestors,
         path_changed=bool(np.any(changed)),
-        changed_fraction=float(np.mean(changed)),
+        path_update_fraction=float(np.mean(changed)),
     )

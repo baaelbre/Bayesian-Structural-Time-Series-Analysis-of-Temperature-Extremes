@@ -1,4 +1,9 @@
 """Innovation, observation, shape, and cross-series priors."""
+from .calibration import (
+    calibrate_structural_scales,
+    half_student_t_scale_for_median,
+    structural_scale_implications,
+)
 from .hierarchical import (
     HierarchicalPrior,
     HierarchicalPriors,
@@ -61,6 +66,9 @@ __all__ = [
     "HierarchicalPrior",
     "HierarchicalPriors",
     "resolve_hierarchical_priors",
+    "calibrate_structural_scales",
+    "half_student_t_scale_for_median",
+    "structural_scale_implications",
     "HalfNormalSD",
     "HalfStudentTSD",
     "ExponentialSD",
