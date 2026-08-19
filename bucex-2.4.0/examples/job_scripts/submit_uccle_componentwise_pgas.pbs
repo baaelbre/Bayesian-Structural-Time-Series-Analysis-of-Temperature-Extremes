@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#PBS -N bucex_cw_pgas
+#PBS -l walltime=72:00:00
+#PBS -l nodes=1:ppn=6
+#PBS -l mem=48gb
+#PBS -j oe
+#PBS -t 1-4%2
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+
+TASK_ID="${PBS_ARRAYID}"
+CHAIN="${TASK_ID}"
+
+START="${START:-1892-01-01}"
+END="${END:-}"
+POOL="${POOL:-selection}"
+DRAWS="${DRAWS:-2000}"
+WARMUP="${WARMUP:-2000}"
+PARTICLES="${PARTICLES:-512}"
+WORKERS="${WORKERS:-6}"
+BASE_SEED="${BASE_SEED:-24100}"
+SCREEN_PATH="${SCREEN_PATH:-results/componentwise_screen/full_record_laplace.bucex}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/hpc_chains}"
+
+exec > "logs/uccle_componentwise_pgas_chain_${CHAIN}_${PBS_JOBID}.log" 2>&1
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+echo "Running componentwise PGAS array task"
+echo "task id     = ${TASK_ID}"
+echo "chain       = ${CHAIN}"
+echo "start       = ${START}"
+echo "end         = ${END:-latest}"
+echo "pool        = ${POOL}"
+echo "draws       = ${DRAWS}"
+echo "warmup      = ${WARMUP}"
+echo "particles   = ${PARTICLES}"
+echo "workers     = ${WORKERS}"
+echo "screen path = ${SCREEN_PATH}"
+echo "output dir  = ${OUTPUT_DIR}"
+date
+hostname
+
+bash examples/job_scripts/run_uccle_componentwise_pgas.sh \
+  "${CHAIN}" "${START}" "${END}" "${POOL}" "${DRAWS}" \
+  "${WARMUP}" "${PARTICLES}" "${WORKERS}" "${BASE_SEED}" \
+  "${SCREEN_PATH}" "${OUTPUT_DIR}"
+
+echo "Finished componentwise PGAS array task"
+date

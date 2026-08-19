@@ -1,57 +1,108 @@
-"""Example 10: hierarchically pool all six Uccle summaries.
+"""Example 10: componentwise hierarchical SSVS for all six Uccle summaries.
 
-This is the proposed joint analysis. Each summary keeps its own temperature
-path and likelihood. The population hierarchy asks whether the same kinds of
-dynamics recur across summaries; it can pool SSVS probabilities, normal-slab
-magnitudes, or both. It does not impose a shared trajectory.
+Each channel retains its own likelihood, latent path, observation parameters,
+and innovation scales. The population hierarchy pools probabilities for:
+
+* level: fixed or dynamic;
+* slope: zero, fixed, or dynamic;
+* seasonality: fixed or dynamic.
+
+Use Laplace for exploratory screening and PGAS for final mixed Gaussian--GEV
+inference. A full-record Laplace archive can initialize the corresponding
+full-record PGAS chains.
 """
 from __future__ import annotations
 
+import argparse
+import warnings
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 import bucex as bx
 
 
-START = "1980-01-01"      # validate this run before extending to 1892
-END = None
-POOL = "selection"        # try "slab" or "both" as sensitivity analyses
-DRAWS = 1_000
-WARMUP = 1_000
-CHAINS = 4
-N_PARTICLES = 512
-SEED = 1_001
-SAVE_FIT = False
-SHOW_PLOTS = False
-FIGURE_DIR = Path("figures/10_uccle_hierarchical")
+def componentwise_prior(pool: str = "selection") -> bx.HierarchicalPrior:
+    """The single componentwise hierarchy used by screening and exact jobs."""
+
+    return bx.HierarchicalPrior(
+        pool=pool,
+        model_space="componentwise",
+        level_states=("fixed", "dynamic"),
+        trend_states=("zero", "fixed", "dynamic"),
+        season_states=("fixed", "dynamic"),
+        level_concentration=(1.0, 1.0),
+        trend_concentration=(1.0, 1.0, 1.0),
+        season_concentration=(1.0, 1.0),
+        coefficient_scale={
+            "level": 0.03,
+            "trend": 0.0002,
+            "season": 0.03,
+        },
+        slab_df=4.0,
+        slab_prior_scale={"level": 1.0, "trend": 1.0, "season": 1.0},
+    )
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", default="1980-01-01")
+    parser.add_argument("--end", default=None)
+    parser.add_argument("--pool", choices=("selection", "both"), default="selection")
+    parser.add_argument("--engine", choices=("laplace", "pgas"), default="laplace")
+    parser.add_argument("--draws", type=int, default=1_000)
+    parser.add_argument("--warmup", type=int, default=1_000)
+    parser.add_argument("--chains", type=int, default=4)
+    parser.add_argument("--particles", type=int, default=512)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=1_001)
+    parser.add_argument("--save-fit", type=Path, default=None)
+    parser.add_argument(
+        "--figure-dir",
+        type=Path,
+        default=Path("figures/10_uccle_hierarchical"),
+    )
+    parser.add_argument("--show-plots", action="store_true")
+    return parser.parse_args()
 
 
 def main() -> None:
+    args = arguments()
     model = bx.make_uccle_hierarchical_model()
-    data = bx.load_uccle_multiseries(start=START, end=END)
-    prior = bx.HierarchicalPrior(
-        pool=POOL,
-        season_states=("fixed", "dynamic"),
-        slab_df=4.0,
-    )
+    data = bx.load_uccle_multiseries(start=args.start, end=args.end)
+    prior = componentwise_prior(args.pool)
+
+    fit_options = {}
+    if args.engine == "pgas":
+        fit_options["particles"] = bx.Particles(
+            n=args.particles,
+            proposal="guided",
+        )
+
     fit = bx.fit_uccle_hierarchical(
         model=model,
-        start=START,
-        end=END,
+        start=args.start,
+        end=args.end,
         priors=prior,
         parameterization="fruehwirth_schnatter",
-        engine="pgas",
+        engine=args.engine,
         asis=False,
         mcmc=bx.MCMC(
-            draws=DRAWS,
-            warmup=WARMUP,
-            chains=CHAINS,
-            seed=SEED,
+            draws=args.draws,
+            warmup=args.warmup,
+            chains=args.chains,
+            seed=args.seed,
             progress=True,
         ),
-        particles=bx.Particles(n=N_PARTICLES, proposal="guided"),
+        hierarchical_sampler=bx.HierarchicalSampler(
+            initializer="laplace",
+            channel_workers=args.workers,
+        ),
+        **fit_options,
     )
 
     scientific = [
@@ -60,43 +111,56 @@ def main() -> None:
         if name.startswith(("sd.channel.", "sigma.", "xi.", "hierarchy."))
     ]
     diagnostics = fit.diagnostics()
+    draw_metrics = fit.sampler_diagnostics.get("draw_metrics", {})
+    sign_errors = np.asarray(draw_metrics.get("sign_invariance_error", np.nan))
+    restored = int(fit.meta.get("restored_iterations", 0) or 0)
+
     print("\nDATA\n", data.describe().round(2))
     print("\nINFERENCE PLAN\n", fit.plan)
     print("\nSCIENTIFIC DIAGNOSTICS\n", diagnostics["parameters"].loc[scientific].round(4))
-    print("\nPARTICLE DIAGNOSTICS\n", diagnostics["engine"])
-    print("\nCHANNEL ALLOCATIONS\n", fit.component_probabilities().round(3))
-    print("\nPOPULATION PROBABILITIES\n", fit.hierarchical_probabilities().round(3))
+    print("\nENGINE DIAGNOSTICS\n", diagnostics["engine"])
+    print("\nCHANNEL COMPONENT PROBABILITIES\n", fit.component_probabilities().round(3))
+    print("\nCHANNEL JOINT STRUCTURES\n", fit.structural_model_probabilities().round(3))
+    print("\nPOPULATION COMPONENT PROBABILITIES\n", fit.hierarchical_probabilities().round(3))
     print("\nPOOLED SLAB MULTIPLIERS\n", fit.hierarchical_slab_summary().round(3))
     print("\nALLOCATION SWITCHING\n", fit.component_transition_summary().round(3))
     print(
         "\nSAMPLER CONTRACT\n",
         {
             "exact_target": fit.plan.targets_exact_posterior,
-            "sign_switching": fit.metadata.get("sign_switching"),
-            "sign_invariance_error": float(np.nanmax(
-                fit.sampler_diagnostics["draw_metrics"]["sign_invariance_error"]
-            )),
-            "restored_iterations": fit.metadata.get("restored_iterations"),
+            "model_space": fit.priors.hierarchy.model_space,
+            "pool": fit.priors.hierarchy.pool,
+            "sign_switching": fit.meta.get("sign_switching"),
+            "sign_invariance_error": float(np.nanmax(sign_errors)),
+            "restored_iterations": restored,
         },
     )
+    if restored:
+        warnings.warn(
+            f"This fit restored {restored} iterations. Diagnose the failure "
+            "types before treating it as a result.",
+            RuntimeWarning,
+        )
 
-    print("\nCOMPLETE-PREDICTOR RATES PER DECADE")
+    print("\nANNUAL-MEAN COMPLETE-PREDICTOR RATES PER DECADE")
     for channel in model.channel_names:
         print(channel, fit.channel_rate_summary(channel))
 
-    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    args.figure_dir.mkdir(parents=True, exist_ok=True)
     for channel in model.channel_names:
-        fit.plot("channel", channel=channel, save=FIGURE_DIR / f"{channel}.png")
-    fit.plot("component_probabilities", save=FIGURE_DIR / "allocations.png")
-    fit.plot("hierarchy", save=FIGURE_DIR / "hierarchy.png")
-    fit.plot("process_sd", save=FIGURE_DIR / "process_sds.png")
-    fit.plot("traces", parameters=scientific, save=FIGURE_DIR / "traces.png")
-    fit.plot("acf", parameters=scientific, max_lag=50, save=FIGURE_DIR / "acf.png")
+        fit.plot("channel", channel=channel, save=args.figure_dir / f"{channel}.png")
+    fit.plot("component_probabilities", save=args.figure_dir / "allocations.png")
+    fit.plot("hierarchy", save=args.figure_dir / "hierarchy.png")
+    fit.plot("process_sd", save=args.figure_dir / "process_sds.png")
+    fit.plot("traces", parameters=scientific, save=args.figure_dir / "traces.png")
+    fit.plot("acf", parameters=scientific, max_lag=50, save=args.figure_dir / "acf.png")
 
-    if SAVE_FIT:
-        Path("results").mkdir(exist_ok=True)
-        fit.save("results/uccle_hierarchical.bucex")
-    if SHOW_PLOTS:
+    if args.save_fit is not None:
+        args.save_fit.parent.mkdir(parents=True, exist_ok=True)
+        fit.save(args.save_fit)
+        print("\nSAVED FIT\n", args.save_fit)
+
+    if args.show_plots:
         plt.show()
     else:
         plt.close("all")

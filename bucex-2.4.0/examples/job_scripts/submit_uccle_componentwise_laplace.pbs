@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#PBS -N bucex_cw_screen
+#PBS -l walltime=12:00:00
+#PBS -l nodes=1:ppn=6
+#PBS -l mem=48gb
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+
+START="${START:-1892-01-01}"
+END="${END:-}"
+POOL="${POOL:-selection}"
+DRAWS="${DRAWS:-1000}"
+WARMUP="${WARMUP:-1000}"
+CHAINS="${CHAINS:-4}"
+WORKERS="${WORKERS:-6}"
+SEED="${SEED:-1001}"
+SCREEN_PATH="${SCREEN_PATH:-results/componentwise_screen/full_record_laplace.bucex}"
+
+exec > "logs/uccle_componentwise_laplace_${PBS_JOBID}.log" 2>&1
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+echo "Running full-record componentwise Laplace screen"
+echo "start       = ${START}"
+echo "end         = ${END:-latest}"
+echo "pool        = ${POOL}"
+echo "draws       = ${DRAWS}"
+echo "warmup      = ${WARMUP}"
+echo "chains      = ${CHAINS}"
+echo "workers     = ${WORKERS}"
+echo "screen path = ${SCREEN_PATH}"
+date
+hostname
+
+bash examples/job_scripts/run_uccle_componentwise_laplace.sh \
+  "${START}" "${END}" "${POOL}" "${DRAWS}" "${WARMUP}" \
+  "${CHAINS}" "${WORKERS}" "${SEED}" "${SCREEN_PATH}"
+
+echo "Finished componentwise Laplace screen"
+date
