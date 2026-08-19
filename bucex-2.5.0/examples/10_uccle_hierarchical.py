@@ -28,35 +28,18 @@ import bucex as bx
 
 def componentwise_prior(pool: str = "selection") -> bx.HierarchicalPrior:
     """The single componentwise hierarchy used by screening and exact jobs."""
-
-    return bx.HierarchicalPrior(
-        pool=pool,
-        model_space="componentwise",
-        level_states=("fixed", "dynamic"),
-        trend_states=("zero", "fixed", "dynamic"),
-        season_states=("fixed", "dynamic"),
-        level_concentration=(1.0, 1.0),
-        trend_concentration=(1.0, 1.0, 1.0),
-        season_concentration=(1.0, 1.0),
-        coefficient_scale={
-            "level": 0.03,
-            "trend": 0.0002,
-            "season": 0.03,
-        },
-        slab_df=4.0,
-        slab_prior_scale={"level": 1.0, "trend": 1.0, "season": 1.0},
-    )
+    return bx.componentwise_hierarchical_prior(pool)
 
 
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", default=None)#"1980-01-01")
+    parser.add_argument("--start", default="1980-01-01")
     parser.add_argument("--end", default=None)
     parser.add_argument("--pool", choices=("selection", "both"), default="selection")
     parser.add_argument("--engine", choices=("laplace", "pgas"), default="laplace")
     parser.add_argument("--draws", type=int, default=1_000)
     parser.add_argument("--warmup", type=int, default=1_000)
-    parser.add_argument("--chains", type=int, default=1)
+    parser.add_argument("--chains", type=int, default=4)
     parser.add_argument("--particles", type=int, default=512)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1_001)
@@ -97,7 +80,6 @@ def main() -> None:
             chains=args.chains,
             seed=args.seed,
             progress=True,
-            progress_every=1
         ),
         hierarchical_sampler=bx.HierarchicalSampler(
             initializer="laplace",

@@ -1,0 +1,26 @@
+{
+  "benchmark": "/tmp/bucex-2.5.0-_0v6nwj4/fits/01_txx_benchmarks/stationary/combined.bucex",
+  "bucex_version": "2.5.0",
+  "data_table": "/tmp/bucex-2.5.0-_0v6nwj4/tables/00_data/uccle_integrity.csv",
+  "deserialized_combine_chains": 2,
+  "exact": "/tmp/bucex-2.5.0-_0v6nwj4/fits/06_hierarchy_pgas/selection/combined.bucex",
+  "independent_artifacts": 8,
+  "manifest_stages": [
+    "data",
+    "hierarchy-pgas",
+    "hierarchy-screen",
+    "report",
+    "sensitivity-both-laplace",
+    "six-univariate-TXm-chain-combined",
+    "txx-benchmarks-stationary-chain-combined",
+    "txx-ssvs",
+    "txx-validation-stationary"
+  ],
+  "report_artifacts": 55,
+  "screen": "/tmp/bucex-2.5.0-_0v6nwj4/fits/05_hierarchy_screen/selection.bucex",
+  "sensitivity": "/tmp/bucex-2.5.0-_0v6nwj4/fits/07_pooling_sensitivity/both_laplace/combined.bucex",
+  "total_seconds": 6.36537574200338,
+  "txx": "/tmp/bucex-2.5.0-_0v6nwj4/fits/02_txx_componentwise_ssvs/combined.bucex",
+  "validation_artifacts": 5,
+  "work_dir": "/tmp/bucex-2.5.0-_0v6nwj4"
+}

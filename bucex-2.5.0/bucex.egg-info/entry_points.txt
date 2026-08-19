@@ -1,0 +1,3 @@
+[console_scripts]
+bucex-presentation = bucex.workflows.cli:main
+bucex-uccle = bucex.cli:main

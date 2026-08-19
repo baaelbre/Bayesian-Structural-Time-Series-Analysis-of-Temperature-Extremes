@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_sensitivity
+#PBS -l walltime=24:00:00
+#PBS -l nodes=1:ppn=6
+#PBS -l mem=48gb
+#PBS -j oe
+#PBS -t 1-2%2
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+TASK_ID="${PBS_ARRAYID}"
+POOLS=(slab both)
+POOL="${POOLS[$((TASK_ID - 1))]}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+exec > "logs/07_sensitivity_${POOL}_${PBS_JOBID}.log" 2>&1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+bash examples/job_scripts/run_presentation_stage.sh run sensitivity \
+  --profile publication --output-dir "${OUTPUT_DIR}" \
+  --pool "${POOL}" --engine laplace --workers 6

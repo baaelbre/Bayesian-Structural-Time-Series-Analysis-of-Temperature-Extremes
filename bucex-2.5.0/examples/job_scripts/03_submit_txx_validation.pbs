@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_txx_lfo
+#PBS -l walltime=120:00:00
+#PBS -l nodes=1:ppn=4
+#PBS -l mem=32gb
+#PBS -j oe
+#PBS -t 1-6%2
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+TASK_ID="${PBS_ARRAYID}"
+INDEX=$((TASK_ID - 1))
+MODELS=(stationary linear_trend huerta_local_level gaetan_grigoletto_rw2 local_linear_trend componentwise_ssvs)
+MODEL="${MODELS[$INDEX]}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+exec > "logs/03_txx_lfo_${MODEL}_${PBS_JOBID}.log" 2>&1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+bash examples/job_scripts/run_presentation_stage.sh run txx-validation \
+  --profile publication --output-dir "${OUTPUT_DIR}" \
+  --validation-model "${MODEL}" --engine pgas

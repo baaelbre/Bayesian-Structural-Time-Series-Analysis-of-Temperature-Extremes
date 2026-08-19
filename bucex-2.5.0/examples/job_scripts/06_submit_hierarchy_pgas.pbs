@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_h_pgas
+#PBS -l walltime=120:00:00
+#PBS -l nodes=1:ppn=6
+#PBS -l mem=64gb
+#PBS -j oe
+#PBS -t 1-4%2
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+CHAIN="${PBS_ARRAYID}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+exec > "logs/06_hierarchy_chain_${CHAIN}_${PBS_JOBID}.log" 2>&1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+bash examples/job_scripts/run_presentation_stage.sh run hierarchy-pgas \
+  --profile publication --output-dir "${OUTPUT_DIR}" \
+  --pool selection --chain "${CHAIN}" --workers 6

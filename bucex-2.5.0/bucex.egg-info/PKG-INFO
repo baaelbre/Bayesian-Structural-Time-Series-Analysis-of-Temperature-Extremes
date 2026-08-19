@@ -1,0 +1,284 @@
+Metadata-Version: 2.4
+Name: bucex
+Version: 2.5.0
+Summary: Bayesian structural time-series with hierarchical pooling for related series
+Author: Bastiaan AVV
+License-Expression: MIT
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Topic :: Scientific/Engineering :: Mathematics
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Requires-Dist: scipy>=1.10
+Requires-Dist: pandas>=1.5
+Provides-Extra: plot
+Requires-Dist: matplotlib>=3.6; extra == "plot"
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
+Provides-Extra: dev
+Requires-Dist: build>=1; extra == "dev"
+Requires-Dist: pytest>=7; extra == "dev"
+Requires-Dist: matplotlib>=3.6; extra == "dev"
+Dynamic: license-file
+
+# bucex 2.5.0
+
+`bucex` fits Bayesian structural time-series models to Gaussian and generalized
+extreme-value observations. It supports one series and hierarchical collections
+of series-specific paths. The hierarchy can share structural-selection
+probabilities, normal-slab magnitudes, or both; it never forces the six Uccle
+temperature summaries to share one latent trajectory.
+
+Version 2.5.0 makes the scientific workflow executable from beginning to end:
+
+1. start with TXx and fixed structural benchmark models;
+2. replace a prespecified structure by componentwise SSVS;
+3. compare models using expanding-window held-out prediction;
+4. repeat the componentwise analysis independently for all six summaries;
+5. screen the six-series hierarchy with Laplace;
+6. obtain final mixed Gaussian--GEV inference with exact-invariant PGAS;
+7. test shared slab magnitudes and combined pooling;
+8. rebuild tables and figures from saved fits without sampling again.
+
+The numbered scripts are in `examples/presentation/`. The same stages are
+available from `bucex-presentation` and as PBS arrays.
+
+## Installation
+
+```bash
+python -m pip install .
+```
+
+For plotting and development:
+
+```bash
+python -m pip install ".[plot,test]"
+```
+
+Check the complete workflow without treating the output as inference:
+
+```bash
+bucex-presentation plan --profile smoke
+bucex-presentation run all \
+  --profile smoke \
+  --output-dir results/smoke \
+  --include-sensitivity \
+  --no-progress
+```
+
+Runtime profiles are explicit:
+
+| Profile | Purpose | Default record | Draws/warmup | Chains | Particles |
+|---|---|---|---:|---:|---:|
+| `smoke` | software behavior only | 2018--2022 | 2/2 | 1 | 20 |
+| `pilot` | timings and preliminary figures | 1980--2022 | 200/200 | 2 | 128 |
+| `publication` | starting point for final inference | 1892--2022 | 2000/2000 | 4 | 512 |
+
+Publication settings are not a guarantee of adequacy. Increase particles and
+draws until the reported diagnostics and scientific summaries stabilize.
+
+## One structural model, three component decisions
+
+For series `i`,
+
+\[
+y_{it}\mid\eta_{it},\vartheta_i\sim
+p_i(y_{it}\mid\eta_{it},\vartheta_i),\qquad
+\eta_{it}=\mu_{it}+\gamma_{it},
+\]
+
+with local-linear evolution
+
+\[
+\begin{aligned}
+\mu_{i,t+1} &= \mu_{it}+\beta_{it}+s_{i,\mu}z^\mu_{i,t+1},\\
+\beta_{i,t+1} &= \beta_{it}+s_{i,\beta}z^\beta_{i,t+1}.
+\end{aligned}
+\]
+
+The primary SSVS model is componentwise and deliberately easy to read:
+
+- level: `fixed` or `dynamic`;
+- slope: `zero`, `fixed`, or `dynamic`;
+- seasonality: `fixed` or `dynamic` for monthly temperature.
+
+`zero` slope removes the slope state; `fixed` retains an estimated constant
+slope; `dynamic` lets the slope evolve. The known annual cycle is not selected
+away. Every channel has its own indicators, initial state, latent path,
+observation scale, and GEV shape where applicable.
+
+```python
+import bucex as bx
+
+prior = bx.componentwise_univariate_prior("TXx")
+fit = bx.fit_uccle_series(
+    "TXx",
+    start="1980-01-01",
+    priors=prior,
+    engine="pgas",
+    parameterization="fruehwirth_schnatter",
+    asis=False,
+    mcmc=bx.MCMC(draws=2_000, warmup=2_000, chains=4, seed=250),
+    particles=bx.Particles(n=512, proposal="guided"),
+)
+
+print(fit.component_probabilities())
+print(fit.structural_model_probabilities())
+print(fit.component_transition_summary())
+```
+
+The four joint level/slope innovation classes from 2.4.1 remain available with
+`model_space="joint_trend"`; they are an explicit sensitivity model in 2.5.0,
+not the default.
+
+## Hierarchical pooling
+
+The default hierarchy shares population probabilities for the three component
+decisions:
+
+\[
+M_{ik}\mid\boldsymbol\pi_k\sim
+\operatorname{Categorical}(\boldsymbol\pi_k),\qquad
+\boldsymbol\pi_k\sim\operatorname{Dirichlet}(\boldsymbol a_k).
+\]
+
+This borrows information about recurring structure. It does not pool the state
+paths or create residual/copula dependence.
+
+```python
+prior = bx.componentwise_hierarchical_prior(pool="selection")
+screen = bx.fit_uccle_hierarchical(
+    start="1892-01-01",
+    priors=prior,
+    engine="laplace",
+    mcmc=bx.MCMC(draws=1_000, warmup=1_000, chains=4, seed=251),
+)
+
+fit = bx.fit_uccle_hierarchical(
+    start="1892-01-01",
+    priors=prior,
+    engine="pgas",
+    init=screen,
+    mcmc=bx.MCMC(draws=2_000, warmup=2_000, chains=4, seed=252),
+    particles=bx.Particles(n=512, proposal="guided"),
+)
+```
+
+Pooling modes are:
+
+- `selection`: share structural probabilities and keep calibrated slab widths
+  fixed; this is the primary analysis;
+- `slab`: keep available components dynamic and learn shared half-t slab
+  multipliers;
+- `both`: share selection probabilities and slab multipliers.
+
+Sharing the slab is scientifically reasonable only if innovation magnitudes are
+exchangeable after component-specific calibration. The `slab` and `both`
+models are therefore sensitivities, not automatic improvements.
+
+## TXx benchmark story
+
+`bx.txx_benchmark_prior(name)` fixes the structural state while keeping the
+same GEV likelihood and FS/PGAS implementation. Available structural analogues
+are:
+
+| Name | Level | Slope | Interpretation |
+|---|---|---|---|
+| `stationary` | fixed | zero | seasonal stationary location |
+| `linear_trend` | fixed | fixed | deterministic linear change |
+| `huerta_local_level` | dynamic | zero | stochastic local location |
+| `gaetan_grigoletto_rw2` | fixed | dynamic | smooth integrated changing rate |
+| `local_linear_trend` | dynamic | dynamic | full local-linear evolution |
+
+These are controlled structural analogues, not claims of bit-for-bit
+replication of the original papers. The workflow evaluates them, and the SSVS
+model, by leave-future-out log score, CRPS, threshold-weighted/tail scores,
+quantile scores, and PIT diagnostics.
+
+## Inference contract
+
+| Model | Family | Engine | State update | Contract |
+|---|---|---|---|---|
+| `Model` | Gaussian | `ffbs` | Gaussian FFBS | exact |
+| `Model` | GEV | `laplace` | iterated pseudo-Gaussian FFBS | approximate |
+| `Model` | GEV | `pgas` | conditional SMC with ancestor sampling | exact-invariant |
+| `MultiSeriesModel` | all Gaussian | `ffbs` | channel FFBS in hierarchical Gibbs | exact |
+| `MultiSeriesModel` | mixed/GEV | `laplace` | hierarchical Laplace updates | approximate |
+| `MultiSeriesModel` | mixed/GEV | `pgas` | channel PGAS in hierarchical Gibbs | exact-invariant |
+
+Laplace is a screening and initialization engine for final non-Gaussian work.
+Passing a compatible Laplace `FitResult` as `init=` transfers one starting draw;
+it neither imports an approximate posterior nor changes the PGAS target.
+
+The FS state system contains deterministic directions when a component is fixed
+or absent. PGAS ancestor probabilities are therefore evaluated on the affine
+transition support, not against a nonexistent full-rank transition density.
+The conditioned predecessor remains available when optional ancestor moves
+violate that support. Inspect particle ESS, ancestor diversity, path-update
+fraction, GEV support, and any restored iterations.
+
+## Results you can regenerate
+
+Each workflow run creates:
+
+```text
+results/presentation/
+  config.json
+  manifest.json
+  fits/       checksummed .bucex archives
+  tables/     tidy CSV and JSON outputs
+  figures/    presentation figures
+  logs/       scheduler logs when requested
+```
+
+```bash
+bucex-presentation report \
+  --profile publication \
+  --output-dir results/presentation \
+  --figures
+```
+
+This report-only command loads completed archives and does not refit models.
+
+## PBS/Torque
+
+The scheduler sequence is in `examples/job_scripts/`:
+
+```bash
+qsub examples/job_scripts/00_submit_data.pbs
+qsub examples/job_scripts/01_submit_txx_benchmarks.pbs
+qsub examples/job_scripts/02_submit_txx_ssvs.pbs
+qsub examples/job_scripts/03_submit_txx_validation.pbs
+qsub examples/job_scripts/04_submit_six_univariate.pbs
+qsub examples/job_scripts/05_submit_hierarchy_screen.pbs
+qsub examples/job_scripts/06_submit_hierarchy_pgas.pbs
+qsub examples/job_scripts/07_submit_sensitivity_screen.pbs
+qsub examples/job_scripts/08_submit_combine_report.pbs
+```
+
+Set `BUCEX_VENV` and `OUTPUT_DIR` through `qsub -v`. Every long PGAS chain is a
+separate process and a final job combines compatible archives along the chain
+dimension.
+
+## Minimum interpretation checks
+
+- split rank-normalized R-hat and bulk ESS for all nonconstant scientific and
+  hierarchy parameters;
+- allocation traces, switching rates, and between-chain agreement;
+- particle-count sensitivity for every final PGAS conclusion;
+- zero unexplained/restored iterations and valid GEV support;
+- FS sign-invariance error at numerical zero;
+- prior-predictive and slab-width sensitivity, including Bartlett's-paradox
+  behavior under excessively diffuse slabs;
+- held-out predictive scores and PIT, not only in-sample reconstruction;
+- independent-series versus hierarchical conclusions;
+- record-start sensitivity (1980 versus the longest defensible record).
+
+More detail is in `docs/HIERARCHICAL_MODEL.md`, `docs/INFERENCE_MATRIX.md`,
+`docs/UCCLE.md`, `docs/PREDICTIVE_VALIDATION.md`, and `docs/VALIDATION.md`.

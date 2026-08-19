@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_txx_ssvs
+#PBS -l walltime=72:00:00
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=24gb
+#PBS -j oe
+#PBS -t 1-4%2
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+CHAIN="${PBS_ARRAYID}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+exec > "logs/02_txx_ssvs_chain_${CHAIN}_${PBS_JOBID}.log" 2>&1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+bash examples/job_scripts/run_presentation_stage.sh run txx-ssvs \
+  --profile publication --output-dir "${OUTPUT_DIR}" \
+  --chain "${CHAIN}" --engine pgas

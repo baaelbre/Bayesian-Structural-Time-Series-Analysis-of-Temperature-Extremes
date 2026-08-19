@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_report
+#PBS -l walltime=12:00:00
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=48gb
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+exec > "logs/08_combine_report_${PBS_JOBID}.log" 2>&1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+
+RUNNER=(bash examples/job_scripts/run_presentation_stage.sh)
+COMMON=(--profile publication --output-dir "${OUTPUT_DIR}" --no-progress)
+
+for MODEL in stationary linear_trend huerta_local_level gaetan_grigoletto_rw2 local_linear_trend; do
+  "${RUNNER[@]}" combine txx-benchmarks "${COMMON[@]}" --benchmark "${MODEL}"
+done
+"${RUNNER[@]}" combine txx-ssvs "${COMMON[@]}"
+for SERIES in TXm TNm TXx TXn TNx TNn; do
+  "${RUNNER[@]}" combine six-univariate "${COMMON[@]}" --series "${SERIES}"
+done
+"${RUNNER[@]}" combine hierarchy-pgas "${COMMON[@]}" --pool selection
+"${RUNNER[@]}" report "${COMMON[@]}" --figures

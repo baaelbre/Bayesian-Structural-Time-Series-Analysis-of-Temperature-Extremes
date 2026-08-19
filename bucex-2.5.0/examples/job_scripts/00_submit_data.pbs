@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#PBS -N bucex250_data
+#PBS -l walltime=00:30:00
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=4gb
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+exec > "logs/00_data_${PBS_JOBID}.log" 2>&1
+
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+OUTPUT_DIR="${OUTPUT_DIR:-results/presentation}"
+
+bash examples/job_scripts/run_presentation_stage.sh run data \
+  --profile publication --output-dir "${OUTPUT_DIR}" --no-progress
