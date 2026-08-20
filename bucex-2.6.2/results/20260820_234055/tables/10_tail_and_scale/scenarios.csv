@@ -1,0 +1,7 @@
+group,name,sigma,xi,sd.level,seed
+shape,bounded_tail,1.5,-0.3,0.08,2601
+shape,gumbel_tail,1.5,0.0,0.08,2601
+shape,heavy_tail,1.5,0.3,0.08,2601
+scale,low_scale,0.75,-0.3,0.08,2602
+scale,reference_scale,1.5,-0.3,0.08,2602
+scale,high_scale,3.0,-0.3,0.08,2602

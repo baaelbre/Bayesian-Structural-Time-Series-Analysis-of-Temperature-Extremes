@@ -1,0 +1,34 @@
+{
+  "initial_state": [
+    25.0
+  ],
+  "model": {
+    "components": [
+      {
+        "initial_mean": null,
+        "initial_sd": null,
+        "mode": "dynamic",
+        "name": "level",
+        "type": "local_level"
+      }
+    ],
+    "eta_name": "mu",
+    "name": "heavy tail",
+    "observation": {
+      "family": "gev",
+      "xi_bounds": [
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  "n_time": 800,
+  "name": "heavy_tail",
+  "params": {
+    "sd.level": 0.08,
+    "sigma": 1.5,
+    "xi": 0.3
+  },
+  "period": 4,
+  "seed": 2601
+}

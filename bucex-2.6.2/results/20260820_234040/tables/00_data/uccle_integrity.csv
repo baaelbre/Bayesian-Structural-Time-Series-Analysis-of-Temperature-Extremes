@@ -1,0 +1,5 @@
+series,description,tail,n,start,end,minimum,maximum,mean,sd
+TXx,monthly maximum daily maximum temperature,max,1572,1892-01-01,2022-12-01,3.2,39.7,20.838867684478373,7.270499462514449
+TXn,monthly minimum daily maximum temperature,min,1572,1892-01-01,2022-12-01,-11.6,23.0,7.064185750636132,6.897080705045904
+TNx,monthly maximum daily minimum temperature,max,1572,1892-01-01,2022-12-01,-0.5,23.5,12.138358778625955,4.42382423436506
+TNn,monthly minimum daily minimum temperature,min,1572,1892-01-01,2022-12-01,-18.4,13.0,0.38040712468193383,6.002459528751256
