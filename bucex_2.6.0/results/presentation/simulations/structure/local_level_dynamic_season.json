@@ -1,0 +1,31 @@
+{
+  "description": "Dynamic level and slowly evolving annual cycle.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.0,
+  "level": "dynamic",
+  "n_time": 240,
+  "name": "local_level_dynamic_season",
+  "parameter_truth": {
+    "sd.level": 0.06,
+    "sd.seasonal": 0.035,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.2
+  },
+  "sd_level": 0.06,
+  "sd_seasonal": 0.035,
+  "sd_slope": 0.0,
+  "season": "dynamic",
+  "season_amplitude": 7.0,
+  "seed": 2614,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 2,
+    "slope": 0
+  },
+  "title": "Local level + dynamic season",
+  "trend": "zero",
+  "xi": -0.2
+}

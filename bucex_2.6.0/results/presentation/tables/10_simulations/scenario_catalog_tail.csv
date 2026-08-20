@@ -1,0 +1,4 @@
+name,title,group,description,n_time,sigma,xi,level,trend,season,sd_level,sd_slope,sd_seasonal,initial_level,initial_slope,season_amplitude,seed,structural_truth.level,structural_truth.slope,structural_truth.seasonal,parameter_truth.sigma,parameter_truth.xi,parameter_truth.sd.level,parameter_truth.sd.slope,parameter_truth.sd.seasonal
+heavy_tail,"Local level, heavy tail",tail,Fréchet-type GEV with xi > 0.,240,1.5,0.2,dynamic,zero,zero,0.1,0.0,0.0,25.0,0.0,0.0,2601,2,0,0,1.5,0.2,0.1,0.0,0.0
+gumbel_tail,"Local level, exponential tail",tail,Gumbel limit with xi = 0.,240,1.5,0.0,dynamic,zero,zero,0.1,0.0,0.0,25.0,0.0,0.0,2601,2,0,0,1.5,0.0,0.1,0.0,0.0
+bounded_tail,"Local level, bounded tail",tail,Weibull-type GEV with xi < 0 and a finite endpoint.,240,1.5,-0.2,dynamic,zero,zero,0.1,0.0,0.0,25.0,0.0,0.0,2601,2,0,0,1.5,-0.2,0.1,0.0,0.0

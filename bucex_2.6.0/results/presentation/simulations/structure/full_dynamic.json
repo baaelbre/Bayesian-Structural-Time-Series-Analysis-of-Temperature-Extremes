@@ -1,0 +1,31 @@
+{
+  "description": "All three structural innovation channels are active.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.004,
+  "level": "dynamic",
+  "n_time": 240,
+  "name": "full_dynamic",
+  "parameter_truth": {
+    "sd.level": 0.05,
+    "sd.seasonal": 0.03,
+    "sd.slope": 0.00035,
+    "sigma": 1.5,
+    "xi": -0.2
+  },
+  "sd_level": 0.05,
+  "sd_seasonal": 0.03,
+  "sd_slope": 0.00035,
+  "season": "dynamic",
+  "season_amplitude": 7.0,
+  "seed": 2616,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 2,
+    "slope": 2
+  },
+  "title": "Level + trend + dynamic season",
+  "trend": "dynamic",
+  "xi": -0.2
+}

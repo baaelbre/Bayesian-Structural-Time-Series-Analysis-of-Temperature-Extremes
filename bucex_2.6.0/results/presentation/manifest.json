@@ -1,0 +1,89 @@
+{
+  "configuration": "results\\presentation\\config.json",
+  "schema": "bucex-presentation-2",
+  "tasks": {
+    "data": {
+      "artifacts": [
+        "results\\presentation\\tables\\00_data\\uccle_extremes.csv",
+        "results\\presentation\\tables\\00_data\\uccle_integrity.csv",
+        "results\\presentation\\figures\\00_data\\00_uccle_extremes.pdf",
+        "results\\presentation\\figures\\00_data\\00_uccle_extremes.png",
+        "results\\presentation\\figures\\00_data\\01_txx_evolution.pdf",
+        "results\\presentation\\figures\\00_data\\01_txx_evolution.png",
+        "results\\presentation\\figures\\00_data\\02_txx_cycle_shift.pdf",
+        "results\\presentation\\figures\\00_data\\02_txx_cycle_shift.png"
+      ],
+      "details": {
+        "n_time": 516,
+        "series": [
+          "TXx",
+          "TXn",
+          "TNx",
+          "TNn"
+        ]
+      },
+      "status": "complete",
+      "updated_utc": "2026-08-20T08:11:53.705729+00:00"
+    },
+    "simulations:structure:all": {
+      "artifacts": [
+        "results\\presentation\\simulations\\structure\\stationary.csv",
+        "results\\presentation\\simulations\\structure\\stationary.json",
+        "results\\presentation\\simulations\\structure\\linear_trend.csv",
+        "results\\presentation\\simulations\\structure\\linear_trend.json",
+        "results\\presentation\\simulations\\structure\\local_level.csv",
+        "results\\presentation\\simulations\\structure\\local_level.json",
+        "results\\presentation\\simulations\\structure\\local_level_fixed_season.csv",
+        "results\\presentation\\simulations\\structure\\local_level_fixed_season.json",
+        "results\\presentation\\simulations\\structure\\local_level_dynamic_season.csv",
+        "results\\presentation\\simulations\\structure\\local_level_dynamic_season.json",
+        "results\\presentation\\simulations\\structure\\stochastic_trend_fixed_season.csv",
+        "results\\presentation\\simulations\\structure\\stochastic_trend_fixed_season.json",
+        "results\\presentation\\simulations\\structure\\full_dynamic.csv",
+        "results\\presentation\\simulations\\structure\\full_dynamic.json",
+        "results\\presentation\\tables\\10_simulations\\scenario_catalog_structure.csv",
+        "results\\presentation\\figures\\10_simulations\\structure\\20_structural_scenarios.pdf",
+        "results\\presentation\\figures\\10_simulations\\structure\\20_structural_scenarios.png",
+        "results\\presentation\\figures\\10_simulations\\structure\\21_true_components.pdf",
+        "results\\presentation\\figures\\10_simulations\\structure\\21_true_components.png"
+      ],
+      "details": {
+        "scenarios": [
+          "stationary",
+          "linear_trend",
+          "local_level",
+          "local_level_fixed_season",
+          "local_level_dynamic_season",
+          "stochastic_trend_fixed_season",
+          "full_dynamic"
+        ]
+      },
+      "status": "complete",
+      "updated_utc": "2026-08-20T08:12:20.486645+00:00"
+    },
+    "simulations:tail:all": {
+      "artifacts": [
+        "results\\presentation\\simulations\\tail\\heavy_tail.csv",
+        "results\\presentation\\simulations\\tail\\heavy_tail.json",
+        "results\\presentation\\simulations\\tail\\gumbel_tail.csv",
+        "results\\presentation\\simulations\\tail\\gumbel_tail.json",
+        "results\\presentation\\simulations\\tail\\bounded_tail.csv",
+        "results\\presentation\\simulations\\tail\\bounded_tail.json",
+        "results\\presentation\\tables\\10_simulations\\scenario_catalog_tail.csv",
+        "results\\presentation\\figures\\10_simulations\\tail\\10_local_level_tail_classes.pdf",
+        "results\\presentation\\figures\\10_simulations\\tail\\10_local_level_tail_classes.png",
+        "results\\presentation\\figures\\10_simulations\\tail\\11_gev_tail_shapes.pdf",
+        "results\\presentation\\figures\\10_simulations\\tail\\11_gev_tail_shapes.png"
+      ],
+      "details": {
+        "scenarios": [
+          "heavy_tail",
+          "gumbel_tail",
+          "bounded_tail"
+        ]
+      },
+      "status": "complete",
+      "updated_utc": "2026-08-20T08:12:00.560319+00:00"
+    }
+  }
+}

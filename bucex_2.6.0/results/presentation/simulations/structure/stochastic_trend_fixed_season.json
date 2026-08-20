@@ -1,0 +1,31 @@
+{
+  "description": "Dynamic slope with no separate level shocks and a fixed annual cycle.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.004,
+  "level": "fixed",
+  "n_time": 240,
+  "name": "stochastic_trend_fixed_season",
+  "parameter_truth": {
+    "sd.level": 0.0,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.00045,
+    "sigma": 1.5,
+    "xi": -0.2
+  },
+  "sd_level": 0.0,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.00045,
+  "season": "fixed",
+  "season_amplitude": 7.0,
+  "seed": 2615,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 1,
+    "seasonal": 1,
+    "slope": 2
+  },
+  "title": "Stochastic trend + fixed season",
+  "trend": "dynamic",
+  "xi": -0.2
+}

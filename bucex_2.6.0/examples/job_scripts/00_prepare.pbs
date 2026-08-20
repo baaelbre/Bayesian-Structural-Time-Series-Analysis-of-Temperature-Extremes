@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#PBS -N bucex_prepare
+#PBS -l select=1:ncpus=1:mem=4gb
+#PBS -l walltime=01:00:00
+#PBS -j oe
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
+bucex_run data --figures
+bucex_run tail-simulations --figures
+bucex_run structural-simulations --figures
+

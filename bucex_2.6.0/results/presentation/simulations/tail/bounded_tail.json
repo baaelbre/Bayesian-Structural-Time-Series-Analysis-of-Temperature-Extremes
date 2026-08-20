@@ -1,0 +1,31 @@
+{
+  "description": "Weibull-type GEV with xi < 0 and a finite endpoint.",
+  "group": "tail",
+  "initial_level": 25.0,
+  "initial_slope": 0.0,
+  "level": "dynamic",
+  "n_time": 240,
+  "name": "bounded_tail",
+  "parameter_truth": {
+    "sd.level": 0.1,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.2
+  },
+  "sd_level": 0.1,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.0,
+  "season": "zero",
+  "season_amplitude": 0.0,
+  "seed": 2601,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 0,
+    "slope": 0
+  },
+  "title": "Local level, bounded tail",
+  "trend": "zero",
+  "xi": -0.2
+}

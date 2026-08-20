@@ -1,0 +1,31 @@
+{
+  "description": "Fixed level; trend and season absent.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.0,
+  "level": "fixed",
+  "n_time": 240,
+  "name": "stationary",
+  "parameter_truth": {
+    "sd.level": 0.0,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.2
+  },
+  "sd_level": 0.0,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.0,
+  "season": "zero",
+  "season_amplitude": 0.0,
+  "seed": 2610,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 1,
+    "seasonal": 0,
+    "slope": 0
+  },
+  "title": "Stationary location",
+  "trend": "zero",
+  "xi": -0.2
+}

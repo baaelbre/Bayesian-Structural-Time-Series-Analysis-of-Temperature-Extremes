@@ -1,0 +1,21 @@
+{
+  "data_dir": null,
+  "end": null,
+  "figure_dpi": 180,
+  "figure_formats": [
+    "pdf",
+    "png"
+  ],
+  "output_dir": "results\\presentation",
+  "profile": "pilot",
+  "progress": true,
+  "runtime": {
+    "chains": 2,
+    "draws": 250,
+    "particles": 128,
+    "simulation_months": 240,
+    "warmup": 250
+  },
+  "seed": 26000,
+  "start": "1980-01-01"
+}
