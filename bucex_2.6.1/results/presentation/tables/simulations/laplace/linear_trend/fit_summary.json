@@ -1,0 +1,28 @@
+{
+  "source": "results\\presentation\\fits\\simulations\\laplace\\linear_trend\\combined.bucex",
+  "series": "linear_trend",
+  "n_time": 1000,
+  "n_chains": 1,
+  "draws_per_chain": 400,
+  "plan": {
+    "family": "gev",
+    "engine": "laplace",
+    "parameterization": "fruehwirth_schnatter",
+    "asis": false,
+    "state_update": "iterated Laplace FFBS approximation",
+    "targets_exact_posterior": false,
+    "approximation": "iterated_laplace",
+    "interweaves_with": null,
+    "backend": "fruehwirth_schnatter",
+    "warnings": []
+  },
+  "prior_profile": "ssvs",
+  "targets_exact_posterior": false,
+  "warm_start_source": null,
+  "engine_diagnostics": {
+    "convergence_rate": 1.0,
+    "median_iterations": 1.0,
+    "median_relative_change": 0.0,
+    "mean_support_rejections": 0.0
+  }
+}

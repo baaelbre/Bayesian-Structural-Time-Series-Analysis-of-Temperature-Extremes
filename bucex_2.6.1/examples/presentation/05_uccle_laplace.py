@@ -22,21 +22,28 @@ PERIOD = 12
 
 # Prior hyperparameters for the observed monthly series.
 ALPHA_PRIOR_SD = 3.2
-BETA_PRIOR_MEAN = 0.0
-BETA_PRIOR_SD = 0.010
+# The current Uccle OLS rates are only approximately 0.15–0.21
+#C per decade, which is very close to the global average. This is about 0.2/decade, or about 0.2/120 = 0.002 per month. 
+BETA_PRIOR_MEAN = 0.002
+BETA_PRIOR_SD = 0.01
 INITIAL_SEASON_PRIOR_SD = 2.25
 SIGMA2_PRIOR_A = 2.0
 SIGMA2_PRIOR_B = 2.0
 XI_PRIOR_BOUNDS = (-0.50, 0.50)
 XI_MAX_ABS = 0.50
+# trend slab: 0.00005, 0.00010, 0.00020, 0.00040
+#beta SD:    0.0025, 0.0040, 0.0075
 INNOVATION_SLAB_SD = {
-    "level": 0.12,
-    "trend": 0.0015,
-    "season": 0.10,
+    "level": 0.05,
+    "trend": 0.00010,
+    "season": 0.09,
 }
 LEVEL_DYNAMIC_PROBABILITY = 0.50
 TREND_PROBABILITIES = (1.0 / 3.0,) * 3
 SEASON_PROBABILITIES = (1.0 / 3.0,) * 3
+# or:
+#TREND_PROBABILITIES = (0.0, 0.5, 0.5) # or (0.10,0.45,0.45)
+#SEASON_PROBABILITIES = (0.0, 0.5, 0.5) 
 
 # Pilot settings. For final results use 2_000 draws, 2_000 warmup, 4 chains.
 DRAWS = 250

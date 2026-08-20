@@ -1,0 +1,32 @@
+{
+  "description": "Fixed level and evolving seasonal cycle; slope absent.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.0,
+  "level": "fixed",
+  "n_time": 1000,
+  "name": "stationary_dynamic_season",
+  "parameter_truth": {
+    "sd.level": 0.0,
+    "sd.seasonal": 0.05,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "sd_level": 0.0,
+  "sd_seasonal": 0.05,
+  "sd_slope": 0.0,
+  "season": "dynamic",
+  "season_amplitude": 0.25,
+  "seed": 13082001,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 1,
+    "seasonal": 2,
+    "slope": 0
+  },
+  "title": "Stationary level + changing seasonality",
+  "trend": "zero",
+  "xi": -0.3
+}

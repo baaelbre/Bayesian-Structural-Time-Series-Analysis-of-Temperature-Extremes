@@ -1,0 +1,28 @@
+{
+  "source": "results\\presentation\\fits\\uccle\\laplace\\TNx\\combined.bucex",
+  "series": "TNx",
+  "n_time": 1572,
+  "n_chains": 2,
+  "draws_per_chain": 250,
+  "plan": {
+    "family": "gev",
+    "engine": "laplace",
+    "parameterization": "fruehwirth_schnatter",
+    "asis": false,
+    "state_update": "iterated Laplace FFBS approximation",
+    "targets_exact_posterior": false,
+    "approximation": "iterated_laplace",
+    "interweaves_with": null,
+    "backend": "fruehwirth_schnatter",
+    "warnings": []
+  },
+  "prior_profile": "ssvs",
+  "targets_exact_posterior": false,
+  "warm_start_source": null,
+  "engine_diagnostics": {
+    "convergence_rate": 1.0,
+    "median_iterations": 3.0,
+    "median_relative_change": 2.6499027952688774e-07,
+    "mean_support_rejections": 0.006
+  }
+}

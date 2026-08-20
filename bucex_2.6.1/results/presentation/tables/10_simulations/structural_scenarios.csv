@@ -1,0 +1,7 @@
+name,title,group,description,n_time,sigma,xi,level,trend,season,sd_level,sd_slope,sd_seasonal,initial_level,initial_slope,season_amplitude,seed,period,structural_truth.level,structural_truth.slope,structural_truth.seasonal,parameter_truth.sigma,parameter_truth.xi,parameter_truth.sd.level,parameter_truth.sd.slope,parameter_truth.sd.seasonal
+stationary,Stationary,structure,Fixed level; trend and seasonality absent.,1000,1.5,-0.3,fixed,zero,zero,0.0,0.0,0.0,25.0,0.0,0.0,13081997,4,1,0,0,1.5,-0.3,0.0,0.0,0.0
+linear_trend,Linear trend,structure,Deterministic non-zero slope; seasonality absent.,1000,1.5,-0.3,fixed,fixed,zero,0.0,0.0,0.0,25.0,0.006,0.0,13081998,4,1,1,0,1.5,-0.3,0.0,0.0,0.0
+random_walk,Random walk,structure,Stochastic level; slope and seasonality absent.,1000,1.5,-0.3,dynamic,zero,zero,0.05,0.0,0.0,25.0,0.0,0.0,13081999,4,2,0,0,1.5,-0.3,0.05,0.0,0.0
+local_linear_trend,Local linear trend,structure,Stochastic level and stochastic slope; seasonality absent.,1000,1.5,-0.3,dynamic,dynamic,zero,0.05,0.0005,0.0,25.0,0.003,0.0,13082000,4,2,2,0,1.5,-0.3,0.05,0.0005,0.0
+stationary_dynamic_season,Stationary level + changing seasonality,structure,Fixed level and evolving seasonal cycle; slope absent.,1000,1.5,-0.3,fixed,zero,dynamic,0.0,0.0,0.05,25.0,0.0,0.25,13082001,4,1,0,2,1.5,-0.3,0.0,0.0,0.05
+local_linear_trend_fixed_season,Local linear trend + fixed seasonality,structure,Stochastic level and slope with a fixed seasonal cycle.,1000,1.5,-0.3,dynamic,dynamic,fixed,0.05,0.0005,0.0,25.0,0.003,0.25,13082000,4,2,2,1,1.5,-0.3,0.05,0.0005,0.0

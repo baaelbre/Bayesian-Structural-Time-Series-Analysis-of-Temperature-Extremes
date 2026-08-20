@@ -1,0 +1,32 @@
+{
+  "description": "Stochastic level and stochastic slope; seasonality absent.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.003,
+  "level": "dynamic",
+  "n_time": 1000,
+  "name": "local_linear_trend",
+  "parameter_truth": {
+    "sd.level": 0.05,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0005,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "sd_level": 0.05,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.0005,
+  "season": "zero",
+  "season_amplitude": 0.0,
+  "seed": 13082000,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 0,
+    "slope": 2
+  },
+  "title": "Local linear trend",
+  "trend": "dynamic",
+  "xi": -0.3
+}

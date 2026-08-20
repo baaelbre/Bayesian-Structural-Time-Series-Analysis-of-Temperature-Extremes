@@ -1,0 +1,4 @@
+process,zero,fixed,dynamic
+level,0.0,0.0,1.0
+slope,0.796,0.11,0.094
+seasonal,0.0,0.606,0.394

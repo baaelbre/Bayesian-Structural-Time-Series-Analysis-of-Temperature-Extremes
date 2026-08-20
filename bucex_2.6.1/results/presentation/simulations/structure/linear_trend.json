@@ -1,0 +1,32 @@
+{
+  "description": "Deterministic non-zero slope; seasonality absent.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.006,
+  "level": "fixed",
+  "n_time": 1000,
+  "name": "linear_trend",
+  "parameter_truth": {
+    "sd.level": 0.0,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "sd_level": 0.0,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.0,
+  "season": "zero",
+  "season_amplitude": 0.0,
+  "seed": 13081998,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 1,
+    "seasonal": 0,
+    "slope": 1
+  },
+  "title": "Linear trend",
+  "trend": "fixed",
+  "xi": -0.3
+}

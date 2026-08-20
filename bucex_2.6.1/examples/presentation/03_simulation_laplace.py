@@ -24,26 +24,28 @@ OUTPUT_DIR = Path("results/presentation")
 
 # Simulation design. Keep these values aligned with 02_structural_simulations.py
 # when you want both files to reuse the same generated CSV/JSON artifacts.
-N_TIME = 800
+N_TIME = 1000
 PERIOD = 4
 SIGMA = 1.50
 XI = -0.30
 INITIAL_LEVEL = 25.0
+# Structural signal sizes. (sigma >> Q)
 LINEAR_SLOPE = 0.006
-RANDOM_WALK_SD = 0.060
-LOCAL_LEVEL_SD = 0.035
+RANDOM_WALK_SD = 0.05
+LOCAL_LEVEL_SD = 0.05
 LOCAL_SLOPE_SD = 0.00050
 LOCAL_INITIAL_SLOPE = 0.003
-DYNAMIC_SEASON_AMPLITUDE = 1.25
-FIXED_SEASON_AMPLITUDE = 1.75
-SEASONAL_SD = 0.040
-SIMULATION_SEED = 2_610
+DYNAMIC_SEASON_AMPLITUDE = .25
+FIXED_SEASON_AMPLITUDE = .25
+SEASONAL_SD = 0.05
+SIMULATION_SEED = 13081997
+
 
 # Fully exposed prior hyperparameters.
 ALPHA_PRIOR_SD = 3.2
 BETA_PRIOR_MEAN = 0.0
-BETA_PRIOR_SD = 0.010
-INITIAL_SEASON_PRIOR_SD = 2.5
+BETA_PRIOR_SD = 0.01
+INITIAL_SEASON_PRIOR_SD = 0.5
 SIGMA2_PRIOR_A = 2.0
 SIGMA2_PRIOR_B = 2.25
 XI_PRIOR_BOUNDS = (-0.50, 0.50)
@@ -58,16 +60,16 @@ TREND_PROBABILITIES = (1.0 / 3.0,) * 3  # absent, fixed, dynamic
 SEASON_PROBABILITIES = (1.0 / 3.0,) * 3  # absent, fixed, dynamic
 
 # Pilot settings. For the final analysis use 2_000, 2_000, and 4 chains.
-DRAWS = 250
-WARMUP = 250
-CHAINS = 2
-SEED = 26_000
+DRAWS = 400
+WARMUP = 100
+CHAINS = 1
+SEED = 13081997
 PROGRESS = True
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
-OVERWRITE = False
+OVERWRITE = True
 
 
 SCENARIOS = bx.make_structural_scenarios(

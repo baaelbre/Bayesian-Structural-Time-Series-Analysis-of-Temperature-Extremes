@@ -1,0 +1,32 @@
+{
+  "description": "Stochastic level; slope and seasonality absent.",
+  "group": "structure",
+  "initial_level": 25.0,
+  "initial_slope": 0.0,
+  "level": "dynamic",
+  "n_time": 1000,
+  "name": "random_walk",
+  "parameter_truth": {
+    "sd.level": 0.05,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "sd_level": 0.05,
+  "sd_seasonal": 0.0,
+  "sd_slope": 0.0,
+  "season": "zero",
+  "season_amplitude": 0.0,
+  "seed": 13081999,
+  "sigma": 1.5,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 0,
+    "slope": 0
+  },
+  "title": "Random walk",
+  "trend": "zero",
+  "xi": -0.3
+}

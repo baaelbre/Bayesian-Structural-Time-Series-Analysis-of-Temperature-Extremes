@@ -17,27 +17,27 @@ import bucex as bx
 OUTPUT_DIR = Path("results/presentation")
 
 # Common observation model and length.
-N_TIME = 800
+N_TIME = 1000
 PERIOD = 4
 SIGMA = 1.50
 XI = -0.30
 INITIAL_LEVEL = 25.0
 
-# Structural signal sizes. They are deliberately modest; the longer series
-# supplies the evidence rather than artificially large process innovations.
+# Structural signal sizes. (sigma >> Q)
 LINEAR_SLOPE = 0.006
-RANDOM_WALK_SD = 0.060
-LOCAL_LEVEL_SD = 0.035
+RANDOM_WALK_SD = 0.05
+LOCAL_LEVEL_SD = 0.05
 LOCAL_SLOPE_SD = 0.00050
 LOCAL_INITIAL_SLOPE = 0.003
-DYNAMIC_SEASON_AMPLITUDE = 1.25
-FIXED_SEASON_AMPLITUDE = 1.75
-SEASONAL_SD = 0.040
-SIMULATION_SEED = 2_610
+DYNAMIC_SEASON_AMPLITUDE = .25
+FIXED_SEASON_AMPLITUDE = .25
+SEASONAL_SD = 0.05
+SIMULATION_SEED = 13081997
+
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
-OVERWRITE = False
+OVERWRITE = True
 
 
 SCENARIOS = bx.make_structural_scenarios(
