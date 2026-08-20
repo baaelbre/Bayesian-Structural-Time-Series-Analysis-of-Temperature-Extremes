@@ -25,6 +25,35 @@
       "status": "complete",
       "updated_utc": "2026-08-20T08:11:53.705729+00:00"
     },
+    "simulation-fit:laplace:stationary:combined": {
+      "artifacts": [
+        "results\\presentation\\fits\\simulations\\laplace\\stationary\\combined.bucex",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\fit_summary.json",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\parameters.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\diagnostics.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\posterior_trajectory.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\algorithm_diagnostics.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\selection_probabilities.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\structural_models.csv",
+        "results\\presentation\\tables\\simulations\\laplace\\stationary\\selection_switching.csv",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\posterior_trajectory.pdf",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\posterior_trajectory.png",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\selection_probabilities.pdf",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\selection_probabilities.png",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\prior_to_posterior_process_sd.pdf",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\prior_to_posterior_process_sd.png",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\gev_parameters.pdf",
+        "results\\presentation\\figures\\simulations\\laplace\\stationary\\gev_parameters.png"
+      ],
+      "details": {
+        "chain": null,
+        "engine": "laplace",
+        "laplace_warm_start": false,
+        "scenario": "stationary"
+      },
+      "status": "complete",
+      "updated_utc": "2026-08-20T08:23:50.695051+00:00"
+    },
     "simulations:structure:all": {
       "artifacts": [
         "results\\presentation\\simulations\\structure\\stationary.csv",
