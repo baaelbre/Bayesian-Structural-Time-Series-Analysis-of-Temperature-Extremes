@@ -1,0 +1,5 @@
+metric,value
+convergence_rate,1.0
+median_iterations,3.0
+median_relative_change,1.2152648673951725e-08
+mean_support_rejections,0.0

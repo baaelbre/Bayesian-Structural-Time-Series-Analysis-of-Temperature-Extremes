@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+#PBS -N bucex_sim_lap_c
+#PBS -l select=1:ncpus=1:mem=8gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
+bucex_combine simulation-fit --engine laplace --no-figures
+
