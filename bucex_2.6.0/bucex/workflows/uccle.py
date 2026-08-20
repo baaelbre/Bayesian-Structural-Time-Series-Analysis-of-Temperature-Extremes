@@ -4,8 +4,9 @@ The workflow follows the scientific story rather than the implementation
 history of the package:
 
 1. describe the Uccle record, led by TXx;
-2. illustrate the three GEV tail classes under one local-level signal;
-3. illustrate absent, fixed, and dynamic structural components;
+2. illustrate GEV shape and observation-scale effects under matched local-level
+   signals;
+3. illustrate absent, fixed, and visibly stochastic structural components;
 4. assess componentwise SSVS recovery with a Laplace state update;
 5. repeat the same fits with PGAS, initialized from the Laplace posterior;
 6. analyse TXx, TXn, TNx, and TNn in that order.
@@ -35,6 +36,7 @@ from .results import (
     collect_selection_probabilities,
     export_fit_results,
     plot_fit_results,
+    plot_scale_simulations,
     plot_selection_recovery,
     plot_structural_simulations,
     plot_tail_simulations,
@@ -43,6 +45,7 @@ from .results import (
 )
 from .scenarios import (
     ALL_SCENARIOS,
+    SCALE_SCENARIOS,
     STRUCTURAL_SCENARIOS,
     TAIL_SCENARIOS,
     GEVScenario,
@@ -338,22 +341,26 @@ class PresentationWorkflow:
         scenario: str | None,
     ) -> tuple[GEVScenario, ...]:
         group = str(kind).lower().replace("_", "-")
-        if group not in {"all", "tail", "structure", "structural"}:
-            raise ValueError("kind must be all, tail, or structure.")
+        if group not in {"all", "tail", "scale", "structure", "structural"}:
+            raise ValueError("kind must be all, tail, scale, or structure.")
         if scenario is not None:
             selected = scenario_by_name(scenario)
-            if group in {"tail", "structure", "structural"}:
+            if group in {"tail", "scale", "structure", "structural"}:
                 expected = (
-                    "structure" if group in {"structure", "structural"} else "tail"
+                    {"structure"}
+                    if group in {"structure", "structural"}
+                    else ({"tail", "scale"} if group == "tail" else {"scale"})
                 )
-                if selected.group != expected:
+                if selected.group not in expected:
                     raise ValueError(
                         f"Scenario {selected.name!r} belongs to {selected.group!r}, "
-                        f"not {expected!r}."
+                        f"not one of {sorted(expected)!r}."
                     )
             return (selected,)
         if group == "tail":
-            return TAIL_SCENARIOS
+            return (*TAIL_SCENARIOS, *SCALE_SCENARIOS)
+        if group == "scale":
+            return SCALE_SCENARIOS
         if group in {"structure", "structural"}:
             return STRUCTURAL_SCENARIOS
         return ALL_SCENARIOS
@@ -366,11 +373,19 @@ class PresentationWorkflow:
         overwrite: bool = False,
         figures: bool = True,
     ) -> list[Path]:
-        """Generate reproducible tail-class and structural scenarios."""
+        """Generate reproducible shape, scale, and structural scenarios."""
 
         selected = self._selected_scenarios(kind=kind, scenario=scenario)
-        tables: dict[str, dict[str, pd.DataFrame]] = {"tail": {}, "structure": {}}
-        truths: dict[str, dict[str, dict[str, Any]]] = {"tail": {}, "structure": {}}
+        tables: dict[str, dict[str, pd.DataFrame]] = {
+            "tail": {},
+            "scale": {},
+            "structure": {},
+        }
+        truths: dict[str, dict[str, dict[str, Any]]] = {
+            "tail": {},
+            "scale": {},
+            "structure": {},
+        }
         artifacts: list[Path] = []
         catalog_rows = []
         for base in selected:
@@ -419,6 +434,15 @@ class PresentationWorkflow:
                         tables["tail"],
                         truths["tail"],
                         self.paths.figures / "10_simulations" / "tail",
+                        **self._figure_options(),
+                    )
+                )
+            if set(tables["scale"]) == {item.name for item in SCALE_SCENARIOS}:
+                artifacts.extend(
+                    plot_scale_simulations(
+                        tables["scale"],
+                        truths["scale"],
+                        self.paths.figures / "10_simulations" / "scale",
                         **self._figure_options(),
                     )
                 )

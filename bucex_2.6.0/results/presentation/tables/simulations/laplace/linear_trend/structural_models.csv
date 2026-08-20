@@ -1,0 +1,6 @@
+,level,slope,seasonal,probability
+0,fixed,dynamic,zero,0.342
+1,dynamic,fixed,zero,0.242
+2,dynamic,dynamic,zero,0.224
+3,fixed,fixed,zero,0.164
+4,dynamic,zero,zero,0.028

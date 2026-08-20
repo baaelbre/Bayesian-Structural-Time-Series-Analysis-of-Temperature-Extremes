@@ -5,7 +5,8 @@ extreme-value observations. Version 2.6.0 provides one focused, reproducible
 workflow for the COMPSTAT temperature-extremes presentation:
 
 1. introduce the Uccle record and the evolution of TXx;
-2. compare heavy, Gumbel, and bounded GEV tails under the same local level;
+2. compare `xi=-0.30,0,+0.30` and `sigma=0.75,1.50,3.00` under matched
+   local-level paths;
 3. simulate absent, fixed, and dynamic trend/seasonal components;
 4. recover those components with componentwise SSVS and a Laplace state update;
 5. repeat the identical experiment with Laplace-initialized PGAS;
@@ -13,9 +14,10 @@ workflow for the COMPSTAT temperature-extremes presentation:
 7. export selection probabilities, posterior trajectories,
    prior-to-posterior plots, parameter summaries, and algorithm diagnostics.
 
-The old presentation scripts have been removed. The numbered scripts under
-`examples/presentation/` and the PBS dependency graph under
-`examples/job_scripts/` are the complete supported presentation surface.
+The old presentation scripts have been removed. The seven numbered files under
+`examples/presentation/` are standalone, direct-API examples; the PBS
+dependency graph under `examples/job_scripts/` remains the batch-computing
+surface.
 
 ## Installation
 
@@ -43,7 +45,7 @@ The smoke output is not suitable for inference. Runtime profiles are explicit:
 | Profile | Uccle window | Draws/warmup | Chains | Particles | Simulation months |
 |---|---|---:|---:|---:|---:|
 | `smoke` | 2015–2022 | 2/2 | 1 | 24 | 48 |
-| `pilot` | 1980–2022 | 250/250 | 2 | 128 | 240 |
+| `pilot` | 1892–2022 | 250/250 | 2 | 128 | 360 |
 | `publication` | 1892–2022 | 2,000/2,000 | 4 | 512 | 720 |
 
 Publication defaults are starting values. Final particle counts and chain
@@ -165,9 +167,11 @@ conditioned lineage is sticky even when the particle ESS looks acceptable.
 
 ## Simulation design
 
-Tail-class illustrations use one local-level specification and vary only
-`xi`: `+0.20`, `0`, and `-0.20`. Structural-selection experiments instead fix
-`sigma=1.5` and `xi=-0.20` and vary only the UC structure:
+Tail-class illustrations use one 30-year local-level realization and vary only
+`xi`: `-0.30`, `0`, and `+0.30`. A second matched experiment fixes
+`xi=-0.30` and varies only `sigma`: `0.75`, `1.50`, and `3.00`.
+Structural-selection experiments fix `sigma=1.5` and `xi=-0.30`, then vary only
+the UC structure with deliberately visible stochastic innovations:
 
 - stationary location;
 - fixed linear trend;
@@ -180,10 +184,16 @@ Tail-class illustrations use one local-level specification and vary only
 Every simulated CSV stores the observations and true level, slope, seasonal
 contribution, and linear predictor. Its adjacent JSON file stores the model and
 parameter truth used by selection-recovery and prior-to-posterior figures.
+Each simulated time series has its own figure. Only the scenario-specific true
+decomposition is multi-panel, with level, slope, and seasonality shown in three
+stacked panels.
 
-## Presentation workflow
+## Standalone presentation examples
 
-Run the scripts in order:
+Every file imports only `bucex` and ordinary Python dependencies, keeps its
+settings at the top, and calls `bx.simulate_scenario`, `bx.fit`, persistence,
+and result helpers directly. No shared settings file or orchestration object is
+needed. Run any file by itself, or run the full sequence:
 
 ```bash
 python examples/presentation/00_uccle_record.py
@@ -193,10 +203,14 @@ python examples/presentation/03_simulation_laplace.py
 python examples/presentation/04_simulation_pgas.py
 python examples/presentation/05_uccle_laplace.py
 python examples/presentation/06_uccle_pgas.py
-python examples/presentation/07_build_results.py
 ```
 
-Or use the CLI for a single task:
+The PGAS files create a missing Laplace initializer themselves and otherwise
+reuse its saved `FitResult`. Pilot constants are visible at the top of each fit
+file; the final values are 2,000 draws, 2,000 warmup iterations, 4 chains, and
+512 guided particles for PGAS.
+
+For HPC orchestration, use the CLI for a single task:
 
 ```bash
 bucex-presentation run simulation-fit \

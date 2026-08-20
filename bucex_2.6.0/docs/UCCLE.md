@@ -18,11 +18,14 @@ observations. The broader data API still includes the Gaussian monthly means
 
 The workflow is ordered to separate questions that are otherwise easy to mix:
 
-1. The Uccle record and TXx evolution establish why stationarity is doubtful.
-2. Tail simulations vary only `xi`, showing that tail class and latent
-   nonstationarity are different modelling decisions.
-3. Structural simulations fix `sigma=1.5` and `xi=-0.20`, then vary only the
-   unobserved components.
+1. The complete Uccle record, beginning in 1892, and TXx evolution establish
+   why stationarity is doubtful.
+2. Matched simulations vary `xi` over `-0.30`, `0`, and `+0.30`, then vary
+   `sigma` over `0.75`, `1.50`, and `3.00`. Tail/scale and latent
+   nonstationarity are therefore kept as separate modelling decisions.
+3. Structural simulations fix `sigma=1.5` and `xi=-0.30`, then vary only the
+   unobserved components with innovations large enough to distinguish fixed
+   from stochastic evolution visually.
 4. Laplace fits give a fast, explicitly approximate SSVS analysis.
 5. PGAS fits use the Laplace path as an initializer and the exact GEV density.
 6. The same model/prior is fitted to TXx, TXn, TNx, and TNn.
@@ -41,6 +44,10 @@ bucex-presentation report --profile pilot --strict
 PGAS commands require the matching combined Laplace files. A fit on one record
 window cannot initialize a fit on another because observations and path length
 must match exactly.
+
+The standalone examples use `START="1892-01-01"`. Each simulated series is
+saved as a separate figure; only its level/slope/seasonal truth decomposition
+uses a three-panel layout.
 
 ## What the structural probabilities mean
 

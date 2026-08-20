@@ -7,11 +7,13 @@ import numpy as np
 import bucex as bx
 
 
-def test_v260_scenario_catalog_separates_tail_and_structure_questions():
+def test_v260_scenario_catalog_separates_shape_scale_and_structure_questions():
     assert bx.__version__ == "2.6.0"
-    assert [scenario.xi for scenario in bx.TAIL_SCENARIOS] == [0.20, 0.0, -0.20]
+    assert [scenario.xi for scenario in bx.TAIL_SCENARIOS] == [-0.30, 0.0, 0.30]
+    assert [scenario.sigma for scenario in bx.SCALE_SCENARIOS] == [0.75, 1.5, 3.0]
+    assert {scenario.xi for scenario in bx.SCALE_SCENARIOS} == {-0.30}
     assert {scenario.sigma for scenario in bx.STRUCTURAL_SCENARIOS} == {1.5}
-    assert {scenario.xi for scenario in bx.STRUCTURAL_SCENARIOS} == {-0.20}
+    assert {scenario.xi for scenario in bx.STRUCTURAL_SCENARIOS} == {-0.30}
     assert {scenario.name for scenario in bx.STRUCTURAL_SCENARIOS} == {
         "stationary",
         "linear_trend",
@@ -21,6 +23,24 @@ def test_v260_scenario_catalog_separates_tail_and_structure_questions():
         "stochastic_trend_fixed_season",
         "full_dynamic",
     }
+    assert min(
+        scenario.sd_level
+        for scenario in bx.STRUCTURAL_SCENARIOS
+        if scenario.level == "dynamic"
+    ) >= 0.10
+
+    tail_tables = [
+        bx.simulate_scenario(scenario.resized(48))[1]
+        for scenario in bx.TAIL_SCENARIOS
+    ]
+    scale_tables = [
+        bx.simulate_scenario(scenario.resized(48))[1]
+        for scenario in bx.SCALE_SCENARIOS
+    ]
+    for table in tail_tables[1:]:
+        np.testing.assert_allclose(table["eta"], tail_tables[0]["eta"])
+    for table in scale_tables[1:]:
+        np.testing.assert_allclose(table["eta"], scale_tables[0]["eta"])
 
 
 def test_componentwise_presentation_prior_has_readable_model_space():
@@ -32,6 +52,62 @@ def test_componentwise_presentation_prior_has_readable_model_space():
         "level": 0.12,
         "trend": 0.0015,
         "season": 0.10,
+    }
+
+
+def test_simulation_series_are_separate_and_decomposition_has_its_own_file(
+    tmp_path,
+):
+    tail_tables = {}
+    tail_truths = {}
+    for scenario in bx.TAIL_SCENARIOS:
+        _, tail_tables[scenario.name] = bx.simulate_scenario(scenario.resized(48))
+        tail_truths[scenario.name] = scenario.resized(48).to_dict()
+    tail_paths = bx.plot_tail_simulations(
+        tail_tables,
+        tail_truths,
+        tmp_path / "tail",
+        formats=("png",),
+        dpi=72,
+    )
+    assert {path.name for path in tail_paths} == {
+        "10_tail_01_bounded_tail.png",
+        "10_tail_02_gumbel_tail.png",
+        "10_tail_03_heavy_tail.png",
+        "11_gev_shape_comparison.png",
+    }
+
+    scale_tables = {}
+    scale_truths = {}
+    for scale in bx.SCALE_SCENARIOS:
+        _, scale_tables[scale.name] = bx.simulate_scenario(scale.resized(48))
+        scale_truths[scale.name] = scale.resized(48).to_dict()
+    scale_paths = bx.plot_scale_simulations(
+        scale_tables,
+        scale_truths,
+        tmp_path / "scale",
+        formats=("png",),
+        dpi=72,
+    )
+    assert {path.name for path in scale_paths} == {
+        "12_scale_01_low_scale.png",
+        "12_scale_02_reference_scale.png",
+        "12_scale_03_high_scale.png",
+        "13_gev_scale_comparison.png",
+    }
+
+    scenario = bx.scenario_by_name("local_level_dynamic_season").resized(48)
+    _, table = bx.simulate_scenario(scenario)
+    structural_paths = bx.plot_structural_simulations(
+        {scenario.name: table},
+        {scenario.name: scenario.to_dict()},
+        tmp_path / "structure",
+        formats=("png",),
+        dpi=72,
+    )
+    assert {path.name for path in structural_paths} == {
+        "20_01_local_level_dynamic_season_series.png",
+        "21_01_local_level_dynamic_season_decomposition.png",
     }
 
 

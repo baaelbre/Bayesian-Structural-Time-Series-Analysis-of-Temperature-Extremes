@@ -31,13 +31,13 @@ class RuntimeSettings:
 
 PROFILE_SETTINGS: dict[str, RuntimeSettings] = {
     "smoke": RuntimeSettings(2, 2, 1, 24, 48),
-    "pilot": RuntimeSettings(250, 250, 2, 128, 240),
+    "pilot": RuntimeSettings(250, 250, 2, 128, 360),
     "publication": RuntimeSettings(2_000, 2_000, 4, 512, 720),
 }
 
 PROFILE_WINDOWS: dict[str, tuple[str, str | None]] = {
     "smoke": ("2015-01-01", "2022-12-01"),
-    "pilot": ("1980-01-01", None),
+    "pilot": ("1892-01-01", None),
     "publication": ("1892-01-01", None),
 }
 
@@ -47,7 +47,7 @@ class PresentationConfig:
     """One serializable configuration used by local scripts and PBS jobs."""
 
     profile: str = "pilot"
-    start: str | None = "1980-01-01"
+    start: str | None = "1892-01-01"
     end: str | None = None
     seed: int = 26_000
     output_dir: Path = Path("results/presentation")

@@ -311,34 +311,58 @@ def plot_tail_simulations(
     formats: tuple[str, ...] = ("pdf", "png"),
     dpi: int = 180,
 ) -> list[Path]:
-    """Show the same local-level signal under three GEV tail classes."""
+    """Show each tail-class simulation separately, then compare densities."""
 
     import matplotlib.pyplot as plt
     from scipy.stats import genextreme
 
     presentation_style()
     target = Path(output_dir)
-    order = ("heavy_tail", "gumbel_tail", "bounded_tail")
+    order = ("bounded_tail", "gumbel_tail", "heavy_tail")
     artifacts: list[Path] = []
 
-    figure, axes = plt.subplots(3, 1, figsize=(11, 8.2), sharex=True)
-    for axis, name in zip(axes, order):
+    for number, name in enumerate(order, start=1):
         table = tables[name]
         truth = truths[name]
-        axis.scatter(pd.to_datetime(table["date"]), table["y"], s=7, alpha=0.38, color=COLORS["grey"])
-        axis.plot(pd.to_datetime(table["date"]), table["eta"], color=COLORS["teal"], linewidth=2.0)
-        axis.set_title(f"{truth['title']}  (xi = {truth['xi']:+.2f})", loc="left")
+        date = pd.to_datetime(table["date"])
+        figure, axis = plt.subplots(figsize=(11, 4.4))
+        axis.scatter(
+            date,
+            table["y"],
+            s=9,
+            alpha=0.36,
+            color=COLORS["grey"],
+            label="simulated maximum",
+        )
+        axis.plot(
+            date,
+            table["eta"],
+            color=COLORS["teal"],
+            linewidth=2.2,
+            label="latent location",
+        )
+        axis.set_title(
+            f"{truth['title']}: xi={truth['xi']:+.2f}, "
+            f"sigma={truth['sigma']:.2f}"
+        )
         axis.set_ylabel("block maximum")
+        axis.set_xlabel("time")
         axis.grid(axis="y")
-    axes[-1].set_xlabel("time")
-    figure.suptitle("One latent local-level path, three extreme-value tails", color=COLORS["navy"], weight="bold")
-    figure.tight_layout()
-    artifacts.extend(_save_figure(figure, target / "10_local_level_tail_classes", formats=formats, dpi=dpi))
-    plt.close(figure)
+        axis.legend(loc="upper left")
+        figure.tight_layout()
+        artifacts.extend(
+            _save_figure(
+                figure,
+                target / f"10_tail_{number:02d}_{name}",
+                formats=formats,
+                dpi=dpi,
+            )
+        )
+        plt.close(figure)
 
-    x = np.linspace(-6.0, 9.0, 700)
+    x = np.linspace(-6.0, 15.0, 900)
     figure, axis = plt.subplots(figsize=(9, 4.6))
-    palette = (COLORS["coral"], COLORS["teal"], COLORS["blue"])
+    palette = (COLORS["blue"], COLORS["teal"], COLORS["coral"])
     for name, color in zip(order, palette):
         truth = truths[name]
         xi, sigma = float(truth["xi"]), float(truth["sigma"])
@@ -353,7 +377,109 @@ def plot_tail_simulations(
     axis.grid(axis="y")
     axis.legend()
     figure.tight_layout()
-    artifacts.extend(_save_figure(figure, target / "11_gev_tail_shapes", formats=formats, dpi=dpi))
+    artifacts.extend(
+        _save_figure(
+            figure,
+            target / "11_gev_shape_comparison",
+            formats=formats,
+            dpi=dpi,
+        )
+    )
+    plt.close(figure)
+    return artifacts
+
+
+def plot_scale_simulations(
+    tables: Mapping[str, pd.DataFrame],
+    truths: Mapping[str, Mapping[str, Any]],
+    output_dir: str | Path,
+    *,
+    formats: tuple[str, ...] = ("pdf", "png"),
+    dpi: int = 180,
+) -> list[Path]:
+    """Show each scale simulation separately, then compare GEV densities."""
+
+    import matplotlib.pyplot as plt
+    from scipy.stats import genextreme
+
+    presentation_style()
+    target = Path(output_dir)
+    order = ("low_scale", "reference_scale", "high_scale")
+    artifacts: list[Path] = []
+
+    for number, name in enumerate(order, start=1):
+        table = tables[name]
+        truth = truths[name]
+        date = pd.to_datetime(table["date"])
+        figure, axis = plt.subplots(figsize=(11, 4.4))
+        axis.scatter(
+            date,
+            table["y"],
+            s=9,
+            alpha=0.36,
+            color=COLORS["grey"],
+            label="simulated maximum",
+        )
+        axis.plot(
+            date,
+            table["eta"],
+            color=COLORS["navy"],
+            linewidth=2.2,
+            label="latent location",
+        )
+        axis.set_title(
+            f"{truth['title']}: sigma={truth['sigma']:.2f}, "
+            f"xi={truth['xi']:+.2f}"
+        )
+        axis.set_xlabel("time")
+        axis.set_ylabel("block maximum")
+        axis.grid(axis="y")
+        axis.legend(loc="upper left")
+        figure.tight_layout()
+        artifacts.extend(
+            _save_figure(
+                figure,
+                target / f"12_scale_{number:02d}_{name}",
+                formats=formats,
+                dpi=dpi,
+            )
+        )
+        plt.close(figure)
+
+    maximum_sigma = max(float(truths[name]["sigma"]) for name in order)
+    maximum_endpoint = max(
+        -float(truths[name]["sigma"]) / float(truths[name]["xi"])
+        for name in order
+    )
+    x = np.linspace(-4.0 * maximum_sigma, maximum_endpoint + 0.5 * maximum_sigma, 900)
+    figure, axis = plt.subplots(figsize=(9, 4.6))
+    palette = (COLORS["blue"], COLORS["teal"], COLORS["coral"])
+    for name, color in zip(order, palette):
+        truth = truths[name]
+        xi, sigma = float(truth["xi"]), float(truth["sigma"])
+        density = genextreme.pdf(x, c=-xi, loc=0.0, scale=sigma)
+        axis.plot(
+            x,
+            density,
+            color=color,
+            linewidth=2.2,
+            label=f"sigma={sigma:.2f}",
+        )
+        axis.axvline(-sigma / xi, color=color, linestyle="--", linewidth=1.0)
+    axis.set_xlabel("value relative to location")
+    axis.set_ylabel("density")
+    axis.set_title("The scale changes dispersion and the bounded-tail endpoint")
+    axis.grid(axis="y")
+    axis.legend()
+    figure.tight_layout()
+    artifacts.extend(
+        _save_figure(
+            figure,
+            target / "13_gev_scale_comparison",
+            formats=formats,
+            dpi=dpi,
+        )
+    )
     plt.close(figure)
     return artifacts
 
@@ -366,45 +492,87 @@ def plot_structural_simulations(
     formats: tuple[str, ...] = ("pdf", "png"),
     dpi: int = 180,
 ) -> list[Path]:
-    """Plot the structural scenarios before presenting model selection."""
+    """Give every structural series its own plot and decomposition figure."""
 
     import matplotlib.pyplot as plt
 
     presentation_style()
     target = Path(output_dir)
     names = list(tables)
-    figure, axes = plt.subplots(len(names), 1, figsize=(11, 2.15 * len(names)), sharex=True)
-    axes = np.atleast_1d(axes)
-    for axis, name in zip(axes, names):
+    artifacts: list[Path] = []
+    component_colors = (COLORS["teal"], COLORS["coral"], COLORS["blue"])
+
+    for number, name in enumerate(names, start=1):
         table, truth = tables[name], truths[name]
         date = pd.to_datetime(table["date"])
-        axis.scatter(date, table["y"], s=5, alpha=0.25, color=COLORS["grey"])
-        axis.plot(date, table["eta"], color=COLORS["navy"], linewidth=1.8)
         labels = truth["structural_truth"]
-        state = ", ".join(f"{key}={STATE_LABELS[int(value)]}" for key, value in labels.items())
-        axis.set_title(f"{truth['title']} — {state}", loc="left", fontsize=10.5)
-        axis.set_ylabel("y")
-        axis.grid(axis="y")
-    axes[-1].set_xlabel("time")
-    figure.suptitle("Same sigma and xi; different nonstationary components", color=COLORS["navy"], weight="bold")
-    figure.tight_layout()
-    artifacts = _save_figure(figure, target / "20_structural_scenarios", formats=formats, dpi=dpi)
-    plt.close(figure)
+        state = ", ".join(
+            f"{key}={STATE_LABELS[int(value)]}" for key, value in labels.items()
+        )
 
-    figure, axes = plt.subplots(len(names), 3, figsize=(12, 1.9 * len(names)), sharex="col")
-    for row, name in enumerate(names):
-        table = tables[name]
-        date = pd.to_datetime(table["date"])
-        for column, component in enumerate(("level", "slope", "seasonal")):
-            axes[row, column].plot(date, table[component], color=(COLORS["teal"], COLORS["coral"], COLORS["blue"])[column])
-            axes[row, column].grid(axis="y")
-            if row == 0:
-                axes[row, column].set_title(component)
-        axes[row, 0].set_ylabel(name.replace("_", "\n"), rotation=0, ha="right", va="center")
-    figure.suptitle("Truth: unobserved components behind each simulated predictor", color=COLORS["navy"], weight="bold")
-    figure.tight_layout()
-    artifacts.extend(_save_figure(figure, target / "21_true_components", formats=formats, dpi=dpi))
-    plt.close(figure)
+        figure, axis = plt.subplots(figsize=(11, 4.4))
+        axis.scatter(
+            date,
+            table["y"],
+            s=8,
+            alpha=0.28,
+            color=COLORS["grey"],
+            label="simulated maximum",
+        )
+        axis.plot(
+            date,
+            table["eta"],
+            color=COLORS["navy"],
+            linewidth=2.1,
+            label="true predictor",
+        )
+        axis.set_title(
+            f"{truth['title']} — {state}\n"
+            f"sigma={truth['sigma']:.2f}, xi={truth['xi']:+.2f}",
+            loc="left",
+        )
+        axis.set_xlabel("time")
+        axis.set_ylabel("block maximum")
+        axis.grid(axis="y")
+        axis.legend(loc="upper left")
+        figure.tight_layout()
+        artifacts.extend(
+            _save_figure(
+                figure,
+                target / f"20_{number:02d}_{name}_series",
+                formats=formats,
+                dpi=dpi,
+            )
+        )
+        plt.close(figure)
+
+        figure, axes = plt.subplots(3, 1, figsize=(11, 7.2), sharex=True)
+        for axis, component, color in zip(
+            axes,
+            ("level", "slope", "seasonal"),
+            component_colors,
+        ):
+            state_name = STATE_LABELS[int(labels[component])]
+            axis.plot(date, table[component], color=color, linewidth=1.8)
+            axis.set_ylabel(component)
+            axis.set_title(f"{component}: {state_name}", loc="left", fontsize=10.5)
+            axis.grid(axis="y")
+        axes[-1].set_xlabel("time")
+        figure.suptitle(
+            f"{truth['title']}: true unobserved components",
+            color=COLORS["navy"],
+            weight="bold",
+        )
+        figure.tight_layout()
+        artifacts.extend(
+            _save_figure(
+                figure,
+                target / f"21_{number:02d}_{name}_decomposition",
+                formats=formats,
+                dpi=dpi,
+            )
+        )
+        plt.close(figure)
     return artifacts
 
 
@@ -611,6 +779,7 @@ __all__ = [
     "export_fit_results",
     "fit_summary",
     "plot_fit_results",
+    "plot_scale_simulations",
     "plot_selection_recovery",
     "plot_structural_simulations",
     "plot_tail_simulations",

@@ -43,7 +43,6 @@ def test_v260_example_surface_contains_only_the_presentation_sequence():
     directory = Path(__file__).resolve().parents[1] / "examples" / "presentation"
     scripts = {path.name for path in directory.glob("*.py")}
     assert scripts == {
-        "settings.py",
         "00_uccle_record.py",
         "01_tail_simulations.py",
         "02_structural_simulations.py",
@@ -51,5 +50,33 @@ def test_v260_example_surface_contains_only_the_presentation_sequence():
         "04_simulation_pgas.py",
         "05_uccle_laplace.py",
         "06_uccle_pgas.py",
-        "07_build_results.py",
     }
+
+
+def test_v260_presentation_examples_are_standalone_public_api_scripts():
+    directory = Path(__file__).resolve().parents[1] / "examples" / "presentation"
+    sources = {
+        path.name: path.read_text(encoding="utf-8")
+        for path in directory.glob("*.py")
+    }
+    for name, source in sources.items():
+        compile(source, str(directory / name), "exec")
+        assert "import bucex as bx" in source
+        assert "from settings" not in source
+        assert "PresentationConfig" not in source
+        assert "PresentationWorkflow" not in source
+        assert "WorkflowPaths" not in source
+
+    for name in (
+        "03_simulation_laplace.py",
+        "04_simulation_pgas.py",
+        "05_uccle_laplace.py",
+        "06_uccle_pgas.py",
+    ):
+        assert "bx.fit(" in sources[name]
+    assert "bx.simulate_scenario(" in sources["03_simulation_laplace.py"]
+    assert "bx.simulate_scenario(" in sources["04_simulation_pgas.py"]
+    assert "bx.plot_scale_simulations(" in sources["01_tail_simulations.py"]
+    assert "init=laplace_fit" in sources["04_simulation_pgas.py"]
+    assert "init=laplace_fit" in sources["06_uccle_pgas.py"]
+    assert 'START = "1892-01-01"' in sources["00_uccle_record.py"]

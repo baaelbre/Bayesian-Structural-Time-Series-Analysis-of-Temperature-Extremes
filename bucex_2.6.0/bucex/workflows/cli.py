@@ -129,6 +129,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "tail_scenarios": [
                         item.name for item in ALL_SCENARIOS if item.group == "tail"
                     ],
+                    "scale_scenarios": [
+                        item.name for item in ALL_SCENARIOS if item.group == "scale"
+                    ],
                     "structural_scenarios": [
                         item.name for item in STRUCTURAL_SCENARIOS
                     ],

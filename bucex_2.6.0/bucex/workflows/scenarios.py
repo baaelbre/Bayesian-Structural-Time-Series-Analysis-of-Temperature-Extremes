@@ -3,7 +3,9 @@
 The catalogue separates two pedagogical jobs:
 
 * ``TAIL_SCENARIOS`` hold the latent local-level path fixed and change only
-  the GEV shape, so the Fréchet/Gumbel/Weibull distinction is visible;
+  the GEV shape, so the Weibull/Gumbel/Fréchet distinction is visible;
+* ``SCALE_SCENARIOS`` hold the latent path and shape fixed and change only
+  ``sigma``, separating observation scale from structural evolution;
 * ``STRUCTURAL_SCENARIOS`` hold ``sigma`` and ``xi`` fixed and change only the
   unobserved-component structure, so SSVS recovery has an unambiguous truth.
 """
@@ -24,7 +26,7 @@ from ..simulate import Simulation, simulate
 
 COMPONENT_CODES = {"zero": 0, "fixed": 1, "dynamic": 2}
 STRUCTURAL_SIGMA = 1.5
-STRUCTURAL_XI = -0.20
+STRUCTURAL_XI = -0.30
 
 
 @dataclass(frozen=True)
@@ -50,8 +52,8 @@ class GEVScenario:
     seed: int = 1
 
     def __post_init__(self) -> None:
-        if self.group not in {"tail", "structure"}:
-            raise ValueError("group must be 'tail' or 'structure'.")
+        if self.group not in {"tail", "scale", "structure"}:
+            raise ValueError("group must be 'tail', 'scale', or 'structure'.")
         if self.level not in {"fixed", "dynamic"}:
             raise ValueError("level must be fixed or dynamic.")
         if self.trend not in COMPONENT_CODES or self.season not in COMPONENT_CODES:
@@ -151,15 +153,15 @@ class GEVScenario:
 
 TAIL_SCENARIOS: tuple[GEVScenario, ...] = (
     GEVScenario(
-        name="heavy_tail",
-        title="Local level, heavy tail",
+        name="bounded_tail",
+        title="Local level, bounded tail",
         group="tail",
-        description="Fréchet-type GEV with xi > 0.",
-        n_time=240,
+        description="Weibull-type GEV with xi < 0 and a finite endpoint.",
+        n_time=360,
         sigma=STRUCTURAL_SIGMA,
-        xi=0.20,
+        xi=-0.30,
         level="dynamic",
-        sd_level=0.10,
+        sd_level=0.18,
         seed=2_601,
     ),
     GEVScenario(
@@ -167,24 +169,64 @@ TAIL_SCENARIOS: tuple[GEVScenario, ...] = (
         title="Local level, exponential tail",
         group="tail",
         description="Gumbel limit with xi = 0.",
-        n_time=240,
+        n_time=360,
         sigma=STRUCTURAL_SIGMA,
         xi=0.0,
         level="dynamic",
-        sd_level=0.10,
+        sd_level=0.18,
         seed=2_601,
     ),
     GEVScenario(
-        name="bounded_tail",
-        title="Local level, bounded tail",
+        name="heavy_tail",
+        title="Local level, heavy tail",
         group="tail",
-        description="Weibull-type GEV with xi < 0 and a finite endpoint.",
-        n_time=240,
+        description="Fréchet-type GEV with xi > 0.",
+        n_time=360,
+        sigma=STRUCTURAL_SIGMA,
+        xi=0.30,
+        level="dynamic",
+        sd_level=0.18,
+        seed=2_601,
+    ),
+)
+
+
+SCALE_SCENARIOS: tuple[GEVScenario, ...] = (
+    GEVScenario(
+        name="low_scale",
+        title="Low observation scale",
+        group="scale",
+        description="Same bounded-tail local level with sigma=0.75.",
+        n_time=360,
+        sigma=0.75,
+        xi=STRUCTURAL_XI,
+        level="dynamic",
+        sd_level=0.18,
+        seed=2_602,
+    ),
+    GEVScenario(
+        name="reference_scale",
+        title="Reference observation scale",
+        group="scale",
+        description="Same bounded-tail local level with sigma=1.50.",
+        n_time=360,
         sigma=STRUCTURAL_SIGMA,
         xi=STRUCTURAL_XI,
         level="dynamic",
-        sd_level=0.10,
-        seed=2_601,
+        sd_level=0.18,
+        seed=2_602,
+    ),
+    GEVScenario(
+        name="high_scale",
+        title="High observation scale",
+        group="scale",
+        description="Same bounded-tail local level with sigma=3.00.",
+        n_time=360,
+        sigma=3.00,
+        xi=STRUCTURAL_XI,
+        level="dynamic",
+        sd_level=0.18,
+        seed=2_602,
     ),
 )
 
@@ -223,7 +265,7 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
         STRUCTURAL_SIGMA,
         STRUCTURAL_XI,
         level="dynamic",
-        sd_level=0.08,
+        sd_level=0.14,
         seed=2_612,
     ),
     GEVScenario(
@@ -236,7 +278,7 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
         STRUCTURAL_XI,
         level="dynamic",
         season="fixed",
-        sd_level=0.06,
+        sd_level=0.12,
         season_amplitude=7.0,
         seed=2_613,
     ),
@@ -250,8 +292,8 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
         STRUCTURAL_XI,
         level="dynamic",
         season="dynamic",
-        sd_level=0.06,
-        sd_seasonal=0.035,
+        sd_level=0.12,
+        sd_seasonal=0.150,
         season_amplitude=7.0,
         seed=2_614,
     ),
@@ -266,7 +308,7 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
         level="fixed",
         trend="dynamic",
         season="fixed",
-        sd_slope=0.00045,
+        sd_slope=0.00075,
         initial_slope=0.004,
         season_amplitude=7.0,
         seed=2_615,
@@ -282,9 +324,9 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
         level="dynamic",
         trend="dynamic",
         season="dynamic",
-        sd_level=0.05,
-        sd_slope=0.00035,
-        sd_seasonal=0.030,
+        sd_level=0.10,
+        sd_slope=0.00065,
+        sd_seasonal=0.120,
         initial_slope=0.004,
         season_amplitude=7.0,
         seed=2_616,
@@ -292,7 +334,7 @@ STRUCTURAL_SCENARIOS: tuple[GEVScenario, ...] = (
 )
 
 
-ALL_SCENARIOS = (*TAIL_SCENARIOS, *STRUCTURAL_SCENARIOS)
+ALL_SCENARIOS = (*TAIL_SCENARIOS, *SCALE_SCENARIOS, *STRUCTURAL_SCENARIOS)
 
 
 def scenario_by_name(name: str, *, group: str | None = None) -> GEVScenario:
@@ -369,6 +411,7 @@ __all__ = [
     "ALL_SCENARIOS",
     "COMPONENT_CODES",
     "GEVScenario",
+    "SCALE_SCENARIOS",
     "STRUCTURAL_SCENARIOS",
     "STRUCTURAL_SIGMA",
     "STRUCTURAL_XI",

@@ -1,27 +1,31 @@
-# Presentation scripts
+# Seven standalone presentation scripts
 
-Run the files in numerical order. They produce the complete COMPSTAT result
-tree under `results/presentation/`:
+These examples teach the public `import bucex as bx` API directly. There is no
+shared settings module, configuration object, or orchestration class. Each file
+contains its own editable constants and can be run from a clean output
+directory by itself.
 
-1. the four-series Uccle record and the TXx opening figures;
-2. local-level GEV tail-class simulations;
-3. structural simulations with common `sigma=1.5` and `xi=-0.20`;
-4. componentwise SSVS fits using Laplace;
-5. the same fits using Laplace-initialized PGAS;
-6. Laplace fits of TXx, TXn, TNx, and TNn;
-7. corresponding PGAS fits;
-8. aggregate selection, trajectory, prior-to-posterior, and diagnostics output.
+1. `00_uccle_record.py` loads the complete 1892--present TXx, TXn, TNx, and TNn
+   records.
+2. `01_tail_simulations.py` simulates three GEV shapes (`xi=-0.30, 0, +0.30`)
+   and three observation scales (`sigma=0.75, 1.50, 3.00`).
+3. `02_structural_simulations.py` simulates the seven UC/SSVS designs.
+4. `03_simulation_laplace.py` simulates as needed, calls `bx.fit` with Laplace,
+   and exports all scenario results.
+5. `04_simulation_pgas.py` simulates as needed, creates or loads its Laplace
+   fit, and passes that `FitResult` to PGAS through `init=`.
+6. `05_uccle_laplace.py` loads and fits all four observed extremes with
+   Laplace.
+7. `06_uccle_pgas.py` loads the observations, creates or loads each Laplace
+initializer, fits PGAS, and builds the final Laplace/PGAS comparison.
 
-For a quick check, set `BUCEX_PROFILE=smoke`. The default is `pilot`; final
-results should use `BUCEX_PROFILE=publication`. Useful optional environment
-variables include `BUCEX_OUTPUT_DIR`, `BUCEX_DATA_DIR`, `BUCEX_OVERWRITE=1`,
-`BUCEX_SCENARIO`, `BUCEX_SERIES`, and the numeric runtime overrides documented
-in `settings.py`.
+Every simulated time series is written to a separate figure. A structural
+scenario also gets one three-panel truth decomposition (level, slope, and
+seasonality), which makes fixed and stochastic components directly comparable.
 
-Example:
+Run one file, or run the sequence:
 
 ```bash
-export BUCEX_PROFILE=smoke
 python examples/presentation/00_uccle_record.py
 python examples/presentation/01_tail_simulations.py
 python examples/presentation/02_structural_simulations.py
@@ -29,5 +33,11 @@ python examples/presentation/03_simulation_laplace.py
 python examples/presentation/04_simulation_pgas.py
 python examples/presentation/05_uccle_laplace.py
 python examples/presentation/06_uccle_pgas.py
-python examples/presentation/07_build_results.py
 ```
+
+The fitting examples default to readable pilot settings (`250` retained draws,
+`250` warmup iterations, and `2` chains). The publication settings used in the
+final analysis are `2_000` draws, `2_000` warmup iterations, `4` chains, and
+`512` guided particles for PGAS. Edit the constants at the top of the relevant
+file. Set `OVERWRITE=True` only when you intend to regenerate existing primary
+simulation or fit artifacts.

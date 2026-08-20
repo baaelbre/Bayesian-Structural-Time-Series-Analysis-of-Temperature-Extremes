@@ -5,11 +5,15 @@ removes the unrelated legacy presentation scripts.
 
 ## Focused experimental design
 
-- Added three local-level GEV tail illustrations with common latent evolution
-  and `xi=0.20`, `0`, and `-0.20`.
+- Added three 30-year local-level GEV tail illustrations with common latent
+  evolution and `xi=-0.30`, `0`, and `+0.30`.
+- Added a matched observation-scale experiment with `sigma=0.75`, `1.50`, and
+  `3.00` and fixed `xi=-0.30`.
 - Added seven structural-selection scenarios with common `sigma=1.5` and
-  `xi=-0.20`, spanning absent, fixed, and dynamic level, slope, and seasonal
-  components.
+  `xi=-0.30`, spanning absent, fixed, and dynamic level, slope, and seasonal
+  components with more visible process innovations.
+- Simulation time series are separate figures; only each scenario's true
+  level/slope/seasonal decomposition uses three panels.
 - Added one results contract for simulations and TXx, TXn, TNx, and TNn:
   selection probabilities, structural-model switching, posterior trajectories,
   prior-to-posterior process-scale plots, GEV parameters, and diagnostics.
@@ -41,10 +45,13 @@ uccle-fit
 report
 ```
 
-`PresentationWorkflow`, `bucex-presentation`, numbered Python examples, and PBS
-jobs all call these same stages and write the same deterministic paths. The PBS
-workflow uses scenario/series-by-chain arrays and dependency-gated combine
-jobs, so PGAS cannot start before the corresponding Laplace fit exists.
+The seven numbered Python examples now call the public simulation, prior,
+fitting, persistence, and plotting API directly. Each is self-contained and
+keeps its editable constants in the file; the PGAS examples create a missing
+Laplace initializer themselves. `PresentationWorkflow` and
+`bucex-presentation` remain available for PBS orchestration. The PBS workflow
+uses scenario/series-by-chain arrays and dependency-gated combine jobs, so PGAS
+cannot start before the corresponding Laplace fit exists.
 
 ## Packaging
 

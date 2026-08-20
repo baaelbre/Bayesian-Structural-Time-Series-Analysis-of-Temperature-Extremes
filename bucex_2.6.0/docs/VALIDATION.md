@@ -28,14 +28,18 @@ evidence for a scientific conclusion.
   conditioned predecessor available;
 - the reference-ancestor change metric is stored, summarized, and exported;
 - lower-tail Uccle fits round-trip observations in their original orientation;
-- tail scenarios share their latent specification and vary only shape;
+- tail scenarios share their latent path and vary only shape over
+  `-0.30/0/+0.30`;
+- scale scenarios share their latent path and `xi=-0.30`, varying only
+  `sigma=0.75/1.50/3.00`;
 - structural scenarios share scale/shape and vary only component truth;
 - workflow paths are deterministic and existing artifacts require explicit
   overwrite authorization;
 - independently saved chains combine only when model, prior, plan, data, and
   dates agree;
 - schema-2.6.0 archives round-trip and older supported archives remain readable;
-- Python examples, CLI stages, and PBS jobs use the same workflow methods;
+- the seven Python examples are self-contained calls to the public API, while
+  CLI stages and PBS jobs retain deterministic orchestration paths;
 - PBS task IDs map to unique scenario/series/chain files and PGAS dependencies
   pass through a completed Laplace combine job.
 

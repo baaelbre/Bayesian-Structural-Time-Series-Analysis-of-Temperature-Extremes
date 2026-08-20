@@ -9,10 +9,15 @@
   Laplace-versus-PGAS comparison, and TXx/TXn/TNx/TNn analyses.
 - Added seven fixed-truth SSVS recovery scenarios with common negative shape
   and scale.
+- Strengthened the simulated structural innovations, widened the GEV shape
+  contrast to `-0.30/0/+0.30`, and added a matched `sigma=0.75/1.50/3.00`
+  experiment.
+- Replaced simulation grids with one figure per time series and one separate
+  three-panel decomposition per structural scenario.
 - Standardized result tables, figures, paths, manifests, runtime profiles, and
   CLI behavior across simulated and observed fits.
-- Replaced all example and PBS scripts with the focused sequence and a complete
-  dependency graph.
+- Replaced the presentation examples with exactly seven standalone direct-API
+  scripts; retained the complete PBS dependency graph for batch execution.
 
 ### Inference and diagnostics
 
