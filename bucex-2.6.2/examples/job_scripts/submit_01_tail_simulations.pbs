@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#PBS -N bucex_tail_sim
+#PBS -l walltime=01:00:00
+#PBS -l nodes=1:ppn=1
+#PBS -l mem=4gb
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+
+N_TIME="${N_TIME:-800}"
+PERIOD="${PERIOD:-4}"
+RESULTS_ROOT="${RESULTS_ROOT:-results}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+OVERWRITE="${OVERWRITE:-0}"
+
+exec > "logs/01_tail_simulations_${PBS_JOBID:-manual}.log" 2>&1
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+echo "Submitting tail-simulation runner"
+echo "n time      = ${N_TIME}"
+echo "period      = ${PERIOD}"
+echo "results     = ${RESULTS_ROOT}"
+echo "run id      = ${RUN_ID}"
+date
+hostname
+
+bash examples/bash_scripts/run_01_tail_simulations.sh \
+  "${N_TIME}" "${PERIOD}" "${RESULTS_ROOT}" "${RUN_ID}" "${OVERWRITE}"

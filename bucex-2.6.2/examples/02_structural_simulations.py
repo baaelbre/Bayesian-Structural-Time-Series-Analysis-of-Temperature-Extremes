@@ -23,11 +23,10 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results.
+# Results. The run name always combines its timestamp and identifying settings.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
-TIMESTAMP_RESULTS = os.environ.get("BUCEX_TIMESTAMP_RESULTS", "1").lower() not in {"0", "false", "no"}
-RUN_ID = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = RESULTS_ROOT / RUN_ID if TIMESTAMP_RESULTS else RESULTS_ROOT
+SCRIPT_NAME = Path(__file__).stem
+RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 OVERWRITE = os.environ.get("BUCEX_OVERWRITE", "0").lower() in {"1", "true", "yes"}
 
 # Simulation design. Keep these settings aligned with scripts 03 and 04 when
@@ -45,11 +44,18 @@ LOCAL_INITIAL_SLOPE = 0.003
 DYNAMIC_SEASON_AMPLITUDE = 0.25
 FIXED_SEASON_AMPLITUDE = 0.25
 SEASONAL_SD = 0.05
-SIMULATION_SEED = 13081997
+SIMULATION_SEED = 13_081_997
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589", "coral": "#D96C4F"}
+
+RUN_SIGNATURE = (
+    f"n{N_TIME}_p{PERIOD}_sigma{SIGMA:g}_xi{XI:g}"
+    f"__qlevel{LOCAL_LEVEL_SD:g}_qslope{LOCAL_SLOPE_SD:g}_qseason{SEASONAL_SD:g}"
+    f"__amp{DYNAMIC_SEASON_AMPLITUDE:g}_seed{SIMULATION_SEED}"
+)
+OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
 # Dummy-season states store period - 1 effects. Their next transition creates
@@ -154,8 +160,54 @@ SCENARIOS = (
 
 def main() -> None:
     plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.titleweight": "bold", "legend.frameon": False})
-    simulation_dir = OUTPUT_DIR / "simulations" / "structure"
-    figure_dir = OUTPUT_DIR / "figures" / "20_structural_simulations"
+    config_path = OUTPUT_DIR / "run_config.json"
+    if config_path.exists() and not OVERWRITE:
+        raise FileExistsError(
+            f"Refusing to overwrite {config_path}; set BUCEX_OVERWRITE=1 to rerun."
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "script": SCRIPT_NAME,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "run_timestamp": RUN_TIMESTAMP,
+        "run_signature": RUN_SIGNATURE,
+        "output_directory": str(OUTPUT_DIR),
+        "bucex_version": bx.__version__,
+        "simulation": {
+            "n_time": N_TIME,
+            "period": PERIOD,
+            "sigma": SIGMA,
+            "xi": XI,
+            "initial_level": INITIAL_LEVEL,
+            "linear_slope": LINEAR_SLOPE,
+            "random_walk_sd": RANDOM_WALK_SD,
+            "local_level_sd": LOCAL_LEVEL_SD,
+            "local_slope_sd": LOCAL_SLOPE_SD,
+            "local_initial_slope": LOCAL_INITIAL_SLOPE,
+            "dynamic_season_amplitude": DYNAMIC_SEASON_AMPLITUDE,
+            "fixed_season_amplitude": FIXED_SEASON_AMPLITUDE,
+            "seasonal_sd": SEASONAL_SD,
+            "seed": SIMULATION_SEED,
+        },
+        "scenarios": [
+            {
+                "name": scenario["name"],
+                "model": scenario["model"].to_dict(),
+                "params": scenario["params"],
+                "initial_state": scenario["initial_state"].tolist(),
+                "seed": scenario["seed"],
+                "structural_truth": scenario["structural_truth"],
+            }
+            for scenario in SCENARIOS
+        ],
+        "figures": {"formats": list(FIGURE_FORMATS), "dpi": FIGURE_DPI},
+    }
+    config_path.write_text(
+        json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
+    simulation_dir = OUTPUT_DIR / "simulations"
+    figure_dir = OUTPUT_DIR / "figures"
     simulation_dir.mkdir(parents=True, exist_ok=True)
     figure_dir.mkdir(parents=True, exist_ok=True)
     catalog = []
@@ -263,7 +315,7 @@ def main() -> None:
 
         print(f"Simulated {scenario['name']}: {data_path}")
 
-    catalog_path = OUTPUT_DIR / "tables" / "20_structural_simulations" / "scenarios.csv"
+    catalog_path = OUTPUT_DIR / "tables" / "scenarios.csv"
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(catalog).to_csv(catalog_path, index=False)
     print(f"Structural simulation outputs: {OUTPUT_DIR}")

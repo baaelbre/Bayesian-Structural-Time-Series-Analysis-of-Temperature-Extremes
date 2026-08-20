@@ -23,11 +23,10 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results.
+# Results. Every run is timestamped and receives an automatic settings signature.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
-TIMESTAMP_RESULTS = os.environ.get("BUCEX_TIMESTAMP_RESULTS", "1").lower() not in {"0", "false", "no"}
-RUN_ID = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = RESULTS_ROOT / RUN_ID if TIMESTAMP_RESULTS else RESULTS_ROOT
+SCRIPT_NAME = Path(__file__).stem
+RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 OVERWRITE = os.environ.get("BUCEX_OVERWRITE", "0").lower() in {"1", "true", "yes"}
 
 # Simulation design. Keep aligned with scripts 02 and 03.
@@ -73,6 +72,14 @@ FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
 PHASE_LABELS = tuple(f"phase {index + 1}" for index in range(PERIOD))
+
+RUN_SIGNATURE = (
+    f"n{N_TIME}_p{PERIOD}_sigma{SIGMA:g}_xi{XI:g}"
+    f"__qlevel{LOCAL_LEVEL_SD:g}_qslope{LOCAL_SLOPE_SD:g}_qseason{SEASONAL_SD:g}"
+    f"__slablevel{INNOVATION_SLAB_SD['level']:g}_slabtrend{INNOVATION_SLAB_SD['trend']:g}_slabseason{INNOVATION_SLAB_SD['season']:g}"
+    f"__draws{DRAWS}_warmup{WARMUP}_chains{CHAINS}_particles{PARTICLES}_seed{SEED}"
+)
+OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
 phase = np.arange(PERIOD, dtype=float)
@@ -166,8 +173,59 @@ def main() -> None:
     labels = {0: "zero", 1: "fixed", 2: "dynamic"}
     comparison_rows = []
 
+    config_path = OUTPUT_DIR / "run_config.json"
+    if config_path.exists() and not OVERWRITE:
+        raise FileExistsError(
+            f"Refusing to overwrite {config_path}; set BUCEX_OVERWRITE=1 to rerun."
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "script": SCRIPT_NAME,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "run_timestamp": RUN_TIMESTAMP,
+        "run_signature": RUN_SIGNATURE,
+        "output_directory": str(OUTPUT_DIR),
+        "bucex_version": bx.__version__,
+        "engine": "pgas",
+        "initializer": "laplace",
+        "simulation": {
+            "n_time": N_TIME,
+            "period": PERIOD,
+            "sigma": SIGMA,
+            "xi": XI,
+            "initial_level": INITIAL_LEVEL,
+            "linear_slope": LINEAR_SLOPE,
+            "random_walk_sd": RANDOM_WALK_SD,
+            "local_level_sd": LOCAL_LEVEL_SD,
+            "local_slope_sd": LOCAL_SLOPE_SD,
+            "local_initial_slope": LOCAL_INITIAL_SLOPE,
+            "dynamic_season_amplitude": DYNAMIC_SEASON_AMPLITUDE,
+            "fixed_season_amplitude": FIXED_SEASON_AMPLITUDE,
+            "seasonal_sd": SEASONAL_SD,
+            "seed": SIMULATION_SEED,
+        },
+        "fit_model": FIT_MODEL.to_dict(),
+        "priors": PRIOR_SETTINGS,
+        "mcmc": {
+            "draws": DRAWS,
+            "warmup": WARMUP,
+            "chains": CHAINS,
+            "particles": PARTICLES,
+            "seed": SEED,
+        },
+        "scenarios": [scenario["name"] for scenario in SCENARIOS],
+        "figures": {
+            "formats": list(FIGURE_FORMATS),
+            "dpi": FIGURE_DPI,
+            "diagnostics": DIAGNOSTIC_FIGURES,
+        },
+    }
+    config_path.write_text(
+        json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
     for number, scenario in enumerate(SCENARIOS):
-        data_path = OUTPUT_DIR / "simulations" / "structure" / f"{scenario['name']}.csv"
+        data_path = OUTPUT_DIR / "simulations" / f"{scenario['name']}.csv"
         truth_path = data_path.with_suffix(".json")
         expected_truth = {
             "name": scenario["name"],
@@ -234,7 +292,7 @@ def main() -> None:
             season_probabilities=SEASON_PROBABILITIES,
         )
 
-        laplace_path = OUTPUT_DIR / "fits" / "simulations" / "laplace" / scenario["name"] / "combined.bucex"
+        laplace_path = OUTPUT_DIR / "fits" / scenario["name"] / "laplace" / "combined.bucex"
         if laplace_path.is_file() and not OVERWRITE:
             laplace_fit = bx.FitResult.load(laplace_path)
             if (
@@ -263,7 +321,7 @@ def main() -> None:
             laplace_path.parent.mkdir(parents=True, exist_ok=True)
             laplace_fit.save(laplace_path)
 
-        pgas_path = OUTPUT_DIR / "fits" / "simulations" / "pgas" / scenario["name"] / "combined.bucex"
+        pgas_path = OUTPUT_DIR / "fits" / scenario["name"] / "pgas" / "combined.bucex"
         if pgas_path.is_file() and not OVERWRITE:
             pgas_fit = bx.FitResult.load(pgas_path)
             if (
@@ -304,8 +362,8 @@ def main() -> None:
             pgas_path.parent.mkdir(parents=True, exist_ok=True)
             pgas_fit.save(pgas_path)
 
-        table_dir = OUTPUT_DIR / "tables" / "simulations" / "pgas" / scenario["name"]
-        figure_dir = OUTPUT_DIR / "figures" / "simulations" / "pgas" / scenario["name"]
+        table_dir = OUTPUT_DIR / "tables" / scenario["name"]
+        figure_dir = OUTPUT_DIR / "figures" / scenario["name"]
         table_dir.mkdir(parents=True, exist_ok=True)
         figure_dir.mkdir(parents=True, exist_ok=True)
         diagnostics = pgas_fit.diagnostics()
@@ -396,7 +454,7 @@ def main() -> None:
                 plt.close(figure)
         print(f"PGAS fit complete: {scenario['name']}")
 
-    comparison_path = OUTPUT_DIR / "tables" / "simulations" / "laplace_pgas_selection_comparison.csv"
+    comparison_path = OUTPUT_DIR / "tables" / "laplace_pgas_selection_comparison.csv"
     comparison_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(comparison_rows).to_csv(comparison_path, index=False)
     print(f"PGAS simulation outputs: {OUTPUT_DIR}")

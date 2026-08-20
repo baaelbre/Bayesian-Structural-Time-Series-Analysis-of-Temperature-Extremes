@@ -23,11 +23,11 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results.
+# Results. The timestamp can be shared across HPC jobs through BUCEX_RUN_ID;
+# the identifying settings are always appended automatically.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
-TIMESTAMP_RESULTS = os.environ.get("BUCEX_TIMESTAMP_RESULTS", "1").lower() not in {"0", "false", "no"}
-RUN_ID = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = RESULTS_ROOT / RUN_ID if TIMESTAMP_RESULTS else RESULTS_ROOT
+SCRIPT_NAME = Path(__file__).stem
+RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 OVERWRITE = os.environ.get("BUCEX_OVERWRITE", "0").lower() in {"1", "true", "yes"}
 
 # Simulation design.
@@ -53,6 +53,14 @@ DENSITY_GRID_POINTS = 900
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589"}
+
+RUN_SIGNATURE = (
+    f"n{N_TIME}_p{PERIOD}"
+    f"__tail-sigma{TAIL_SIGMA:g}-xi{'_'.join(f'{value:g}' for value in TAIL_XI_VALUES)}"
+    f"__scale-sigma{'_'.join(f'{value:g}' for value in SCALE_SIGMA_VALUES)}-xi{SCALE_XI:g}"
+    f"__qlevel{LEVEL_PROCESS_SD:g}_seed{TAIL_SEED}_{SCALE_SEED}"
+)
+OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
 # Each scenario is an ordinary bucex model plus its parameters and initial
@@ -118,6 +126,43 @@ def main() -> None:
     grouped_tables: dict[str, dict[str, pd.DataFrame]] = {"shape": {}, "scale": {}}
     grouped_scenarios = {"shape": TAIL_SCENARIOS, "scale": SCALE_SCENARIOS}
 
+    config_path = OUTPUT_DIR / "run_config.json"
+    if config_path.exists() and not OVERWRITE:
+        raise FileExistsError(
+            f"Refusing to overwrite {config_path}; set BUCEX_OVERWRITE=1 to rerun."
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "script": SCRIPT_NAME,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "run_timestamp": RUN_TIMESTAMP,
+        "run_signature": RUN_SIGNATURE,
+        "output_directory": str(OUTPUT_DIR),
+        "bucex_version": bx.__version__,
+        "simulation": {
+            "n_time": N_TIME,
+            "period": PERIOD,
+            "start_date": START_DATE,
+            "initial_level": INITIAL_LEVEL,
+            "level_process_sd": LEVEL_PROCESS_SD,
+            "tail_sigma": TAIL_SIGMA,
+            "tail_xi_values": list(TAIL_XI_VALUES),
+            "tail_seed": TAIL_SEED,
+            "scale_sigma_values": list(SCALE_SIGMA_VALUES),
+            "scale_xi": SCALE_XI,
+            "scale_seed": SCALE_SEED,
+        },
+        "density": {
+            "probability_range": list(DENSITY_PROBABILITY_RANGE),
+            "grid_points": DENSITY_GRID_POINTS,
+            "relative_to_location": True,
+        },
+        "figures": {"formats": list(FIGURE_FORMATS), "dpi": FIGURE_DPI},
+    }
+    config_path.write_text(
+        json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
     for group, scenarios in grouped_scenarios.items():
         for scenario in scenarios:
             simulation = bx.simulate(
@@ -155,7 +200,7 @@ def main() -> None:
             }
             truth_path.write_text(json.dumps(truth, indent=2, sort_keys=True), encoding="utf-8")
 
-    figure_dir = OUTPUT_DIR / "figures" / "10_tail_and_scale"
+    figure_dir = OUTPUT_DIR / "figures"
     figure_dir.mkdir(parents=True, exist_ok=True)
     for group, scenarios in grouped_scenarios.items():
         all_y = np.concatenate([grouped_tables[group][scenario["name"]]["y"].to_numpy() for scenario in scenarios])
@@ -260,7 +305,7 @@ def main() -> None:
     for group, scenarios in grouped_scenarios.items():
         for scenario in scenarios:
             catalog.append({"group": group, "name": scenario["name"], **scenario["params"], "seed": scenario["seed"]})
-    catalog_path = OUTPUT_DIR / "tables" / "10_tail_and_scale" / "scenarios.csv"
+    catalog_path = OUTPUT_DIR / "tables" / "scenarios.csv"
     catalog_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(catalog).to_csv(catalog_path, index=False)
     print(f"Tail and scale outputs: {OUTPUT_DIR}")

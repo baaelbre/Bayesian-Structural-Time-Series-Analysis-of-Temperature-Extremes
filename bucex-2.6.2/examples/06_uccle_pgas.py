@@ -22,11 +22,10 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results.
+# Results. Every run is timestamped and receives an automatic settings signature.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
-TIMESTAMP_RESULTS = os.environ.get("BUCEX_TIMESTAMP_RESULTS", "1").lower() not in {"0", "false", "no"}
-RUN_ID = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = RESULTS_ROOT / RUN_ID if TIMESTAMP_RESULTS else RESULTS_ROOT
+SCRIPT_NAME = Path(__file__).stem
+RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 OVERWRITE = os.environ.get("BUCEX_OVERWRITE", "0").lower() in {"1", "true", "yes"}
 
 # Data.
@@ -52,7 +51,7 @@ LEVEL_DYNAMIC_PROBABILITY = 0.50
 TREND_PROBABILITIES = (1.0 / 3.0,) * 3
 SEASON_PROBABILITIES = (1.0 / 3.0,) * 3
 
-# MCMC. Final runs can use 2000/2000/4 and 512 particles via environment.
+# MCMC. These values can also be supplied through the environment.
 DRAWS = int(os.environ.get("BUCEX_DRAWS", "250"))
 WARMUP = int(os.environ.get("BUCEX_WARMUP", "250"))
 CHAINS = int(os.environ.get("BUCEX_CHAINS", "2"))
@@ -63,6 +62,13 @@ PROGRESS = os.environ.get("BUCEX_PROGRESS", "1").lower() not in {"0", "false", "
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
+
+RUN_SIGNATURE = (
+    f"{START}_to_{END or 'latest'}__series-{'-'.join(SERIES)}_p{PERIOD}"
+    f"__slablevel{INNOVATION_SLAB_SD['level']:g}_slabtrend{INNOVATION_SLAB_SD['trend']:g}_slabseason{INNOVATION_SLAB_SD['season']:g}"
+    f"__draws{DRAWS}_warmup{WARMUP}_chains{CHAINS}_particles{PARTICLES}_seed{SEED}"
+)
+OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
 MODEL = bx.Model(
@@ -90,6 +96,47 @@ def main() -> None:
     plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.titleweight": "bold", "legend.frameon": False})
     selection_rows = []
 
+    config_path = OUTPUT_DIR / "run_config.json"
+    if config_path.exists() and not OVERWRITE:
+        raise FileExistsError(
+            f"Refusing to overwrite {config_path}; set BUCEX_OVERWRITE=1 to rerun."
+        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "script": SCRIPT_NAME,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "run_timestamp": RUN_TIMESTAMP,
+        "run_signature": RUN_SIGNATURE,
+        "output_directory": str(OUTPUT_DIR),
+        "bucex_version": bx.__version__,
+        "engine": "pgas",
+        "initializer": "laplace",
+        "data": {
+            "data_dir": None if DATA_DIR is None else str(DATA_DIR),
+            "start": START,
+            "end": END,
+            "series": list(SERIES),
+            "period": PERIOD,
+        },
+        "model": MODEL.to_dict(),
+        "priors": PRIOR_SETTINGS,
+        "mcmc": {
+            "draws": DRAWS,
+            "warmup": WARMUP,
+            "chains": CHAINS,
+            "particles": PARTICLES,
+            "seed": SEED,
+        },
+        "figures": {
+            "formats": list(FIGURE_FORMATS),
+            "dpi": FIGURE_DPI,
+            "diagnostics": DIAGNOSTIC_FIGURES,
+        },
+    }
+    config_path.write_text(
+        json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
+
     for number, name in enumerate(SERIES):
         values = bx.load_uccle_series(name, DATA_DIR, start=START, end=END)
         tail = bx.UCCLE_INFO[name]["tail"]
@@ -111,7 +158,7 @@ def main() -> None:
             season_probabilities=SEASON_PROBABILITIES,
         )
 
-        laplace_path = OUTPUT_DIR / "fits" / "uccle" / "laplace" / name / "combined.bucex"
+        laplace_path = OUTPUT_DIR / "fits" / name / "laplace" / "combined.bucex"
         if laplace_path.is_file() and not OVERWRITE:
             laplace_fit = bx.FitResult.load(laplace_path)
             if (
@@ -149,7 +196,7 @@ def main() -> None:
             laplace_path.parent.mkdir(parents=True, exist_ok=True)
             laplace_fit.save(laplace_path)
 
-        pgas_path = OUTPUT_DIR / "fits" / "uccle" / "pgas" / name / "combined.bucex"
+        pgas_path = OUTPUT_DIR / "fits" / name / "pgas" / "combined.bucex"
         if pgas_path.is_file() and not OVERWRITE:
             pgas_fit = bx.FitResult.load(pgas_path)
             if (
@@ -193,8 +240,8 @@ def main() -> None:
             pgas_path.parent.mkdir(parents=True, exist_ok=True)
             pgas_fit.save(pgas_path)
 
-        table_dir = OUTPUT_DIR / "tables" / "uccle" / "pgas" / name
-        figure_dir = OUTPUT_DIR / "figures" / "uccle" / "pgas" / name
+        table_dir = OUTPUT_DIR / "tables" / name
+        figure_dir = OUTPUT_DIR / "figures" / name
         table_dir.mkdir(parents=True, exist_ok=True)
         figure_dir.mkdir(parents=True, exist_ok=True)
         diagnostics = pgas_fit.diagnostics()
@@ -288,7 +335,7 @@ def main() -> None:
         print(f"PGAS fit complete: {name}")
 
     selection_table = pd.concat(selection_rows, ignore_index=True)
-    selection_path = OUTPUT_DIR / "tables" / "uccle" / "uccle_selection_laplace_pgas.csv"
+    selection_path = OUTPUT_DIR / "tables" / "uccle_selection_laplace_pgas.csv"
     selection_table.to_csv(selection_path, index=False)
 
     # One compact comparison of the two engines. Each row is a series/process
@@ -307,7 +354,7 @@ def main() -> None:
     axis.set_title("Uccle structural selection: Laplace and PGAS")
     axis.legend()
     figure.tight_layout()
-    comparison_dir = OUTPUT_DIR / "figures" / "uccle"
+    comparison_dir = OUTPUT_DIR / "figures"
     comparison_dir.mkdir(parents=True, exist_ok=True)
     for extension in FIGURE_FORMATS:
         figure.savefig(comparison_dir / f"selection_laplace_pgas.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")

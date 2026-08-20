@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+#PBS -N bucex_uccle_laplace
+#PBS -l walltime=48:00:00
+#PBS -l nodes=1:ppn=4
+#PBS -l mem=12gb
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+
+START="${START:-1892-01-01}"
+END="${END:-latest}"
+DRAWS="${DRAWS:-250}"
+WARMUP="${WARMUP:-250}"
+CHAINS="${CHAINS:-2}"
+MCMC_SEED="${MCMC_SEED:-56000}"
+DATA_DIR="${DATA_DIR:-data}"
+RESULTS_ROOT="${RESULTS_ROOT:-results}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+OVERWRITE="${OVERWRITE:-0}"
+
+exec > "logs/05_uccle_laplace_${PBS_JOBID:-manual}.log" 2>&1
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+echo "Submitting Uccle-Laplace runner"
+echo "start       = ${START}"
+echo "end         = ${END}"
+echo "draws       = ${DRAWS}"
+echo "warmup      = ${WARMUP}"
+echo "chains      = ${CHAINS}"
+echo "MCMC seed   = ${MCMC_SEED}"
+echo "data dir    = ${DATA_DIR}"
+echo "results     = ${RESULTS_ROOT}"
+echo "run id      = ${RUN_ID}"
+date
+hostname
+
+bash examples/bash_scripts/run_05_uccle_laplace.sh \
+  "${START}" "${END}" "${DRAWS}" "${WARMUP}" "${CHAINS}" "${MCMC_SEED}" \
+  "${DATA_DIR}" "${RESULTS_ROOT}" "${RUN_ID}" "${OVERWRITE}"

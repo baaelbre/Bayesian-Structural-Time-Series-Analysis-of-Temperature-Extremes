@@ -6,6 +6,7 @@ All settings intended for editing are collected directly below.
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import sys
@@ -21,14 +22,11 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results. Set one BUCEX_RUN_ID before running several scripts to make them
-# share a timestamped directory, for example 20260820_143000.
+# Results. BUCEX_RUN_ID may supply one shared timestamp to several HPC jobs.
+# Otherwise the script uses its own start time. The run signature is automatic.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
-TIMESTAMP_RESULTS = os.environ.get("BUCEX_TIMESTAMP_RESULTS", "1").lower() not in {
-    "0", "false", "no",
-}
-RUN_ID = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR = RESULTS_ROOT / RUN_ID if TIMESTAMP_RESULTS else RESULTS_ROOT
+SCRIPT_NAME = Path(__file__).stem
+RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
 OVERWRITE = os.environ.get("BUCEX_OVERWRITE", "0").lower() in {"1", "true", "yes"}
 
 # Data and smoothing.
@@ -47,6 +45,12 @@ FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589"}
 
+RUN_SIGNATURE = (
+    f"{START}_to_{END or 'latest'}"
+    f"__loess{LOESS_FRACTION_MONTHLY:g}-{LOESS_FRACTION_ANNUAL:g}"
+)
+OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
+
 
 def main() -> None:
     values = [
@@ -59,18 +63,45 @@ def main() -> None:
     if uccle.index.min() > pd.Timestamp(START):
         raise ValueError(f"The available record starts at {uccle.index.min()}, not {START}.")
 
-    table_dir = OUTPUT_DIR / "tables" / "00_data"
-    figure_dir = OUTPUT_DIR / "figures" / "00_data"
+    table_dir = OUTPUT_DIR / "tables"
+    figure_dir = OUTPUT_DIR / "figures"
     data_path = table_dir / "uccle_extremes.csv"
     summary_path = table_dir / "uccle_integrity.csv"
+    config_path = OUTPUT_DIR / "run_config.json"
     if not OVERWRITE:
-        existing = [path for path in (data_path, summary_path) if path.exists()]
+        existing = [path for path in (config_path, data_path, summary_path) if path.exists()]
         if existing:
             raise FileExistsError(
                 f"Refusing to overwrite {existing[0]}; set BUCEX_OVERWRITE=1 to rerun."
             )
     table_dir.mkdir(parents=True, exist_ok=True)
     figure_dir.mkdir(parents=True, exist_ok=True)
+
+    run_config = {
+        "script": SCRIPT_NAME,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "run_timestamp": RUN_TIMESTAMP,
+        "run_signature": RUN_SIGNATURE,
+        "output_directory": str(OUTPUT_DIR),
+        "bucex_version": bx.__version__,
+        "data": {
+            "data_dir": None if DATA_DIR is None else str(DATA_DIR),
+            "requested_start": START,
+            "requested_end": END,
+            "actual_start": str(uccle.index.min()),
+            "actual_end": str(uccle.index.max()),
+            "series": list(SERIES),
+        },
+        "loess": {
+            "monthly_fraction": LOESS_FRACTION_MONTHLY,
+            "annual_fraction": LOESS_FRACTION_ANNUAL,
+            "robust_iterations": LOESS_ROBUST_ITERATIONS,
+        },
+        "figures": {"formats": list(FIGURE_FORMATS), "dpi": FIGURE_DPI},
+    }
+    config_path.write_text(
+        json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
+    )
 
     uccle.rename_axis("date").reset_index().to_csv(data_path, index=False)
     pd.DataFrame(

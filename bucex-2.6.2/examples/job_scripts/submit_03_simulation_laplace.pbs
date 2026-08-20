@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#PBS -N bucex_sim_laplace
+#PBS -l walltime=24:00:00
+#PBS -l nodes=1:ppn=4
+#PBS -l mem=12gb
+#PBS -j oe
+
+set -euo pipefail
+
+cd "${PBS_O_WORKDIR}"
+mkdir -p logs
+
+N_TIME="${N_TIME:-1000}"
+PERIOD="${PERIOD:-4}"
+SIMULATION_SEED="${SIMULATION_SEED:-13081997}"
+DRAWS="${DRAWS:-400}"
+WARMUP="${WARMUP:-100}"
+CHAINS="${CHAINS:-1}"
+MCMC_SEED="${MCMC_SEED:-13081997}"
+RESULTS_ROOT="${RESULTS_ROOT:-results}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+OVERWRITE="${OVERWRITE:-0}"
+
+exec > "logs/03_simulation_laplace_${PBS_JOBID:-manual}.log" 2>&1
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+echo "Submitting simulation-Laplace runner"
+echo "n time      = ${N_TIME}"
+echo "period      = ${PERIOD}"
+echo "sim seed    = ${SIMULATION_SEED}"
+echo "draws       = ${DRAWS}"
+echo "warmup      = ${WARMUP}"
+echo "chains      = ${CHAINS}"
+echo "MCMC seed   = ${MCMC_SEED}"
+echo "results     = ${RESULTS_ROOT}"
+echo "run id      = ${RUN_ID}"
+date
+hostname
+
+bash examples/bash_scripts/run_03_simulation_laplace.sh \
+  "${N_TIME}" "${PERIOD}" "${SIMULATION_SEED}" \
+  "${DRAWS}" "${WARMUP}" "${CHAINS}" "${MCMC_SEED}" \
+  "${RESULTS_ROOT}" "${RUN_ID}" "${OVERWRITE}"
