@@ -14,7 +14,7 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.stats import gaussian_kde
+from scipy.stats import genextreme
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
@@ -44,6 +44,11 @@ TAIL_SEED = 2_601  # Same seed gives all three series the same latent path.
 SCALE_SIGMA_VALUES = (0.75, 1.50, 3.00)
 SCALE_XI = -0.30
 SCALE_SEED = 2_602  # Same seed gives all three series the same latent path.
+
+# The theoretical density plots show this central probability range. Their
+# horizontal axis is y - mu, so the changing local-level path plays no role.
+DENSITY_PROBABILITY_RANGE = (0.001, 0.995)
+DENSITY_GRID_POINTS = 900
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
@@ -174,19 +179,81 @@ def main() -> None:
                 figure.savefig(figure_dir / f"{group}_{scenario['name']}.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
             plt.close(figure)
 
-        figure, axis = plt.subplots(figsize=(8.5, 4.5))
-        density_grid = np.linspace(common_ylim[0], common_ylim[1], 500)
+        # Compare the actual GEV densities, rather than kernel densities of the
+        # simulated non-stationary observations.  SciPy uses c = -xi.  Setting
+        # loc=0 makes the horizontal axis the value relative to mu_t.
+        density_ranges = []
+        finite_upper_endpoints = []
         for scenario in scenarios:
-            values = grouped_tables[group][scenario["name"]]["y"].to_numpy()
-            density = gaussian_kde(values)
-            axis.plot(density_grid, density(density_grid), linewidth=1.8, label=scenario["title"])
-        axis.set_title(f"GEV {group} comparison on a common latent path")
-        axis.set_xlabel("observation")
+            sigma = float(scenario["params"]["sigma"])
+            xi = float(scenario["params"]["xi"])
+            density_ranges.append(
+                genextreme.ppf(
+                    DENSITY_PROBABILITY_RANGE,
+                    c=-xi,
+                    loc=0.0,
+                    scale=sigma,
+                )
+            )
+            if xi < 0.0:
+                finite_upper_endpoints.append(-sigma / xi)
+
+        lower = min(float(values[0]) for values in density_ranges)
+        upper = max(float(values[1]) for values in density_ranges)
+        if finite_upper_endpoints:
+            upper = max(upper, max(finite_upper_endpoints))
+        padding = 0.05 * max(upper - lower, 1.0)
+        density_grid = np.linspace(lower - padding, upper + padding, DENSITY_GRID_POINTS)
+
+        figure, axis = plt.subplots(figsize=(9, 4.6), layout="constrained")
+        palette = ("#2778B4", COLORS["teal"], "#E76F51")
+        for scenario, color in zip(scenarios, palette):
+            sigma = float(scenario["params"]["sigma"])
+            xi = float(scenario["params"]["xi"])
+            density = genextreme.pdf(
+                density_grid,
+                c=-xi,
+                loc=0.0,
+                scale=sigma,
+            )
+            if group == "shape":
+                label = rf"$\xi={xi:+.2f}$, $\sigma={sigma:.2f}$"
+            else:
+                label = rf"$\sigma={sigma:.2f}$, $\xi={xi:+.2f}$"
+            if xi < 0.0:
+                endpoint = -sigma / xi
+                label += rf"; endpoint $={endpoint:.2f}$"
+                axis.axvline(
+                    endpoint,
+                    color=color,
+                    linestyle="--",
+                    linewidth=1.25,
+                    alpha=0.85,
+                )
+            axis.plot(
+                density_grid,
+                density,
+                color=color,
+                linewidth=2.2,
+                label=label,
+            )
+
+        axis.set_xlim(lower - padding, upper + padding)
+        axis.set_title(
+            "The GEV shape changes the tail and its support"
+            if group == "shape"
+            else "The GEV scale changes dispersion and the bounded endpoint"
+        )
+        axis.set_xlabel(r"value relative to location, $y-\mu$")
         axis.set_ylabel("density")
+        axis.grid(axis="y", alpha=0.35)
         axis.legend()
-        figure.tight_layout()
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"{group}_density_comparison.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(
+                figure_dir / f"{group}_theoretical_density_comparison.{extension}",
+                dpi=FIGURE_DPI,
+                bbox_inches="tight",
+            )
         plt.close(figure)
 
     catalog = []
