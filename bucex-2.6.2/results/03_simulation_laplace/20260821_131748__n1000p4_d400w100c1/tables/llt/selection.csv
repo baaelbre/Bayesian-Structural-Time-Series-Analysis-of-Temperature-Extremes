@@ -1,0 +1,4 @@
+process,zero,fixed,dynamic,truth_code,truth_state,probability_true_state
+level,0.0,0.0075,0.9925,2,dynamic,0.9925
+slope,0.19,0.5875,0.2225,2,dynamic,0.2225
+seasonal,0.995,0.0025,0.0025,0,zero,0.995

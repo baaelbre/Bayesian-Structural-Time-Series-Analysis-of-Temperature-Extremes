@@ -9,10 +9,22 @@ cores without oversubscription.
 ## One-time setup
 
 ```bash
-cd /path/to/bucex_2.6.2
+cd /kyukon/data/gent/vo/000/gvo00048/vsc42619/GitHub/Bayesian-Structural-Time-Series-Analysis-of-Temperature-Extremes/bucex-2.6.2
+# only one time install
+mkdir -p "$HOME/venvs"
+
+python -m venv "$HOME/venvs/bucex_env"
 source "$HOME/venvs/bucex_env/bin/activate"
+
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
+
+# run this !
+source "$HOME/venvs/bucex_env/bin/activate"
+module load Python/3.12.3-GCCcore-13.3.0
 python -m pip install -e .
 python -c "import bucex; print(bucex.__version__)"
+python -m pip install matplib
 mkdir -p logs results
 ```
 
@@ -32,7 +44,7 @@ STAMP="$(date +%Y%m%d_%H%M%S)"
 qsub -v START=1892-01-01,END=latest,DATA_DIR=data,RESULTS_ROOT=results,RUN_ID="${STAMP}_record" \
   examples/job_scripts/submit_00_uccle_record.pbs
 
-qsub -v N_TIME=800,PERIOD=4,RESULTS_ROOT=results,RUN_ID="${STAMP}_tails" \
+qsub -v N_TIME=1000,PERIOD=4,RESULTS_ROOT=results,RUN_ID="${STAMP}_tails" \
   examples/job_scripts/submit_01_tail_simulations.pbs
 
 qsub -v N_TIME=1000,PERIOD=4,SIMULATION_SEED=13081997,RESULTS_ROOT=results,RUN_ID="${STAMP}_structures" \
