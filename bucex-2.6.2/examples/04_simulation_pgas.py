@@ -80,11 +80,7 @@ FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
 PHASE_LABELS = tuple(f"phase {index + 1}" for index in range(PERIOD))
 
-RUN_SIGNATURE = (
-    f"n{N_TIME}_p{PERIOD}"
-    f"__slab{INNOVATION_SLAB_SD['level']:g}-{INNOVATION_SLAB_SD['trend']:g}-{INNOVATION_SLAB_SD['season']:g}"
-    f"__d{DRAWS}_w{WARMUP}_c{CHAINS}_pt{PARTICLES}_s{SEED}"
-)
+RUN_SIGNATURE = f"n{N_TIME}p{PERIOD}_d{DRAWS}w{WARMUP}c{CHAINS}p{PARTICLES}"
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
@@ -97,6 +93,7 @@ fixed_cycle -= fixed_cycle.mean()
 SCENARIOS = (
     {
         "name": "stationary",
+        "key": "stationary",
         "model": bx.Model(bx.GEV(), (bx.LocalLinearTrend(level_mode="static", trend_mode="off"),), name="stationary"),
         "params": {"sigma": SIGMA, "xi": XI},
         "initial_state": np.array([INITIAL_LEVEL]),
@@ -105,6 +102,7 @@ SCENARIOS = (
     },
     {
         "name": "linear_trend",
+        "key": "linear",
         "model": bx.Model(bx.GEV(), (bx.LocalLinearTrend(level_mode="static", trend_mode="static"),), name="linear trend"),
         "params": {"sigma": SIGMA, "xi": XI},
         "initial_state": np.array([INITIAL_LEVEL, LINEAR_SLOPE]),
@@ -113,6 +111,7 @@ SCENARIOS = (
     },
     {
         "name": "random_walk",
+        "key": "random_walk",
         "model": bx.Model(bx.GEV(), (bx.LocalLinearTrend(level_mode="dynamic", trend_mode="off"),), name="random walk"),
         "params": {"sigma": SIGMA, "xi": XI, "sd.level": RANDOM_WALK_SD},
         "initial_state": np.array([INITIAL_LEVEL]),
@@ -121,6 +120,7 @@ SCENARIOS = (
     },
     {
         "name": "local_linear_trend",
+        "key": "llt",
         "model": bx.Model(bx.GEV(), (bx.LocalLinearTrend(level_mode="dynamic", trend_mode="dynamic"),), name="local linear trend"),
         "params": {"sigma": SIGMA, "xi": XI, "sd.level": LOCAL_LEVEL_SD, "sd.slope": LOCAL_SLOPE_SD},
         "initial_state": np.array([INITIAL_LEVEL, LOCAL_INITIAL_SLOPE]),
@@ -129,6 +129,7 @@ SCENARIOS = (
     },
     {
         "name": "stationary_dynamic_season",
+        "key": "dynamic_season",
         "model": bx.Model(
             bx.GEV(),
             (bx.LocalLinearTrend(level_mode="static", trend_mode="off"), bx.DummySeasonal(PERIOD, mode="dynamic")),
@@ -141,6 +142,7 @@ SCENARIOS = (
     },
     {
         "name": "local_linear_trend_fixed_season",
+        "key": "llt_season",
         "model": bx.Model(
             bx.GEV(),
             (bx.LocalLinearTrend(level_mode="dynamic", trend_mode="dynamic"), bx.DummySeasonal(PERIOD, mode="static")),
@@ -225,6 +227,9 @@ def main() -> None:
             "seed": SEED,
         },
         "scenarios": [scenario["name"] for scenario in SCENARIOS],
+        "scenario_directories": {
+            scenario["name"]: scenario["key"] for scenario in SCENARIOS
+        },
         "figures": {
             "formats": list(FIGURE_FORMATS),
             "dpi": FIGURE_DPI,
@@ -238,7 +243,7 @@ def main() -> None:
     )
 
     for number, scenario in enumerate(SCENARIOS):
-        data_path = OUTPUT_DIR / "simulations" / f"{scenario['name']}.csv"
+        data_path = OUTPUT_DIR / "simulations" / f"{scenario['key']}.csv"
         truth_path = data_path.with_suffix(".json")
         expected_truth = {
             "name": scenario["name"],
@@ -305,7 +310,7 @@ def main() -> None:
             season_probabilities=SEASON_PROBABILITIES,
         )
 
-        laplace_path = OUTPUT_DIR / "fits" / scenario["name"] / "laplace" / "combined.bucex"
+        laplace_path = OUTPUT_DIR / "fits" / scenario["key"] / "laplace" / "combined.bucex"
         if laplace_path.is_file() and not OVERWRITE:
             laplace_fit = bx.FitResult.load(laplace_path)
             if (
@@ -321,7 +326,7 @@ def main() -> None:
                 raise ValueError(f"{laplace_path} does not match the current settings.")
         elif COMBINE_RUNS:
             source_paths = [
-                run_dir / "fits" / scenario["name"] / "laplace" / "combined.bucex"
+                run_dir / "fits" / scenario["key"] / "laplace" / "combined.bucex"
                 for run_dir in COMBINE_RUNS
             ]
             missing = [path for path in source_paths if not path.is_file()]
@@ -353,7 +358,7 @@ def main() -> None:
             laplace_path.parent.mkdir(parents=True, exist_ok=True)
             laplace_fit.save(laplace_path)
 
-        pgas_path = OUTPUT_DIR / "fits" / scenario["name"] / "pgas" / "combined.bucex"
+        pgas_path = OUTPUT_DIR / "fits" / scenario["key"] / "pgas" / "combined.bucex"
         if pgas_path.is_file() and not OVERWRITE:
             pgas_fit = bx.FitResult.load(pgas_path)
             if (
@@ -371,7 +376,7 @@ def main() -> None:
             print(f"Reusing {pgas_path}")
         elif COMBINE_RUNS:
             source_paths = [
-                run_dir / "fits" / scenario["name"] / "pgas" / "combined.bucex"
+                run_dir / "fits" / scenario["key"] / "pgas" / "combined.bucex"
                 for run_dir in COMBINE_RUNS
             ]
             missing = [path for path in source_paths if not path.is_file()]
@@ -418,29 +423,29 @@ def main() -> None:
             print(f"One-chain PGAS fit complete: {scenario['name']}")
             continue
 
-        table_dir = OUTPUT_DIR / "tables" / scenario["name"]
-        figure_dir = OUTPUT_DIR / "figures" / scenario["name"]
+        table_dir = OUTPUT_DIR / "tables" / scenario["key"]
+        figure_dir = OUTPUT_DIR / "figures" / scenario["key"]
         table_dir.mkdir(parents=True, exist_ok=True)
         figure_dir.mkdir(parents=True, exist_ok=True)
         diagnostics = pgas_fit.diagnostics()
 
         pd.DataFrame.from_dict(pgas_fit.static_summary(), orient="index").rename_axis("parameter").to_csv(table_dir / "parameters.csv")
         diagnostics["parameters"].to_csv(table_dir / "diagnostics.csv")
-        pd.DataFrame([{"metric": key, "value": value} for key, value in diagnostics["engine"].items()]).to_csv(table_dir / "algorithm_diagnostics.csv", index=False)
+        pd.DataFrame([{"metric": key, "value": value} for key, value in diagnostics["engine"].items()]).to_csv(table_dir / "algorithm.csv", index=False)
         eta_draws = pgas_fit.eta_draws(original_scale=True)
         lower, median, upper = np.quantile(eta_draws, [0.05, 0.50, 0.95], axis=0)
         pd.DataFrame({"time": table["time"], "observed": pgas_fit.observed, "lower": lower, "median": median, "upper": upper, "truth": table["eta"]}).to_csv(
-            table_dir / "posterior_trajectory.csv", index=False
+            table_dir / "trajectory.csv", index=False
         )
 
         selection = pgas_fit.component_probabilities().reset_index()
         selection["truth_code"] = selection["process"].map(scenario["structural_truth"])
         selection["truth_state"] = selection["truth_code"].map(labels)
         selection["probability_true_state"] = [row[labels[int(row["truth_code"])]] for _, row in selection.iterrows()]
-        selection.to_csv(table_dir / "selection_probabilities.csv", index=False)
-        pgas_fit.structural_model_probabilities().to_csv(table_dir / "structural_models.csv", index=False)
-        pgas_fit.component_transition_summary().reset_index().to_csv(table_dir / "selection_switching.csv", index=False)
-        (table_dir / "fit_summary.json").write_text(
+        selection.to_csv(table_dir / "selection.csv", index=False)
+        pgas_fit.structural_model_probabilities().to_csv(table_dir / "models.csv", index=False)
+        pgas_fit.component_transition_summary().reset_index().to_csv(table_dir / "switching.csv", index=False)
+        (table_dir / "summary.json").write_text(
             json.dumps(
                 {
                     "fit": str(pgas_path),
@@ -477,33 +482,33 @@ def main() -> None:
         axis.set_title(f"{scenario['name']}: posterior latent predictor (PGAS)")
         axis.legend()
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"posterior_trajectory.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"trajectory.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("component_probabilities")
         figure.suptitle(f"{scenario['name']}: structural selection (PGAS)")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"selection_probabilities.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"selection.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("process_sds", truths=truth["parameter_truth"], title=f"{scenario['name']}: prior to posterior (PGAS)")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"prior_to_posterior_process_sd.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"process_sd.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("parameter_densities", parameters=("sigma", "xi"), truths=truth["parameter_truth"])
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"gev_parameters.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"gev.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("season", labels=PHASE_LABELS, show_interval=False)
         figure.suptitle(f"{scenario['name']}: phase-specific posterior trajectories")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"seasonal_trajectories.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"season.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         if DIAGNOSTIC_FIGURES:
-            for kind, filename in (("traces", "process_sd_traces"), ("acf", "parameter_acfs")):
+            for kind, filename in (("traces", "sd_traces"), ("acf", "acf")):
                 figure, _ = pgas_fit.plot(kind)
                 for extension in FIGURE_FORMATS:
                     figure.savefig(figure_dir / f"{filename}.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
@@ -514,7 +519,7 @@ def main() -> None:
         print(f"One-chain PGAS simulation outputs: {OUTPUT_DIR}")
         return
 
-    comparison_path = OUTPUT_DIR / "tables" / "laplace_pgas_selection_comparison.csv"
+    comparison_path = OUTPUT_DIR / "tables" / "engine_selection.csv"
     comparison_path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(comparison_rows).to_csv(comparison_path, index=False)
     print(f"PGAS simulation outputs: {OUTPUT_DIR}")

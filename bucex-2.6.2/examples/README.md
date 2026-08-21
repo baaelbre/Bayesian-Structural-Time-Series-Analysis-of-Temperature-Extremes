@@ -34,6 +34,13 @@ There is no switch for disabling either part of the run name. Set
 `run_config.json`; set `BUCEX_OVERWRITE=1` only when deliberately rerunning an
 existing identifier.
 
+Run signatures and repeated figure/table names are deliberately compact. This
+keeps the complete path below the legacy Windows directory limit even when the
+repository itself is inside a long OneDrive path. The readable identifiers
+needed for browsing stay in the folder name; all omitted settings, seeds, and
+the mapping from short scenario directories such as `llt` to their full names
+are recorded in `run_config.json`.
+
 Every scientific setting is near the top of the relevant script. For HPC use,
 each example has a positional-argument runner in `bash_scripts/` and a matching
 resource-and-logging submission file in `job_scripts/`. Their direct Bash and

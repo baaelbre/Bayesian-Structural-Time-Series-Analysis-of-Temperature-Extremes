@@ -71,9 +71,8 @@ FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
 
 RUN_SIGNATURE = (
-    f"{START.removesuffix('-01-01')}-{(END or 'latest').removesuffix('-12-31')}"
-    f"__slab{INNOVATION_SLAB_SD['level']:g}-{INNOVATION_SLAB_SD['trend']:g}-{INNOVATION_SLAB_SD['season']:g}"
-    f"__d{DRAWS}_w{WARMUP}_c{CHAINS}_pt{PARTICLES}_s{SEED}"
+    f"y{START.removesuffix('-01-01')}-{(END or 'latest').removesuffix('-12-31')}"
+    f"_d{DRAWS}w{WARMUP}c{CHAINS}p{PARTICLES}"
 )
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
@@ -305,19 +304,19 @@ def main() -> None:
 
         pd.DataFrame.from_dict(pgas_fit.static_summary(), orient="index").rename_axis("parameter").to_csv(table_dir / "parameters.csv")
         diagnostics["parameters"].to_csv(table_dir / "diagnostics.csv")
-        pd.DataFrame([{"metric": key, "value": value} for key, value in diagnostics["engine"].items()]).to_csv(table_dir / "algorithm_diagnostics.csv", index=False)
+        pd.DataFrame([{"metric": key, "value": value} for key, value in diagnostics["engine"].items()]).to_csv(table_dir / "algorithm.csv", index=False)
         eta_draws = pgas_fit.eta_draws(original_scale=True)
         lower, median, upper = np.quantile(eta_draws, [0.05, 0.50, 0.95], axis=0)
         pd.DataFrame({"date": values.index, "observed": values.to_numpy(), "lower": lower, "median": median, "upper": upper}).to_csv(
-            table_dir / "posterior_trajectory.csv", index=False
+            table_dir / "trajectory.csv", index=False
         )
         selection = pgas_fit.component_probabilities().reset_index()
         selection.insert(0, "series", name)
         selection.insert(1, "engine", "pgas")
-        selection.to_csv(table_dir / "selection_probabilities.csv", index=False)
-        pgas_fit.structural_model_probabilities().to_csv(table_dir / "structural_models.csv", index=False)
-        pgas_fit.component_transition_summary().reset_index().to_csv(table_dir / "selection_switching.csv", index=False)
-        (table_dir / "fit_summary.json").write_text(
+        selection.to_csv(table_dir / "selection.csv", index=False)
+        pgas_fit.structural_model_probabilities().to_csv(table_dir / "models.csv", index=False)
+        pgas_fit.component_transition_summary().reset_index().to_csv(table_dir / "switching.csv", index=False)
+        (table_dir / "summary.json").write_text(
             json.dumps(
                 {
                     "fit": str(pgas_path),
@@ -349,29 +348,29 @@ def main() -> None:
         axis.set_title(f"{name}: posterior latent predictor (PGAS)")
         axis.set_ylabel("GEV location / °C")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"posterior_trajectory.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"trajectory.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("component_probabilities")
         figure.suptitle(f"{name}: structural selection (PGAS)")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"selection_probabilities.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"selection.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("process_sds", title=f"{name}: prior to posterior (PGAS)")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"prior_to_posterior_process_sd.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"process_sd.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("parameter_densities", parameters=("sigma", "xi"))
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"gev_parameters.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"gev.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         figure, _ = pgas_fit.plot("season", show_interval=False)
         figure.suptitle(f"{name}: monthly level + seasonal trajectories")
         for extension in FIGURE_FORMATS:
-            figure.savefig(figure_dir / f"seasonal_trajectories.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+            figure.savefig(figure_dir / f"season.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
         plt.close(figure)
 
         try:
@@ -384,7 +383,7 @@ def main() -> None:
             plt.close(figure)
 
         if DIAGNOSTIC_FIGURES:
-            for kind, filename in (("traces", "process_sd_traces"), ("acf", "parameter_acfs")):
+            for kind, filename in (("traces", "sd_traces"), ("acf", "acf")):
                 figure, _ = pgas_fit.plot(kind)
                 for extension in FIGURE_FORMATS:
                     figure.savefig(figure_dir / f"{filename}.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
@@ -396,7 +395,7 @@ def main() -> None:
         return
 
     selection_table = pd.concat(selection_rows, ignore_index=True)
-    selection_path = OUTPUT_DIR / "tables" / "uccle_selection_laplace_pgas.csv"
+    selection_path = OUTPUT_DIR / "tables" / "selection_all.csv"
     selection_table.to_csv(selection_path, index=False)
 
     # One compact comparison of the two engines. Each row is a series/process
@@ -418,7 +417,7 @@ def main() -> None:
     comparison_dir = OUTPUT_DIR / "figures"
     comparison_dir.mkdir(parents=True, exist_ok=True)
     for extension in FIGURE_FORMATS:
-        figure.savefig(comparison_dir / f"selection_laplace_pgas.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
+        figure.savefig(comparison_dir / f"selection_engines.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(figure)
     print(f"Uccle PGAS outputs: {OUTPUT_DIR}")
 

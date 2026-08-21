@@ -1,0 +1,44 @@
+{
+  "bucex_version": "2.6.2",
+  "created_at": "2026-08-21T12:48:09.751358+02:00",
+  "density": {
+    "grid_points": 900,
+    "probability_range": [
+      0.001,
+      0.995
+    ],
+    "relative_to_location": true
+  },
+  "figures": {
+    "dpi": 180,
+    "formats": [
+      "pdf",
+      "png"
+    ]
+  },
+  "output_directory": "results\\01_tail_simulations\\20260821_124809__n800_p4__xi-0.3_0_0.3__scale0.75_1.5_3__q0.08_s2601-2602",
+  "run_signature": "n800_p4__xi-0.3_0_0.3__scale0.75_1.5_3__q0.08_s2601-2602",
+  "run_timestamp": "20260821_124809",
+  "script": "01_tail_simulations",
+  "simulation": {
+    "initial_level": 25.0,
+    "level_process_sd": 0.08,
+    "n_time": 800,
+    "period": 4,
+    "scale_seed": 2602,
+    "scale_sigma_values": [
+      0.75,
+      1.5,
+      3.0
+    ],
+    "scale_xi": -0.3,
+    "start_date": "1901-01-01",
+    "tail_seed": 2601,
+    "tail_sigma": 1.5,
+    "tail_xi_values": [
+      -0.3,
+      0.0,
+      0.3
+    ]
+  }
+}

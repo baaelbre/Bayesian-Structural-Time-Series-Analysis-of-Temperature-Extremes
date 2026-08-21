@@ -1,0 +1,7 @@
+name,level,slope,seasonal,sigma,xi,sd.level,sd.slope,sd.seasonal,seed
+stationary,1,0,0,1.5,-0.3,0.0,0.0,0.0,13081997
+linear_trend,1,1,0,1.5,-0.3,0.0,0.0,0.0,13081998
+random_walk,2,0,0,1.5,-0.3,0.05,0.0,0.0,13081999
+local_linear_trend,2,2,0,1.5,-0.3,0.02,0.0005,0.0,13082000
+stationary_dynamic_season,1,0,2,1.5,-0.3,0.0,0.0,0.05,13082001
+local_linear_trend_fixed_season,2,2,1,1.5,-0.3,0.02,0.0005,0.0,13082000

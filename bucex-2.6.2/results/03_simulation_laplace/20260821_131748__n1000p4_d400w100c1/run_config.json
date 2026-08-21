@@ -1,0 +1,120 @@
+{
+  "bucex_version": "2.6.2",
+  "chain_only": false,
+  "combined_chain_runs": [],
+  "created_at": "2026-08-21T13:17:48.845322+02:00",
+  "engine": "laplace",
+  "figures": {
+    "diagnostics": false,
+    "dpi": 180,
+    "formats": [
+      "pdf",
+      "png"
+    ]
+  },
+  "fit_model": {
+    "components": [
+      {
+        "initial_level": null,
+        "initial_level_sd": null,
+        "initial_slope": 0.0,
+        "initial_slope_sd": null,
+        "level_mode": "dynamic",
+        "level_name": "level",
+        "slope_name": "slope",
+        "trend_mode": "dynamic",
+        "type": "local_linear_trend"
+      },
+      {
+        "initial_mean": null,
+        "initial_sd": null,
+        "mode": "dynamic",
+        "name": "seasonal",
+        "period": 4,
+        "type": "dummy_seasonal"
+      }
+    ],
+    "eta_name": "mu",
+    "name": "GEV unobserved-components model",
+    "observation": {
+      "family": "gev",
+      "xi_bounds": [
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  "mcmc": {
+    "chains": 1,
+    "draws": 400,
+    "seed": 13081997,
+    "warmup": 100
+  },
+  "output_directory": "results\\03_simulation_laplace\\20260821_131748__n1000p4_d400w100c1",
+  "priors": {
+    "alpha_sd": 3.2,
+    "beta_mean": 0.0,
+    "beta_sd": 0.01,
+    "innovation_slab_sd": {
+      "level": 0.1,
+      "season": 0.07,
+      "trend": 0.0008
+    },
+    "level_dynamic_probability": 0.5,
+    "season_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    "seasonal_initial_sd": 0.5,
+    "sigma2": {
+      "a": 2.0,
+      "b": 2.25
+    },
+    "trend_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    "xi_bounds": [
+      -0.5,
+      0.5
+    ],
+    "xi_max_abs": 0.5
+  },
+  "run_signature": "n1000p4_d400w100c1",
+  "run_timestamp": "20260821_131748",
+  "scenario_directories": {
+    "linear_trend": "linear",
+    "local_linear_trend": "llt",
+    "local_linear_trend_fixed_season": "llt_season",
+    "random_walk": "random_walk",
+    "stationary": "stationary",
+    "stationary_dynamic_season": "dynamic_season"
+  },
+  "scenarios": [
+    "stationary",
+    "linear_trend",
+    "random_walk",
+    "local_linear_trend",
+    "stationary_dynamic_season",
+    "local_linear_trend_fixed_season"
+  ],
+  "script": "03_simulation_laplace",
+  "simulation": {
+    "dynamic_season_amplitude": 0.25,
+    "fixed_season_amplitude": 0.25,
+    "initial_level": 25.0,
+    "linear_slope": 0.006,
+    "local_initial_slope": 0.003,
+    "local_level_sd": 0.02,
+    "local_slope_sd": 0.0005,
+    "n_time": 1000,
+    "period": 4,
+    "random_walk_sd": 0.05,
+    "seasonal_sd": 0.05,
+    "seed": 13081997,
+    "sigma": 1.5,
+    "xi": -0.3
+  }
+}

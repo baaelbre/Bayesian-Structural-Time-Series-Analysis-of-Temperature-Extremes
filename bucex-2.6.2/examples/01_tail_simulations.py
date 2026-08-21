@@ -54,12 +54,7 @@ FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589"}
 
-RUN_SIGNATURE = (
-    f"n{N_TIME}_p{PERIOD}"
-    f"__xi{'_'.join(f'{value:g}' for value in TAIL_XI_VALUES)}"
-    f"__scale{'_'.join(f'{value:g}' for value in SCALE_SIGMA_VALUES)}"
-    f"__q{LEVEL_PROCESS_SD:g}_s{TAIL_SEED}-{SCALE_SEED}"
-)
+RUN_SIGNATURE = f"n{N_TIME}p{PERIOD}_s{TAIL_SEED}"
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 
@@ -295,7 +290,7 @@ def main() -> None:
         axis.legend()
         for extension in FIGURE_FORMATS:
             figure.savefig(
-                figure_dir / f"{group}_theoretical_density_comparison.{extension}",
+                figure_dir / f"{group}_density_comparison.{extension}",
                 dpi=FIGURE_DPI,
                 bbox_inches="tight",
             )

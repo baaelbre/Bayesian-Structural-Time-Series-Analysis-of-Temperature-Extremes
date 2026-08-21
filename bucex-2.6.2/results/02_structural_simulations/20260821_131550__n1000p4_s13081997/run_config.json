@@ -1,0 +1,304 @@
+{
+  "bucex_version": "2.6.2",
+  "created_at": "2026-08-21T13:15:50.157248+02:00",
+  "figures": {
+    "dpi": 180,
+    "formats": [
+      "pdf",
+      "png"
+    ]
+  },
+  "output_directory": "results\\02_structural_simulations\\20260821_131550__n1000p4_s13081997",
+  "run_signature": "n1000p4_s13081997",
+  "run_timestamp": "20260821_131550",
+  "scenarios": [
+    {
+      "initial_state": [
+        25.0
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "static",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "off",
+            "type": "local_linear_trend"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "stationary",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "stationary",
+      "params": {
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13081997,
+      "structural_truth": {
+        "level": 1,
+        "seasonal": 0,
+        "slope": 0
+      }
+    },
+    {
+      "initial_state": [
+        25.0,
+        0.006
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "static",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "static",
+            "type": "local_linear_trend"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "linear trend",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "linear_trend",
+      "params": {
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13081998,
+      "structural_truth": {
+        "level": 1,
+        "seasonal": 0,
+        "slope": 1
+      }
+    },
+    {
+      "initial_state": [
+        25.0
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "dynamic",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "off",
+            "type": "local_linear_trend"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "random walk",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "random_walk",
+      "params": {
+        "sd.level": 0.05,
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13081999,
+      "structural_truth": {
+        "level": 2,
+        "seasonal": 0,
+        "slope": 0
+      }
+    },
+    {
+      "initial_state": [
+        25.0,
+        0.003
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "dynamic",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "dynamic",
+            "type": "local_linear_trend"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "local linear trend",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "local_linear_trend",
+      "params": {
+        "sd.level": 0.02,
+        "sd.slope": 0.0005,
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13082000,
+      "structural_truth": {
+        "level": 2,
+        "seasonal": 0,
+        "slope": 2
+      }
+    },
+    {
+      "initial_state": [
+        25.0,
+        -2.678914873134835e-17,
+        0.25,
+        3.444319122601931e-17
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "static",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "off",
+            "type": "local_linear_trend"
+          },
+          {
+            "initial_mean": null,
+            "initial_sd": null,
+            "mode": "dynamic",
+            "name": "seasonal",
+            "period": 4,
+            "type": "dummy_seasonal"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "stationary plus changing seasonality",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "stationary_dynamic_season",
+      "params": {
+        "sd.seasonal": 0.05,
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13082001,
+      "structural_truth": {
+        "level": 1,
+        "seasonal": 2,
+        "slope": 0
+      }
+    },
+    {
+      "initial_state": [
+        25.0,
+        0.003,
+        -2.678914873134835e-17,
+        0.25,
+        3.444319122601931e-17
+      ],
+      "model": {
+        "components": [
+          {
+            "initial_level": null,
+            "initial_level_sd": null,
+            "initial_slope": 0.0,
+            "initial_slope_sd": null,
+            "level_mode": "dynamic",
+            "level_name": "level",
+            "slope_name": "slope",
+            "trend_mode": "dynamic",
+            "type": "local_linear_trend"
+          },
+          {
+            "initial_mean": null,
+            "initial_sd": null,
+            "mode": "static",
+            "name": "seasonal",
+            "period": 4,
+            "type": "dummy_seasonal"
+          }
+        ],
+        "eta_name": "mu",
+        "name": "local linear trend plus fixed seasonality",
+        "observation": {
+          "family": "gev",
+          "xi_bounds": [
+            -0.5,
+            0.5
+          ]
+        }
+      },
+      "name": "local_linear_trend_fixed_season",
+      "params": {
+        "sd.level": 0.02,
+        "sd.slope": 0.0005,
+        "sigma": 1.5,
+        "xi": -0.3
+      },
+      "seed": 13082000,
+      "structural_truth": {
+        "level": 2,
+        "seasonal": 1,
+        "slope": 2
+      }
+    }
+  ],
+  "script": "02_structural_simulations",
+  "simulation": {
+    "dynamic_season_amplitude": 0.25,
+    "fixed_season_amplitude": 0.25,
+    "initial_level": 25.0,
+    "linear_slope": 0.006,
+    "local_initial_slope": 0.003,
+    "local_level_sd": 0.02,
+    "local_slope_sd": 0.0005,
+    "n_time": 1000,
+    "period": 4,
+    "random_walk_sd": 0.05,
+    "seasonal_sd": 0.05,
+    "seed": 13081997,
+    "sigma": 1.5,
+    "xi": -0.3
+  }
+}
