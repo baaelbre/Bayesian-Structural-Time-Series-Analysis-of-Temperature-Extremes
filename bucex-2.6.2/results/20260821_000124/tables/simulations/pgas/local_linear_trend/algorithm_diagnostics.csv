@@ -1,0 +1,10 @@
+metric,value
+median_min_particle_ess,48.955983353929945
+mean_unique_ancestors,79.938465
+path_change_rate,0.9875
+mean_path_update_fraction,0.08723526473526473
+reference_ancestor_change_rate,0.0010025000000000004
+ssvs_model_move_acceptance,0.4375
+ssvs_proposed_change_rate,0.11
+ssvs_median_log_acceptance_ratio,-1.000113910848313
+ssvs_mean_elliptical_slice_steps,11.5575

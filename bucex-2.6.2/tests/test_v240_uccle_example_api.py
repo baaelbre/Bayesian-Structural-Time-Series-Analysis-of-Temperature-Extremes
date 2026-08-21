@@ -86,7 +86,12 @@ def test_v262_examples_are_standalone_public_api_scripts():
         assert "PresentationWorkflow" not in source
         assert "export_fit_results" not in source
         assert "plot_fit_results" not in source
-        assert "TIMESTAMP_RESULTS" in source
+        assert "SCRIPT_NAME = Path(__file__).stem" in source
+        assert "RUN_SIGNATURE" in source
+        assert 'OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"' in source
+        assert 'run_config.json' in source
+        assert "TIMESTAMP_RESULTS" not in source
+        assert "BUCEX_TIMESTAMP_RESULTS" not in source
 
     assert "bx.loess_smooth(" in sources["00_uccle_record.py"]
     assert '"1892-01-01"' in sources["00_uccle_record.py"]

@@ -8,6 +8,12 @@ Every analysis now has two files, following the usual PBS pattern:
 - `examples/job_scripts/submit_*.pbs` contains resource requests, logging, and
   named PBS settings. It calls the corresponding runner.
 
+For examples 03--06, `CHAINS=4` means four independent one-chain Python
+processes run concurrently on the four requested PBS cores. The runner waits
+for every process, combines the fits with `bucex.combine_fits`, and produces
+tables and figures from the combined four-chain result. Examples 00--02 remain
+single-process jobs.
+
 For example:
 
 ```text
@@ -118,25 +124,29 @@ The main scientific settings—GEV scale and shape, process-noise truths, SSVS
 probabilities, and prior scales—remain visible at the top of the Python files.
 Edit those there for scientific sensitivity analyses.
 
-## Shared run identifier and dependencies
+## Submit the complete workflow
 
-Use one run identifier when several scripts should have the same timestamp
-prefix:
+All seven examples are self-contained, so they may be submitted together; no
+PBS dependency is required. Use one timestamp prefix and descriptive suffixes:
 
 ```bash
-RUN_ID="$(date +%Y%m%d_%H%M%S)"
-
-SIM_JOB=$(qsub -v RUN_ID="${RUN_ID}",N_TIME=1000,PERIOD=4 \
-  examples/job_scripts/submit_02_structural_simulations.pbs)
-
-LAP_JOB=$(qsub -W depend=afterok:"${SIM_JOB}" \
-  -v RUN_ID="${RUN_ID}",N_TIME=1000,PERIOD=4,DRAWS=2000,WARMUP=2000,CHAINS=4 \
-  examples/job_scripts/submit_03_simulation_laplace.pbs)
-
-qsub -W depend=afterok:"${LAP_JOB}" \
-  -v RUN_ID="${RUN_ID}",N_TIME=1000,PERIOD=4,DRAWS=2000,WARMUP=2000,CHAINS=4,PARTICLES=512 \
+STAMP="$(date +%Y%m%d_%H%M%S)"
+qsub -v RUN_ID="${STAMP}_structures",N_TIME=1000,PERIOD=4 \
+  examples/job_scripts/submit_02_structural_simulations.pbs
+qsub -v RUN_ID="${STAMP}_sim_lap",N_TIME=1000,PERIOD=4,DRAWS=400,WARMUP=100,CHAINS=4 \
+  examples/job_scripts/submit_03_simulation_laplace.pbs
+qsub -v RUN_ID="${STAMP}_sim_pgas",N_TIME=1000,PERIOD=4,DRAWS=400,WARMUP=100,CHAINS=4,PARTICLES=128 \
   examples/job_scripts/submit_04_simulation_pgas.pbs
 ```
+
+See [`../HPC_PARALLEL.md`](../HPC_PARALLEL.md) for copy-and-paste pilot and
+final commands for all seven jobs, plus monitoring commands.
+
+For a four-chain job, use the result directory containing
+`RUN_ID_combined__...c4...`. The `RUN_ID_chain01__...c1...` through
+`RUN_ID_chain04__...c1...` directories and their separate logs are retained
+for chain-level debugging. `CHAINS` must not exceed the `ppn` request in the
+PBS file.
 
 Monitor jobs with `qstat -u "$USER"` and cancel one with `qdel JOB_ID`.
 Adjust the `#PBS` walltime, memory, CPU, project, and queue directives in each

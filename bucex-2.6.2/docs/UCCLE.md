@@ -98,6 +98,7 @@ so the seasonal cycle is retained in the risk functional.
 
 ## Artifact layout
 
-The scripts store input truths, checksummed fits, tables, and figures under
-`results/<BUCEX_RUN_ID>/` by default. Set `BUCEX_TIMESTAMP_RESULTS=0` for an
-unindexed root and `BUCEX_OVERWRITE=1` to replace compatible artifacts.
+The scripts store input truths, checksummed fits, tables, figures, and a full
+`run_config.json` under
+`results/<script>/<BUCEX_RUN_ID>__<automatic-settings-signature>/`.
+Set `BUCEX_OVERWRITE=1` only to replace compatible existing artifacts.

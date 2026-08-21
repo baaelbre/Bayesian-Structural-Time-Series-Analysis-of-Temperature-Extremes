@@ -122,13 +122,30 @@ def test_laplace_fit_is_a_full_path_warm_start_for_pgas():
 
 
 def test_hpc_surface_matches_the_seven_examples():
-    directory = Path(__file__).resolve().parents[1] / "examples" / "job_scripts"
-    assert {path.name for path in directory.glob("*.pbs")} == {
-        "00_uccle_record.pbs",
-        "01_tail_simulations.pbs",
-        "02_structural_simulations.pbs",
-        "03_simulation_laplace.pbs",
-        "04_simulation_pgas.pbs",
-        "05_uccle_laplace.pbs",
-        "06_uccle_pgas.pbs",
+    examples = Path(__file__).resolve().parents[1] / "examples"
+    runner_directory = examples / "bash_scripts"
+    submit_directory = examples / "job_scripts"
+    runners = {path.name for path in runner_directory.glob("run_*.sh")}
+    submissions = {path.name for path in submit_directory.glob("submit_*.pbs")}
+    expected_stems = {
+        "00_uccle_record",
+        "01_tail_simulations",
+        "02_structural_simulations",
+        "03_simulation_laplace",
+        "04_simulation_pgas",
+        "05_uccle_laplace",
+        "06_uccle_pgas",
     }
+    assert runners == {f"run_{stem}.sh" for stem in expected_stems}
+    assert submissions == {f"submit_{stem}.pbs" for stem in expected_stems}
+    assert not (submit_directory / "common.sh").exists()
+    assert not (submit_directory / "submit_all.sh").exists()
+    for stem in expected_stems:
+        runner = (runner_directory / f"run_{stem}.sh").read_text(encoding="utf-8")
+        submission = (submit_directory / f"submit_{stem}.pbs").read_text(encoding="utf-8")
+        assert "set -euo pipefail" in runner
+        assert f"examples/{stem}.py" in runner
+        assert "BUCEX_RESULTS_ROOT" in runner
+        assert "BUCEX_RUN_ID" in runner
+        assert "#PBS -N" in submission
+        assert f"examples/bash_scripts/run_{stem}.sh" in submission

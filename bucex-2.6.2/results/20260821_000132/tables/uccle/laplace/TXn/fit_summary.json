@@ -1,0 +1,60 @@
+{
+  "fit": "results/20260821_000132/fits/uccle/laplace/TXn/combined.bucex",
+  "series": "TXn",
+  "description": "monthly minimum daily maximum temperature",
+  "tail": "min",
+  "start": "1892-01-01",
+  "end": "2022-12-01",
+  "n_time": 1572,
+  "n_chains": 2,
+  "draws_per_chain": 250,
+  "plan": {
+    "family": "gev",
+    "engine": "laplace",
+    "parameterization": "fruehwirth_schnatter",
+    "asis": false,
+    "state_update": "iterated Laplace FFBS approximation",
+    "targets_exact_posterior": false,
+    "approximation": "iterated_laplace",
+    "interweaves_with": null,
+    "backend": "fruehwirth_schnatter",
+    "warnings": []
+  },
+  "engine_diagnostics": {
+    "convergence_rate": 1.0,
+    "median_iterations": 3.0,
+    "median_relative_change": 7.887599939792307e-07,
+    "mean_support_rejections": 0.0
+  },
+  "prior_settings": {
+    "alpha_sd": 3.2,
+    "beta_mean": 0.0,
+    "beta_sd": 0.004,
+    "seasonal_initial_sd": 2.25,
+    "sigma2": {
+      "a": 2.0,
+      "b": 2.0
+    },
+    "xi_bounds": [
+      -0.5,
+      0.5
+    ],
+    "xi_max_abs": 0.5,
+    "innovation_slab_sd": {
+      "level": 0.05,
+      "trend": 0.0001,
+      "season": 0.09
+    },
+    "level_dynamic_probability": 0.5,
+    "trend_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    "season_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ]
+  }
+}

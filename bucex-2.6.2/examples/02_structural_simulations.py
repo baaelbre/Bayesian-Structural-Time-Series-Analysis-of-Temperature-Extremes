@@ -23,7 +23,8 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results. The run name always combines its timestamp and identifying settings.
+# Results. The concise signature contains the structural settings most useful
+# when browsing runs. sigma, xi, and all other values remain in run_config.json.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
 SCRIPT_NAME = Path(__file__).stem
 RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -44,16 +45,16 @@ LOCAL_INITIAL_SLOPE = 0.003
 DYNAMIC_SEASON_AMPLITUDE = 0.25
 FIXED_SEASON_AMPLITUDE = 0.25
 SEASONAL_SD = 0.05
-SIMULATION_SEED = 13_081_997
+SIMULATION_SEED = int(os.environ.get("BUCEX_SIMULATION_SEED", "13081997"))
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589", "coral": "#D96C4F"}
 
 RUN_SIGNATURE = (
-    f"n{N_TIME}_p{PERIOD}_sigma{SIGMA:g}_xi{XI:g}"
-    f"__qlevel{LOCAL_LEVEL_SD:g}_qslope{LOCAL_SLOPE_SD:g}_qseason{SEASONAL_SD:g}"
-    f"__amp{DYNAMIC_SEASON_AMPLITUDE:g}_seed{SIMULATION_SEED}"
+    f"n{N_TIME}_p{PERIOD}"
+    f"__q{LOCAL_LEVEL_SD:g}-{LOCAL_SLOPE_SD:g}-{SEASONAL_SD:g}"
+    f"__a{DYNAMIC_SEASON_AMPLITUDE:g}_s{SIMULATION_SEED}"
 )
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 

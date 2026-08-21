@@ -13,10 +13,13 @@ core package API.
 - Tables and figures are produced sequentially from `FitResult` methods, so
   every output is traceable to a public API call in the example.
 - Results no longer contain a `presentation/` subdirectory.
-- Timestamped results are enabled by default. `BUCEX_RUN_ID` shares one run
-  directory across scripts and jobs; `BUCEX_TIMESTAMP_RESULTS=0` disables it.
-- Seven PBS files invoke the same seven examples. The submission script passes
-  one run ID and enforces the two Laplace-to-PGAS dependencies.
+- Results are always indexed as
+  `results/<script>/<timestamp>__<settings-signature>/`; every run contains a
+  complete `run_config.json`. `BUCEX_RUN_ID` shares the timestamp prefix across
+  scripts and jobs.
+- Every example has its own `run_*.sh` positional-argument runner and matching
+  `submit_*.pbs` scheduler file. The PBS layer handles resources and logging,
+  then passes named `qsub -v` settings to the runner in a documented order.
 
 ## Figures
 

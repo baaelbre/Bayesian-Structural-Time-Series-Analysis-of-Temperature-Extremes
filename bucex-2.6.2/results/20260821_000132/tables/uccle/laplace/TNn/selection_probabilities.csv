@@ -1,0 +1,4 @@
+series,engine,process,zero,fixed,dynamic
+TNn,laplace,level,0.0,0.188,0.812
+TNn,laplace,slope,0.216,0.25,0.534
+TNn,laplace,seasonal,0.0,0.854,0.146

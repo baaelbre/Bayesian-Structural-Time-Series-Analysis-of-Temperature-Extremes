@@ -104,6 +104,9 @@ def test_combine_fits_preserves_chain_identity():
         )
         for seed in (40, 41)
     ]
+    # Starting values may legitimately differ across independently launched
+    # chains; the resolved prior and statistical model are still identical.
+    fits[1].model.components[0].initial_mean = 0.75
     combined = bx.combine_fits(fits)
     assert combined.n_chains == 2
     np.testing.assert_allclose(combined.state_draws[0], fits[0].state_draws[0])

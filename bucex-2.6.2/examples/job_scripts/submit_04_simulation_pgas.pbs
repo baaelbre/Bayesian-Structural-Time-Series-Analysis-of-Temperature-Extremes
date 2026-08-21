@@ -2,7 +2,7 @@
 #PBS -N bucex_sim_pgas
 #PBS -l walltime=72:00:00
 #PBS -l nodes=1:ppn=4
-#PBS -l mem=16gb
+#PBS -l mem=64gb
 #PBS -j oe
 
 set -euo pipefail
@@ -15,7 +15,7 @@ PERIOD="${PERIOD:-4}"
 SIMULATION_SEED="${SIMULATION_SEED:-13081997}"
 DRAWS="${DRAWS:-400}"
 WARMUP="${WARMUP:-100}"
-CHAINS="${CHAINS:-1}"
+CHAINS="${CHAINS:-4}"
 PARTICLES="${PARTICLES:-128}"
 MCMC_SEED="${MCMC_SEED:-13081997}"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
@@ -28,6 +28,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export BUCEX_MAX_PARALLEL_CHAINS="${PBS_NP:-4}"
 
 echo "Submitting simulation-PGAS runner"
 echo "n time      = ${N_TIME}"
@@ -36,6 +37,7 @@ echo "sim seed    = ${SIMULATION_SEED}"
 echo "draws       = ${DRAWS}"
 echo "warmup      = ${WARMUP}"
 echo "chains      = ${CHAINS}"
+echo "PBS cores   = ${PBS_NP:-4}"
 echo "particles   = ${PARTICLES}"
 echo "MCMC seed   = ${MCMC_SEED}"
 echo "results     = ${RESULTS_ROOT}"

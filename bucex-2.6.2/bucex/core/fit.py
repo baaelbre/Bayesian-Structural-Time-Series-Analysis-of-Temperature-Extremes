@@ -1332,6 +1332,24 @@ def _same_data(left: Any, right: Any) -> bool:
         return bool(np.array_equal(left_array, right_array))
 
 
+def _model_target_signature(model: Any) -> Any:
+    """Return the model specification without chain-specific start values.
+
+    Warm starts update component ``initial_*`` values before sampling.  Those
+    values initialize a chain; they do not change its target once the resolved
+    priors are fixed.  ``combine_fits`` compares those priors separately, so
+    independently initialized chains remain compatible here.
+    """
+
+    if not hasattr(model, "to_dict"):
+        return model
+    payload = model.to_dict()
+    for component in payload.get("components", ()):
+        for name in ("initial_level", "initial_slope", "initial_mean"):
+            component.pop(name, None)
+    return payload
+
+
 def combine_fits(fits: Iterable[FitResult]) -> FitResult:
     """Combine independently run compatible fits along the chain dimension."""
 
@@ -1341,7 +1359,10 @@ def combine_fits(fits: Iterable[FitResult]) -> FitResult:
     first = items[0]
     for index, fit in enumerate(items[1:], start=2):
         if (
-            not _same_data(fit.model, first.model)
+            not _same_data(
+                _model_target_signature(fit.model),
+                _model_target_signature(first.model),
+            )
             or not _same_data(fit.priors, first.priors)
             or not _same_data(fit.plan, first.plan)
         ):

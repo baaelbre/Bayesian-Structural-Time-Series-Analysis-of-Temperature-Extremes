@@ -133,7 +133,8 @@ structural switching, and GEV support diagnostics before trusting a run.
 
 ## Seven standalone examples
 
-Set one run ID to put every result below the same timestamp:
+Set one run ID to give all seven script-specific result directories the same
+timestamp prefix:
 
 ```bash
 export BUCEX_RUN_ID=$(date +%Y%m%d_%H%M%S)
@@ -146,10 +147,10 @@ python examples/05_uccle_laplace.py
 python examples/06_uccle_pgas.py
 ```
 
-Outputs are written below `results/<BUCEX_RUN_ID>/`. Set
-`BUCEX_TIMESTAMP_RESULTS=0` for an unindexed `results/` directory, change the
-root with `BUCEX_RESULTS_ROOT`, or set `BUCEX_OVERWRITE=1` to regenerate safe
-existing artifacts.
+Outputs are written below
+`results/<script>/<BUCEX_RUN_ID>__<automatic-settings-signature>/`. Every run
+contains `run_config.json`. Change the root with `BUCEX_RESULTS_ROOT`, or set
+`BUCEX_OVERWRITE=1` to deliberately regenerate an existing identifier.
 
 All scientific settings remain near the top of each script. MCMC controls can
 also be overridden with `BUCEX_DRAWS`, `BUCEX_WARMUP`, `BUCEX_CHAINS`,
@@ -168,20 +169,20 @@ trajectories.
 
 ## HPC
 
-The seven PBS files call the same seven examples. `submit_all.sh` creates one
-run ID and submits the Laplace-to-PGAS dependencies:
+Each Python example has a normal Bash runner and a matching PBS submission
+file. The PBS file handles resources and logging and then calls the runner:
 
 ```bash
-export BUCEX_PYTHON=/path/to/bucex_env/bin/python
-export BUCEX_RESULTS_ROOT=/path/to/scratch/bucex-results
-export BUCEX_PROFILE=publication
-bash examples/job_scripts/submit_all.sh
+qsub examples/job_scripts/submit_00_uccle_record.pbs
+
+qsub -v DRAWS=2000,WARMUP=2000,CHAINS=4,PARTICLES=512 \
+  examples/job_scripts/submit_06_uccle_pgas.pbs
 ```
 
-Profiles are `smoke` (20/20, one chain, 32 particles), `pilot` (250/250, two
-chains, 128 particles), and `publication` (2,000/2,000, four chains, 512
-particles). See `examples/job_scripts/README.md` and adapt resource directives
-to the local cluster.
+The seven `run_*.sh` files also run directly with positional arguments. There
+is no shared settings layer; every pair is readable by itself. See
+`examples/job_scripts/README.md` for the exact argument order and adapt the
+resource directives to the local cluster.
 
 ## Risk summaries
 

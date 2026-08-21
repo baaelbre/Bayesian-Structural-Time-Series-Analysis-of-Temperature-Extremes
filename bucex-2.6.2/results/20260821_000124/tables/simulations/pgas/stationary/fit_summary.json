@@ -1,0 +1,64 @@
+{
+  "fit": "results/20260821_000124/fits/simulations/pgas/stationary/combined.bucex",
+  "warm_start": "results/20260821_000124/fits/simulations/laplace/stationary/combined.bucex",
+  "n_time": 1000,
+  "n_chains": 1,
+  "draws_per_chain": 400,
+  "particles": 128,
+  "plan": {
+    "family": "gev",
+    "engine": "pgas",
+    "parameterization": "fruehwirth_schnatter",
+    "asis": false,
+    "state_update": "conditional SMC with ancestor sampling",
+    "targets_exact_posterior": true,
+    "approximation": null,
+    "interweaves_with": null,
+    "backend": "fruehwirth_schnatter",
+    "warnings": [
+      "The transition is singular; PGAS operates on its affine support. Inspect particle ESS and ancestor diversity."
+    ]
+  },
+  "engine_diagnostics": {
+    "median_min_particle_ess": 128.0,
+    "mean_unique_ancestors": 81.073705,
+    "path_change_rate": 0.9925,
+    "mean_path_update_fraction": 0.11776223776223776,
+    "reference_ancestor_change_rate": 0.0009950000000000002,
+    "ssvs_model_move_acceptance": 0.0725,
+    "ssvs_proposed_change_rate": 0.435,
+    "ssvs_median_log_acceptance_ratio": -7.8768381534142655,
+    "ssvs_mean_elliptical_slice_steps": 8.965
+  },
+  "prior_settings": {
+    "alpha_sd": 3.2,
+    "beta_mean": 0.0,
+    "beta_sd": 0.01,
+    "seasonal_initial_sd": 0.5,
+    "sigma2": {
+      "a": 2.0,
+      "b": 2.25
+    },
+    "xi_bounds": [
+      -0.5,
+      0.5
+    ],
+    "xi_max_abs": 0.5,
+    "innovation_slab_sd": {
+      "level": 0.1,
+      "trend": 0.0008,
+      "season": 0.07
+    },
+    "level_dynamic_probability": 0.5,
+    "trend_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    "season_probabilities": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ]
+  }
+}

@@ -32,20 +32,19 @@ The seven complete examples are in `examples/`; matching PBS jobs are in
 
 ## Result paths
 
-Results are timestamped by default:
+Results are always indexed by script, timestamp, and identifying settings:
 
 ```text
-results/<BUCEX_RUN_ID>/
-  simulations/
-  fits/simulations/{laplace,pgas}/<scenario>/combined.bucex
-  fits/uccle/{laplace,pgas}/<series>/combined.bucex
-  tables/
-  figures/
-  logs/
+results/<script>/<BUCEX_RUN_ID>__<settings-signature>/
+  run_config.json
+  simulations/               # simulation scripts
+  fits/<scenario-or-series>/
+  tables/<scenario-or-series>/
+  figures/<scenario-or-series>/
 ```
 
-Export one `BUCEX_RUN_ID` before running multiple scripts. Set
-`BUCEX_TIMESTAMP_RESULTS=0` to retain an unindexed root.
+Export one `BUCEX_RUN_ID` before running multiple scripts to share a timestamp
+prefix. The settings signature is always present.
 
 ## New plots
 

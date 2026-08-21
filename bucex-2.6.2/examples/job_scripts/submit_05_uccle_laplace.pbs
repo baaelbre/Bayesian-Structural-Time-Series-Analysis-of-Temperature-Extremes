@@ -2,7 +2,7 @@
 #PBS -N bucex_uccle_laplace
 #PBS -l walltime=48:00:00
 #PBS -l nodes=1:ppn=4
-#PBS -l mem=12gb
+#PBS -l mem=48gb
 #PBS -j oe
 
 set -euo pipefail
@@ -14,7 +14,7 @@ START="${START:-1892-01-01}"
 END="${END:-latest}"
 DRAWS="${DRAWS:-250}"
 WARMUP="${WARMUP:-250}"
-CHAINS="${CHAINS:-2}"
+CHAINS="${CHAINS:-4}"
 MCMC_SEED="${MCMC_SEED:-56000}"
 DATA_DIR="${DATA_DIR:-data}"
 RESULTS_ROOT="${RESULTS_ROOT:-results}"
@@ -27,6 +27,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export BUCEX_MAX_PARALLEL_CHAINS="${PBS_NP:-4}"
 
 echo "Submitting Uccle-Laplace runner"
 echo "start       = ${START}"
@@ -34,6 +35,7 @@ echo "end         = ${END}"
 echo "draws       = ${DRAWS}"
 echo "warmup      = ${WARMUP}"
 echo "chains      = ${CHAINS}"
+echo "PBS cores   = ${PBS_NP:-4}"
 echo "MCMC seed   = ${MCMC_SEED}"
 echo "data dir    = ${DATA_DIR}"
 echo "results     = ${RESULTS_ROOT}"

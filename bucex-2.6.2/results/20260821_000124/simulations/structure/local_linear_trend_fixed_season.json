@@ -1,0 +1,63 @@
+{
+  "initial_state": [
+    25.0,
+    0.003,
+    -2.678914873134835e-17,
+    0.25,
+    3.444319122601931e-17
+  ],
+  "model": {
+    "components": [
+      {
+        "initial_level": null,
+        "initial_level_sd": null,
+        "initial_slope": 0.0,
+        "initial_slope_sd": null,
+        "level_mode": "dynamic",
+        "level_name": "level",
+        "slope_name": "slope",
+        "trend_mode": "dynamic",
+        "type": "local_linear_trend"
+      },
+      {
+        "initial_mean": null,
+        "initial_sd": null,
+        "mode": "static",
+        "name": "seasonal",
+        "period": 4,
+        "type": "dummy_seasonal"
+      }
+    ],
+    "eta_name": "mu",
+    "name": "local linear trend plus fixed seasonality",
+    "observation": {
+      "family": "gev",
+      "xi_bounds": [
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  "n_time": 1000,
+  "name": "local_linear_trend_fixed_season",
+  "parameter_truth": {
+    "sd.level": 0.05,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0005,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "params": {
+    "sd.level": 0.05,
+    "sd.slope": 0.0005,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "seed": 13082000,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 1,
+    "slope": 2
+  }
+}

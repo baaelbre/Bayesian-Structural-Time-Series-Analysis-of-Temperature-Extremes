@@ -1,0 +1,4 @@
+series,engine,process,zero,fixed,dynamic
+TXx,laplace,level,0.0,0.0,1.0
+TXx,laplace,slope,0.186,0.372,0.442
+TXx,laplace,seasonal,0.0,0.62,0.38

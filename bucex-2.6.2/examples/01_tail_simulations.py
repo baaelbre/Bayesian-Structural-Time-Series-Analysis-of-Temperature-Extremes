@@ -23,8 +23,8 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results. The timestamp can be shared across HPC jobs through BUCEX_RUN_ID;
-# the identifying settings are always appended automatically.
+# Results. The timestamp can be shared across HPC jobs through BUCEX_RUN_ID.
+# The concise signature is for browsing; run_config.json stores every value.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
 SCRIPT_NAME = Path(__file__).stem
 RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -56,9 +56,9 @@ COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589"}
 
 RUN_SIGNATURE = (
     f"n{N_TIME}_p{PERIOD}"
-    f"__tail-sigma{TAIL_SIGMA:g}-xi{'_'.join(f'{value:g}' for value in TAIL_XI_VALUES)}"
-    f"__scale-sigma{'_'.join(f'{value:g}' for value in SCALE_SIGMA_VALUES)}-xi{SCALE_XI:g}"
-    f"__qlevel{LEVEL_PROCESS_SD:g}_seed{TAIL_SEED}_{SCALE_SEED}"
+    f"__xi{'_'.join(f'{value:g}' for value in TAIL_XI_VALUES)}"
+    f"__scale{'_'.join(f'{value:g}' for value in SCALE_SIGMA_VALUES)}"
+    f"__q{LEVEL_PROCESS_SD:g}_s{TAIL_SEED}-{SCALE_SEED}"
 )
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 

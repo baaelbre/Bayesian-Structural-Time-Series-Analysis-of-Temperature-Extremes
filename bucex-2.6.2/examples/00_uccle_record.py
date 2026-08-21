@@ -23,7 +23,8 @@ import bucex as bx
 
 
 # Results. BUCEX_RUN_ID may supply one shared timestamp to several HPC jobs.
-# Otherwise the script uses its own start time. The run signature is automatic.
+# The directory name contains only the settings useful for browsing results;
+# run_config.json records the complete configuration.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
 SCRIPT_NAME = Path(__file__).stem
 RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -45,10 +46,9 @@ FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 COLORS = {"navy": "#123B4A", "teal": "#1D7F7A", "grey": "#7A8589"}
 
-RUN_SIGNATURE = (
-    f"{START}_to_{END or 'latest'}"
-    f"__loess{LOESS_FRACTION_MONTHLY:g}-{LOESS_FRACTION_ANNUAL:g}"
-)
+START_TAG = START.removesuffix("-01-01")
+END_TAG = (END or "latest").removesuffix("-12-31")
+RUN_SIGNATURE = f"{START_TAG}-{END_TAG}__loess{LOESS_FRACTION_MONTHLY:g}-{LOESS_FRACTION_ANNUAL:g}"
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
 

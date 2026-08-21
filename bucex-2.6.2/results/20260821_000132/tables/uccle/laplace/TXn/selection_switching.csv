@@ -1,0 +1,4 @@
+process,n_draws,n_switches,switch_rate,first_state,last_state,status
+level,500,28,0.056112224448897796,dynamic,dynamic,switching
+slope,500,146,0.2925851703406814,zero,fixed,switching
+seasonal,500,130,0.2605210420841683,fixed,fixed,switching

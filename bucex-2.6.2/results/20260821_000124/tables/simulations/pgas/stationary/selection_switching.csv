@@ -1,0 +1,4 @@
+process,n_draws,n_switches,switch_rate,first_state,last_state,status
+level,400,10,0.02506265664160401,fixed,fixed,switching
+slope,400,8,0.020050125313283207,zero,zero,switching
+seasonal,400,0,0.0,zero,zero,constant posterior allocation

@@ -22,7 +22,8 @@ if (SOURCE_ROOT / "bucex").is_dir() and str(SOURCE_ROOT) not in sys.path:
 import bucex as bx
 
 
-# Results. Every run is timestamped and receives an automatic settings signature.
+# Results. The folder name keeps only the data range, slab scales, and sampling
+# effort. run_config.json contains the full data, prior, and sampler settings.
 RESULTS_ROOT = Path(os.environ.get("BUCEX_RESULTS_ROOT", "results"))
 SCRIPT_NAME = Path(__file__).stem
 RUN_TIMESTAMP = os.environ.get("BUCEX_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -58,15 +59,21 @@ CHAINS = int(os.environ.get("BUCEX_CHAINS", "2"))
 PARTICLES = int(os.environ.get("BUCEX_PARTICLES", "128"))
 SEED = int(os.environ.get("BUCEX_SEED", "56000"))
 PROGRESS = os.environ.get("BUCEX_PROGRESS", "1").lower() not in {"0", "false", "no"}
+CHAIN_ONLY = os.environ.get("BUCEX_CHAIN_ONLY", "0").lower() in {"1", "true", "yes"}
+COMBINE_RUNS = tuple(
+    Path(value)
+    for value in os.environ.get("BUCEX_COMBINE_RUNS", "").split(os.pathsep)
+    if value
+)
 
 FIGURE_FORMATS = ("pdf", "png")
 FIGURE_DPI = 180
 DIAGNOSTIC_FIGURES = False
 
 RUN_SIGNATURE = (
-    f"{START}_to_{END or 'latest'}__series-{'-'.join(SERIES)}_p{PERIOD}"
-    f"__slablevel{INNOVATION_SLAB_SD['level']:g}_slabtrend{INNOVATION_SLAB_SD['trend']:g}_slabseason{INNOVATION_SLAB_SD['season']:g}"
-    f"__draws{DRAWS}_warmup{WARMUP}_chains{CHAINS}_particles{PARTICLES}_seed{SEED}"
+    f"{START.removesuffix('-01-01')}-{(END or 'latest').removesuffix('-12-31')}"
+    f"__slab{INNOVATION_SLAB_SD['level']:g}-{INNOVATION_SLAB_SD['trend']:g}-{INNOVATION_SLAB_SD['season']:g}"
+    f"__d{DRAWS}_w{WARMUP}_c{CHAINS}_pt{PARTICLES}_s{SEED}"
 )
 OUTPUT_DIR = RESULTS_ROOT / SCRIPT_NAME / f"{RUN_TIMESTAMP}__{RUN_SIGNATURE}"
 
@@ -93,6 +100,11 @@ PRIOR_SETTINGS = {
 
 
 def main() -> None:
+    if COMBINE_RUNS and len(COMBINE_RUNS) != CHAINS:
+        raise ValueError(
+            f"BUCEX_COMBINE_RUNS contains {len(COMBINE_RUNS)} runs, "
+            f"but BUCEX_CHAINS={CHAINS}."
+        )
     plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False, "axes.titleweight": "bold", "legend.frameon": False})
     selection_rows = []
 
@@ -132,6 +144,8 @@ def main() -> None:
             "dpi": FIGURE_DPI,
             "diagnostics": DIAGNOSTIC_FIGURES,
         },
+        "chain_only": CHAIN_ONLY,
+        "combined_chain_runs": [str(path) for path in COMBINE_RUNS],
     }
     config_path.write_text(
         json.dumps(run_config, indent=2, sort_keys=True), encoding="utf-8"
@@ -172,6 +186,25 @@ def main() -> None:
                 or laplace_fit.metadata.get("prior_settings") != PRIOR_SETTINGS
             ):
                 raise ValueError(f"{laplace_path} does not match the current settings.")
+        elif COMBINE_RUNS:
+            source_paths = [
+                run_dir / "fits" / name / "laplace" / "combined.bucex"
+                for run_dir in COMBINE_RUNS
+            ]
+            missing = [path for path in source_paths if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    "Cannot combine Uccle Laplace initializers; missing fit file(s):\n  "
+                    + "\n  ".join(str(path) for path in missing)
+                )
+            laplace_fit = bx.combine_fits(
+                [bx.FitResult.load(path) for path in source_paths]
+            )
+            laplace_fit.metadata["combined_chain_sources"] = [
+                str(path) for path in source_paths
+            ]
+            laplace_path.parent.mkdir(parents=True, exist_ok=True)
+            laplace_fit.save(laplace_path)
         else:
             laplace_fit = bx.fit(
                 values,
@@ -212,6 +245,26 @@ def main() -> None:
             ):
                 raise ValueError(f"{pgas_path} does not match the current settings.")
             print(f"Reusing {pgas_path}")
+        elif COMBINE_RUNS:
+            source_paths = [
+                run_dir / "fits" / name / "pgas" / "combined.bucex"
+                for run_dir in COMBINE_RUNS
+            ]
+            missing = [path for path in source_paths if not path.is_file()]
+            if missing:
+                raise FileNotFoundError(
+                    "Cannot combine Uccle PGAS chains; missing fit file(s):\n  "
+                    + "\n  ".join(str(path) for path in missing)
+                )
+            pgas_fit = bx.combine_fits(
+                [bx.FitResult.load(path) for path in source_paths]
+            )
+            pgas_fit.metadata["combined_chain_sources"] = [
+                str(path) for path in source_paths
+            ]
+            pgas_fit.metadata["warm_start_source"] = str(laplace_path)
+            pgas_path.parent.mkdir(parents=True, exist_ok=True)
+            pgas_fit.save(pgas_path)
         else:
             pgas_fit = bx.fit(
                 values,
@@ -239,6 +292,10 @@ def main() -> None:
             )
             pgas_path.parent.mkdir(parents=True, exist_ok=True)
             pgas_fit.save(pgas_path)
+
+        if CHAIN_ONLY:
+            print(f"One-chain Uccle PGAS fit complete: {name}")
+            continue
 
         table_dir = OUTPUT_DIR / "tables" / name
         figure_dir = OUTPUT_DIR / "figures" / name
@@ -333,6 +390,10 @@ def main() -> None:
                     figure.savefig(figure_dir / f"{filename}.{extension}", dpi=FIGURE_DPI, bbox_inches="tight")
                 plt.close(figure)
         print(f"PGAS fit complete: {name}")
+
+    if CHAIN_ONLY:
+        print(f"One-chain Uccle PGAS outputs: {OUTPUT_DIR}")
+        return
 
     selection_table = pd.concat(selection_rows, ignore_index=True)
     selection_path = OUTPUT_DIR / "tables" / "uccle_selection_laplace_pgas.csv"

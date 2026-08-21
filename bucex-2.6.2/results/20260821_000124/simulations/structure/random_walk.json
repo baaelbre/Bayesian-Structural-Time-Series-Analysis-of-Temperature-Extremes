@@ -1,0 +1,50 @@
+{
+  "initial_state": [
+    25.0
+  ],
+  "model": {
+    "components": [
+      {
+        "initial_level": null,
+        "initial_level_sd": null,
+        "initial_slope": 0.0,
+        "initial_slope_sd": null,
+        "level_mode": "dynamic",
+        "level_name": "level",
+        "slope_name": "slope",
+        "trend_mode": "off",
+        "type": "local_linear_trend"
+      }
+    ],
+    "eta_name": "mu",
+    "name": "random walk",
+    "observation": {
+      "family": "gev",
+      "xi_bounds": [
+        -0.5,
+        0.5
+      ]
+    }
+  },
+  "n_time": 1000,
+  "name": "random_walk",
+  "parameter_truth": {
+    "sd.level": 0.05,
+    "sd.seasonal": 0.0,
+    "sd.slope": 0.0,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "params": {
+    "sd.level": 0.05,
+    "sigma": 1.5,
+    "xi": -0.3
+  },
+  "period": 4,
+  "seed": 13081999,
+  "structural_truth": {
+    "level": 2,
+    "seasonal": 0,
+    "slope": 0
+  }
+}
